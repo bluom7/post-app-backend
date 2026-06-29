@@ -13,3 +13,4 @@ PyJWT==2.8.0
 email-validator==2.1.1
 dnspython==2.6.1
 resend 
+twilio
