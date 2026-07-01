@@ -263,6 +263,9 @@ class ProfileUpdate(BaseModel):
     category: Optional[str] = None
     gender: Optional[str] = None
     dob: Optional[str] = None
+    is_private: Optional[bool] = None
+    theme: Optional[str] = None
+    chat_translation_enabled: Optional[bool] = None
 
     @field_validator("username")
     @classmethod
@@ -272,6 +275,16 @@ class ProfileUpdate(BaseModel):
         if not USERNAME_RE.match(v):
             raise ValueError("Username: 3-20 chars, only lowercase letters, numbers, underscore")
         return v
+
+class NotificationsPrefsIn(BaseModel):
+    likes: Optional[bool] = None
+    comments: Optional[bool] = None
+    friend_requests: Optional[bool] = None
+    messages: Optional[bool] = None
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
 
 class PostIn(BaseModel):
     content: str; accent: str = "#FFD600"; location: Optional[str] = None
@@ -318,7 +331,8 @@ async def signup(p: SignupIn):
         "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
         "website": "", "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
-        "is_online": False, "last_seen": None,
+        "is_online": False, "last_seen": None, "is_private": False, "theme": "dark",
+        "chat_translation_enabled": True,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -415,7 +429,8 @@ async def email_signup(p: EmailSignupIn):
         "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
         "website": "", "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
-        "is_online": False, "last_seen": None,
+        "is_online": False, "last_seen": None, "is_private": False, "theme": "dark",
+        "chat_translation_enabled": True,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -471,7 +486,8 @@ async def phone_signup(p: PhoneSignupIn):
         "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
         "website": "", "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
-        "is_online": False, "last_seen": None,
+        "is_online": False, "last_seen": None, "is_private": False, "theme": "dark",
+        "chat_translation_enabled": True,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -959,6 +975,38 @@ async def unblock_user(user_id: str, u=Depends(current_user)):
     """Unblock a user"""
     await db.users.update_one({"id": u["id"]}, {"$pull": {"blocked_users": user_id}})
     return {"ok": True}
+
+@api.get("/users/me/blocked")
+async def get_blocked_users(u=Depends(current_user)):
+    """List full profile details for users the current user has blocked"""
+    ids = u.get("blocked_users", [])
+    if not ids: return []
+    return await db.users.find(
+        {"id": {"$in": ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}
+    ).to_list(len(ids))
+
+# ── Settings: notifications, security ────────────────────────
+@api.patch("/settings/notifications")
+async def update_notifications_prefs(p: NotificationsPrefsIn, u=Depends(current_user)):
+    """Merge-update the current user's notification preferences"""
+    upd = {k: v for k, v in p.dict().items() if v is not None}
+    if upd:
+        await db.users.update_one(
+            {"id": u["id"]},
+            {"$set": {f"notifications_prefs.{k}": v for k, v in upd.items()}}
+        )
+    fresh = await db.users.find_one({"id": u["id"]}, {"_id": 0, "notifications_prefs": 1})
+    return fresh.get("notifications_prefs", {})
+
+@api.post("/settings/change-password")
+async def change_password(p: ChangePasswordIn, u=Depends(current_user)):
+    """Verify the current password and set a new one"""
+    if not verifypw(p.current_password, u.get("password_hash", "")):
+        raise HTTPException(400, "Current password is incorrect")
+    if len(p.new_password) < 6:
+        raise HTTPException(400, "New password must be at least 6 characters")
+    await db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": hashpw(p.new_password)}})
+    return {"message": "Password updated successfully"}
 
 # ── Health ───────────────────────────────────────────────────
 @api.get("/")
