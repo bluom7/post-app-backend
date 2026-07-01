@@ -1101,7 +1101,9 @@ async def update_notifications_prefs(p: NotificationsPrefsIn, u=Depends(current_
 @api.post("/settings/change-password")
 async def change_password(p: ChangePasswordIn, u=Depends(current_user)):
     """Verify the current password and set a new one"""
-    if not verifypw(p.current_password, u.get("password_hash", "")):
+    # current_user excludes password_hash for security — re-fetch it for verification
+    user_with_hash = await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 1})
+    if not user_with_hash or not verifypw(p.current_password, user_with_hash.get("password_hash", "")):
         raise HTTPException(400, "Current password is incorrect")
     if len(p.new_password) < 6:
         raise HTTPException(400, "New password must be at least 6 characters")
