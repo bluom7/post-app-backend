@@ -57,12 +57,63 @@ def send_otp_email(email, code):
     try:
         import resend
         resend.api_key = RESEND_API_KEY
+        
+        # ✨ FIXED: Complete HTML template with proper structure
+        html_body = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>POST Verification Code</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f5f5f5; font-family:Arial,sans-serif;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f5f5f5;">
+        <tr>
+            <td style="padding:20px;">
+                <table width="100%" style="max-width:500px; margin:0 auto; background-color:#111111; border-radius:12px; border:1px solid #333; padding:40px; color:#fff;">
+                    <tr>
+                        <td style="text-align:center; padding-bottom:30px;">
+                            <h1 style="margin:0; font-size:48px; font-weight:900; letter-spacing:8px; color:#FFD600;">POST</h1>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="text-align:center; padding:0 0 30px 0;">
+                            <p style="margin:0 0 20px 0; font-size:16px; color:#ccc;">
+                                Your verification code is:
+                            </p>
+                            <div style="background:#FFD600; color:#000; font-size:36px; font-weight:900; letter-spacing:8px; padding:20px; border-radius:8px; margin:20px 0; word-break:break-all;">
+                                {code}
+                            </div>
+                            <p style="margin:20px 0 0 0; font-size:14px; color:#999;">
+                                Valid for <strong>10 minutes only</strong>
+                            </p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="text-align:center; padding-top:30px; border-top:1px solid #333;">
+                            <p style="margin:15px 0; font-size:12px; color:#666;">
+                                Did not request this code? You can safely ignore this email.
+                            </p>
+                            <p style="margin:5px 0; font-size:11px; color:#555;">
+                                © 2024 POST App. All rights reserved.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>"""
+        
         resend.Emails.send({
             "from": "POST App <noreply@postbluom.online>",
             "to": [email],
-            "subject": "Your POST verification code",
-            "html": f"<div style='font-family:sans-serif;max-width:400px;margin:auto;padding:24px;background:#111;color:#fff;border-radius:16px;'><h1 style='color:#FFD600;letter-spacing:6px;'>POST</h1><p>Your verification code:</p><div style='font-size:36px;font-weight:900;letter-spacing:10px;color:#FFD600;padding:16px 0;'>{code}</div><p style='color:#666;font-size:13px;'>Valid for 10 minutes.</p></div>"
+            "subject": f"[POST] Verification Code: {code}",  # ✨ Clearer subject
+            "html": html_body,
+            "reply_to": "support@postbluom.online",  # ✨ Added reply-to
         })
+        logging.info(f"✅ OTP email sent to {email}")
     except Exception as e:
         logging.warning(f"Email failed: {e}")
 
@@ -475,7 +526,7 @@ async def seed():
     ]
     for name, handle, loc, about, continent, color in WORLD:
         uid = str(uuid.uuid4())
-        await db.users.insert_one({"id": uid, "email": f"{handle[1:]}@post.demo", "username": handle[1:], "name": name, "handle": handle, "is_verified": True, "is_seed": True, "avatar_bg": color, "avatar_letter": name[0], "avatar_photo": None, "location": loc, "about": about, "continent": continent, "language": "en", "created_at": now()})
+        await db.users.insert_one({"id": uid, "email": f"{handle[1:]}@post.demo", "username": handle[1:], "name": name, "handle": handle, "is_verified": True, "is_seed": True, "avatar_bg": color, "avatar_letter": name[0], "avatar_photo": None, "location": loc, "about": about, "language": "en", "continent": continent, "created_at": now()})
     logging.info("✅ World users seeded")
 
 app.include_router(api)
