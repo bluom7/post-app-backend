@@ -100,7 +100,10 @@ def send_otp_email(email, code):
                                 Did not request this code? You can safely ignore this email.
                             </p>
                             <p style="margin:5px 0; font-size:11px; color:#555;">
-                                © 2024 POST App. All rights reserved.
+                                © 2025 POST App. All rights reserved.
+                            </p>
+                            <p style="margin:5px 0; font-size:10px; color:#444;">
+                                This is a transactional email. You are receiving this because someone requested a verification code for this email address.
                             </p>
                         </td>
                     </tr>
@@ -114,9 +117,13 @@ def send_otp_email(email, code):
         resend.Emails.send({
             "from": "POST App <noreply@postbluom.online>",
             "to": [email],
-            "subject": f"[POST] Verification Code: {code}",
+            "subject": f"POST App - Your verification code is {code}",
             "html": html_body,
             "reply_to": "support@postbluom.online",
+            "headers": {
+                "X-Entity-Ref-ID": str(uuid.uuid4()),
+                "List-Unsubscribe": "<mailto:support@postbluom.online?subject=unsubscribe>",
+            },
         })
         logging.info(f"✅ OTP email sent to {email}")
     except Exception as e:
