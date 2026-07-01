@@ -21,6 +21,11 @@ TWILIO_PHONE = os.environ.get("TWILIO_PHONE", "").strip()
 
 DEMO_MODE = not bool(RESEND_API_KEY)
 
+DELETE_GRACE_DAYS = 30
+ABUSE_WINDOW_DAYS = 90
+ABUSE_MAX_DELETIONS = 3
+ABUSE_COOLDOWN_DAYS = 14
+
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
@@ -146,6 +151,46 @@ async def ensure_username_unique(username: str, exclude_uid: Optional[str] = Non
         else:
             raise ValueError("Username already taken")
 
+# ── Account deletion / restore / abuse-detection helpers ───────
+def _aware(dt):
+    if dt and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+async def permanently_delete_user(uid: str):
+    """Hard-delete a user and all their data. Used once the 30-day grace period is over."""
+    await db.posts.delete_many({"user_id": uid})
+    await db.messages.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
+    await db.notifications.delete_many({"$or": [{"user_id": uid}, {"from_user_id": uid}]})
+    await db.friend_requests.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
+    await db.users.update_many({}, {"$pull": {"followers": uid, "following": uid, "blocked_users": uid}})
+    await db.users.delete_one({"id": uid})
+
+async def purge_expired_deleted_account(field: str, value: str):
+    """If a user with this phone/email is soft-deleted and past the 30-day grace period, hard-delete them now."""
+    user = await db.users.find_one({field: value})
+    if user and user.get("deleted_at"):
+        deleted_at = _aware(user["deleted_at"])
+        if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
+            await permanently_delete_user(user["id"])
+            return True
+    return False
+
+async def check_delete_recreate_abuse(identifier: str):
+    """Block repeated delete-then-recreate cycles for the same phone/email."""
+    since = now() - timedelta(days=ABUSE_WINDOW_DAYS)
+    count = await db.account_deletions.count_documents({"identifier": identifier, "deleted_at": {"$gte": since}})
+    if count >= ABUSE_MAX_DELETIONS:
+        last = await db.account_deletions.find({"identifier": identifier}).sort("deleted_at", -1).limit(1).to_list(1)
+        if last:
+            cooldown_until = _aware(last[0]["deleted_at"]) + timedelta(days=ABUSE_COOLDOWN_DAYS)
+            if now() < cooldown_until:
+                raise HTTPException(
+                    429,
+                    f"Too many account deletions detected for this number/email. Please try again after "
+                    f"{cooldown_until.strftime('%d %b %Y')}."
+                )
+
 # ── Models ───────────────────────────────────────────────────
 class SignupIn(BaseModel):
     email: EmailStr; password: str; name: str; username: str
@@ -264,7 +309,7 @@ async def signup(p: SignupIn):
         "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10),
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "location": "", "about": "", "language": "en",
-        "continent": "Asia", "created_at": now(), "is_seed": False,
+        "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -293,7 +338,15 @@ async def login(p: LoginIn):
     u = await db.users.find_one({"email": p.email})
     if not u or not verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid credentials")
     if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
-    return {"token": make_token(u["id"]), "user_id": u["id"]}
+    resp = {"token": make_token(u["id"]), "user_id": u["id"]}
+    if u.get("deleted_at"):
+        deleted_at = _aware(u["deleted_at"])
+        if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
+            await permanently_delete_user(u["id"])
+            raise HTTPException(400, "Invalid credentials")
+        resp["pending_delete"] = True
+        resp["restore_deadline"] = (deleted_at + timedelta(days=DELETE_GRACE_DAYS)).isoformat()
+    return resp
 
 @api.post("/auth/resend-otp")
 async def resend_otp(body: dict):
@@ -307,6 +360,8 @@ async def resend_otp(body: dict):
 # ── Auth Email (OTP-first) ──────────────────────────────────────
 @api.post("/auth/email-signup-init")
 async def email_signup_init(p: EmailInitIn):
+    await purge_expired_deleted_account("email", p.email)
+    await check_delete_recreate_abuse(p.email)
     existing = await db.users.find_one({"email": p.email, "is_verified": True})
     if existing: raise HTTPException(400, "Email already registered")
     code = f"{random.randint(0,9999):04d}"
@@ -349,7 +404,7 @@ async def email_signup(p: EmailSignupIn):
         "password_hash": hashpw(p.password), "is_verified": True,
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "location": "", "about": "", "language": "en",
-        "continent": "Asia", "created_at": now(), "is_seed": False,
+        "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -361,6 +416,8 @@ async def email_signup(p: EmailSignupIn):
 # ── Auth Phone ──────────────────────────────────────────────
 @api.post("/auth/phone-signup-init")
 async def phone_signup_init(p: PhoneInitIn):
+    await purge_expired_deleted_account("phone", p.phone)
+    await check_delete_recreate_abuse(p.phone)
     code = f"{random.randint(0,9999):04d}"
     await db.phone_otps.update_one(
         {"phone": p.phone},
@@ -401,7 +458,7 @@ async def phone_signup(p: PhoneSignupIn):
         "password_hash": hashpw(p.password), "is_verified": True,
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "location": "", "about": "", "language": "en",
-        "continent": "Asia", "created_at": now(), "is_seed": False,
+        "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -415,10 +472,55 @@ async def phone_login(p: PhoneLoginIn):
     u = await db.users.find_one({"phone": p.phone})
     if not u or not verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid phone or password")
     if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
-    return {"token": make_token(u["id"]), "user_id": u["id"]}
+    resp = {"token": make_token(u["id"]), "user_id": u["id"]}
+    if u.get("deleted_at"):
+        deleted_at = _aware(u["deleted_at"])
+        if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
+            await permanently_delete_user(u["id"])
+            raise HTTPException(400, "Invalid phone or password")
+        resp["pending_delete"] = True
+        resp["restore_deadline"] = (deleted_at + timedelta(days=DELETE_GRACE_DAYS)).isoformat()
+    return resp
 
 @api.get("/auth/me")
 async def me(u=Depends(current_user)): return u
+
+# ── Account deletion / restore ──────────────────────────────
+@api.post("/account/delete-request")
+async def request_account_delete(u=Depends(current_user)):
+    """Soft-delete: account is hidden immediately, hard-deleted after DELETE_GRACE_DAYS unless restored."""
+    if u.get("deleted_at"):
+        raise HTTPException(400, "Account is already pending deletion")
+    deleted_at = now()
+    await db.users.update_one({"id": u["id"]}, {"$set": {"deleted_at": deleted_at}})
+    identifier = u.get("phone") or u.get("email")
+    await db.account_deletions.insert_one({
+        "id": str(uuid.uuid4()), "user_id": u["id"], "identifier": identifier, "deleted_at": deleted_at
+    })
+    restore_deadline = deleted_at + timedelta(days=DELETE_GRACE_DAYS)
+    return {
+        "message": f"Account will be permanently deleted in {DELETE_GRACE_DAYS} days unless you log back in and restore it.",
+        "restore_deadline": restore_deadline.isoformat()
+    }
+
+@api.post("/account/restore")
+async def restore_account(u=Depends(current_user)):
+    if not u.get("deleted_at"):
+        raise HTTPException(400, "Account is not pending deletion")
+    deleted_at = _aware(u["deleted_at"])
+    if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
+        raise HTTPException(400, "Restore window has expired; account was permanently deleted")
+    await db.users.update_one({"id": u["id"]}, {"$set": {"deleted_at": None}})
+    await db.account_deletions.delete_many({"user_id": u["id"], "deleted_at": u["deleted_at"]})
+    return {"message": "Account restored successfully"}
+
+@api.get("/account/deletion-status")
+async def deletion_status(u=Depends(current_user)):
+    if not u.get("deleted_at"):
+        return {"pending_delete": False}
+    deleted_at = _aware(u["deleted_at"])
+    deadline = deleted_at + timedelta(days=DELETE_GRACE_DAYS)
+    return {"pending_delete": True, "restore_deadline": deadline.isoformat(), "days_left": max(0, (deadline - now()).days)}
 
 # ── Profile ──────────────────────────────────────────────────
 @api.patch("/profile")
@@ -445,7 +547,7 @@ async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
 # ── Users ────────────────────────────────────────────────────
 @api.get("/users")
 async def list_users(continent: Optional[str] = None, q: Optional[str] = None, skip: int = 0, limit: int = 50, u=Depends(current_user)):
-    query = {"id": {"$ne": u["id"]}, "is_verified": True}
+    query = {"id": {"$ne": u["id"]}, "is_verified": True, "deleted_at": None}
     if continent and continent != "All": query["continent"] = continent
     if q:
         query["$or"] = [
