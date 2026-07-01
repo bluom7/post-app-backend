@@ -755,8 +755,10 @@ async def create_post(p: PostIn, u=Depends(current_user)):
     return doc
 
 @api.get("/posts")
-async def list_posts(q: Optional[str] = None, skip: int = 0, limit: int = 50, u=Depends(current_user)):
+async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, skip: int = 0, limit: int = 50, u=Depends(current_user)):
     query = {}
+    if user_id:
+        query["user_id"] = user_id
     if q:
         query["$or"] = [
             {"content": {"$regex": q, "$options": "i"}}, 
