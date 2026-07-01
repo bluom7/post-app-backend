@@ -63,66 +63,82 @@ def send_otp_email(email, code):
     try:
         import resend
         resend.api_key = RESEND_API_KEY
-        
+
+        plain_text = f"""Hi,
+
+Your POST App verification code is: {code}
+
+This code is valid for 10 minutes only.
+
+If you did not request this code, please ignore this email.
+
+- POST App Team
+postbluom.online"""
+
         html_body = f"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>POST Verification Code</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Your POST App Code</title>
 </head>
-<body style="margin:0; padding:0; background-color:#f5f5f5; font-family:Arial,sans-serif;">
-    <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f5f5f5;">
-        <tr>
-            <td style="padding:20px;">
-                <table width="100%" style="max-width:500px; margin:0 auto; background-color:#111111; border-radius:12px; border:1px solid #333; padding:40px; color:#fff;">
-                    <tr>
-                        <td style="text-align:center; padding-bottom:30px;">
-                            <h1 style="margin:0; font-size:48px; font-weight:900; letter-spacing:8px; color:#FFD600;">POST</h1>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="text-align:center; padding:0 0 30px 0;">
-                            <p style="margin:0 0 20px 0; font-size:16px; color:#ccc;">
-                                Your verification code is:
-                            </p>
-                            <div style="background:#FFD600; color:#000; font-size:36px; font-weight:900; letter-spacing:8px; padding:20px; border-radius:8px; margin:20px 0; word-break:break-all;">
-                                {code}
-                            </div>
-                            <p style="margin:20px 0 0 0; font-size:14px; color:#999;">
-                                Valid for <strong>10 minutes only</strong>
-                            </p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="text-align:center; padding-top:30px; border-top:1px solid #333;">
-                            <p style="margin:15px 0; font-size:12px; color:#666;">
-                                Did not request this code? You can safely ignore this email.
-                            </p>
-                            <p style="margin:5px 0; font-size:11px; color:#555;">
-                                © 2025 POST App. All rights reserved.
-                            </p>
-                            <p style="margin:5px 0; font-size:10px; color:#444;">
-                                This is a transactional email. You are receiving this because someone requested a verification code for this email address.
-                            </p>
-                        </td>
-                    </tr>
-                </table>
+<body style="margin:0;padding:0;background:#ffffff;font-family:Arial,Helvetica,sans-serif;color:#111111;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;">
+    <tr>
+      <td style="padding:40px 20px;">
+        <table role="presentation" width="100%" style="max-width:480px;margin:0 auto;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;padding:40px;">
+          <tr>
+            <td style="padding-bottom:24px;border-bottom:1px solid #eeeeee;">
+              <p style="margin:0;font-size:22px;font-weight:900;letter-spacing:4px;">
+                <span style="color:#FFD600;">P</span><span style="color:#00C853;">O</span><span style="color:#FF1744;">S</span><span style="color:#29B6F6;">T</span>
+                <span style="font-size:14px;font-weight:400;color:#666;letter-spacing:1px;margin-left:8px;">App</span>
+              </p>
             </td>
-        </tr>
-    </table>
+          </tr>
+          <tr>
+            <td style="padding:32px 0 24px 0;">
+              <p style="margin:0 0 8px 0;font-size:15px;color:#333;">Hi,</p>
+              <p style="margin:0 0 24px 0;font-size:15px;color:#333;line-height:1.6;">
+                Here is your verification code for POST App:
+              </p>
+              <table role="presentation" width="100%">
+                <tr>
+                  <td style="text-align:center;padding:20px 0;">
+                    <span style="display:inline-block;background:#f5f5f5;border:2px solid #FFD600;border-radius:8px;padding:16px 32px;font-size:32px;font-weight:900;letter-spacing:10px;color:#111111;">{code}</span>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:16px 0 0 0;font-size:13px;color:#888;text-align:center;">
+                This code expires in <strong>10 minutes</strong>.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-top:24px;border-top:1px solid #eeeeee;">
+              <p style="margin:0 0 8px 0;font-size:13px;color:#999;">
+                If you did not request this code, you can safely ignore this email.
+              </p>
+              <p style="margin:0;font-size:12px;color:#bbb;">
+                &copy; 2025 POST App &middot; postbluom.online
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
 </html>"""
-        
+
         resend.Emails.send({
             "from": "POST App <noreply@postbluom.online>",
             "to": [email],
-            "subject": f"POST App - Your verification code is {code}",
+            "subject": "Your POST App verification code",
             "html": html_body,
+            "text": plain_text,
             "reply_to": "support@postbluom.online",
             "headers": {
                 "X-Entity-Ref-ID": str(uuid.uuid4()),
-                "List-Unsubscribe": "<mailto:support@postbluom.online?subject=unsubscribe>",
             },
         })
         logging.info(f"✅ OTP email sent to {email}")
