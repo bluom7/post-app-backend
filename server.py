@@ -430,9 +430,10 @@ async def forgot_password_init(p: ForgotPasswordInitIn):
     is_email = "@" in identifier
     if is_email:
         send_otp_email(identifier, code)
+        return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email"}
     else:
-        send_otp_sms(identifier, code)
-    return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email" if is_email else "sms"}
+        sms_sent = send_otp_sms(identifier, code)
+        return {"message": "OTP sent", "demo_otp": code if not sms_sent else None, "method": "sms"}
 
 @api.post("/auth/forgot-password-verify")
 async def forgot_password_verify(p: ForgotPasswordVerifyIn):
