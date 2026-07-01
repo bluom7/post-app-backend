@@ -252,9 +252,13 @@ class ProfileUpdate(BaseModel):
     handle: Optional[str] = None
     location: Optional[str] = None
     about: Optional[str] = None
+    website: Optional[str] = None
     avatar_bg: Optional[str] = None
     avatar_letter: Optional[str] = None
     avatar_photo: Optional[str] = None
+    profile_video: Optional[str] = None
+    cover_photo: Optional[str] = None
+    cover_video: Optional[str] = None
     language: Optional[str] = None
 
     @field_validator("username")
@@ -308,8 +312,10 @@ async def signup(p: SignupIn):
         "password_hash": hashpw(p.password), "is_verified": False,
         "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10),
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
-        "avatar_photo": None, "location": "", "about": "", "language": "en",
+        "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
+        "website": "", "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
+        "is_online": False, "last_seen": None,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -403,8 +409,10 @@ async def email_signup(p: EmailSignupIn):
         "handle": f"@{p.username}", "dob": p.dob,
         "password_hash": hashpw(p.password), "is_verified": True,
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
-        "avatar_photo": None, "location": "", "about": "", "language": "en",
+        "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
+        "website": "", "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
+        "is_online": False, "last_seen": None,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -457,8 +465,10 @@ async def phone_signup(p: PhoneSignupIn):
         "name": p.name, "username": p.username, "handle": f"@{p.username}", "dob": p.dob,
         "password_hash": hashpw(p.password), "is_verified": True,
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
-        "avatar_photo": None, "location": "", "about": "", "language": "en",
+        "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
+        "website": "", "location": "", "about": "", "language": "en",
         "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
+        "is_online": False, "last_seen": None,
         "followers": [], "following": [], "blocked_users": [], "notifications_prefs": {
             "likes": True, "comments": True, "friend_requests": True, "messages": True
         }
@@ -534,6 +544,7 @@ async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
         upd["handle"] = f"@{upd['username']}"
     if upd:
         await db.users.update_one({"id": u["id"]}, {"$set": upd})
+        # Sync identity fields to posts
         post_upd = {}
         if "name" in upd: post_upd["user_name"] = upd["name"]
         if "handle" in upd: post_upd["user_handle"] = upd["handle"]
@@ -542,7 +553,37 @@ async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
         if "avatar_photo" in upd: post_upd["avatar_photo"] = upd["avatar_photo"]
         if post_upd:
             await db.posts.update_many({"user_id": u["id"]}, {"$set": post_upd})
+        # Sync identity fields to comments inside posts
+        comment_upd = {}
+        if "name" in upd: comment_upd["comments.$[c].user_name"] = upd["name"]
+        if "handle" in upd: comment_upd["comments.$[c].user_handle"] = upd["handle"]
+        if "avatar_bg" in upd: comment_upd["comments.$[c].avatar_bg"] = upd["avatar_bg"]
+        if "avatar_letter" in upd: comment_upd["comments.$[c].avatar_letter"] = upd["avatar_letter"]
+        if "avatar_photo" in upd: comment_upd["comments.$[c].avatar_photo"] = upd["avatar_photo"]
+        if comment_upd:
+            await db.posts.update_many(
+                {"comments.user_id": u["id"]},
+                {"$set": comment_upd},
+                array_filters=[{"c.user_id": u["id"]}]
+            )
+        # Sync name/avatar to messages sent by user
+        msg_upd = {}
+        if "name" in upd: msg_upd["from_name"] = upd["name"]
+        if "avatar_bg" in upd: msg_upd["avatar_bg"] = upd["avatar_bg"]
+        if "avatar_photo" in upd: msg_upd["avatar_photo"] = upd["avatar_photo"]
+        if msg_upd:
+            await db.messages.update_many({"from_user_id": u["id"]}, {"$set": msg_upd})
     return await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+
+@api.patch("/profile/online")
+async def update_online_status(body: dict, u=Depends(current_user)):
+    """Mark user online or offline; updates last_seen timestamp"""
+    is_online = body.get("is_online", True)
+    await db.users.update_one(
+        {"id": u["id"]},
+        {"$set": {"is_online": is_online, "last_seen": now().isoformat()}}
+    )
+    return {"ok": True}
 
 # ── Users ────────────────────────────────────────────────────
 @api.get("/users")
