@@ -943,8 +943,14 @@ async def get_following(user_id: str, u=Depends(current_user)):
 @api.post("/friends/request")
 async def friend_request(p: FriendIn, u=Depends(current_user)):
     if p.target_user_id == u["id"]: raise HTTPException(400, "Can't friend yourself")
+    # Check outgoing duplicate
     existing = await db.friend_requests.find_one({"from_id": u["id"], "to_id": p.target_user_id})
     if existing: return {"status": existing["status"]}
+    # Check reverse: target already sent us a request → auto-accept both sides
+    reverse = await db.friend_requests.find_one({"from_id": p.target_user_id, "to_id": u["id"], "status": "pending"})
+    if reverse:
+        await db.friend_requests.update_one({"_id": reverse["_id"]}, {"$set": {"status": "accepted"}})
+        return {"status": "accepted"}
     await db.friend_requests.insert_one({
         "id": str(uuid.uuid4()), 
         "from_id": u["id"], 
@@ -993,21 +999,21 @@ async def list_friends(u=Depends(current_user)):
     friend_ids = [r["to_id"] if r["from_id"] == u["id"] else r["from_id"] for r in accepted]
     pending_in = await db.friend_requests.find({"to_id": u["id"], "status": "pending"}, {"_id": 0}).to_list(500)
     pending_out = await db.friend_requests.find({"from_id": u["id"], "status": "pending"}, {"_id": 0}).to_list(500)
-    friends = await db.users.find(
-        {"id": {"$in": friend_ids}}, 
-        {"_id": 0, "password_hash": 0, "otp_hash": 0}
-    ).to_list(500)
 
-    # Populate user info for pending incoming requests
-    in_from_ids = [r["from_id"] for r in pending_in]
-    out_to_ids  = [r["to_id"]   for r in pending_out]
+    # Public profile fields only — no PII (email, phone, otp, etc.)
+    PUBLIC_FIELDS = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+                     "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1,
+                     "category": 1, "location": 1, "about": 1, "cover_photo": 1,
+                     "stats": 1, "following": 1}
 
-    in_users_list = await db.users.find(
-        {"id": {"$in": in_from_ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}
-    ).to_list(500) if in_from_ids else []
-    out_users_list = await db.users.find(
-        {"id": {"$in": out_to_ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}
-    ).to_list(500) if out_to_ids else []
+    friends = await db.users.find({"id": {"$in": friend_ids}}, PUBLIC_FIELDS).to_list(500)
+
+    # Populate user info for pending incoming / outgoing requests
+    in_from_ids  = [r["from_id"] for r in pending_in]
+    out_to_ids   = [r["to_id"]   for r in pending_out]
+
+    in_users_list  = await db.users.find({"id": {"$in": in_from_ids}},  PUBLIC_FIELDS).to_list(500) if in_from_ids  else []
+    out_users_list = await db.users.find({"id": {"$in": out_to_ids}},   PUBLIC_FIELDS).to_list(500) if out_to_ids   else []
 
     in_users  = {usr["id"]: usr for usr in in_users_list}
     out_users = {usr["id"]: usr for usr in out_users_list}
