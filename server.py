@@ -943,14 +943,17 @@ async def get_following(user_id: str, u=Depends(current_user)):
 @api.post("/friends/request")
 async def friend_request(p: FriendIn, u=Depends(current_user)):
     if p.target_user_id == u["id"]: raise HTTPException(400, "Can't friend yourself")
-    # Check outgoing duplicate
+    # Block duplicate outgoing request
     existing = await db.friend_requests.find_one({"from_id": u["id"], "to_id": p.target_user_id})
     if existing: return {"status": existing["status"]}
-    # Check reverse: target already sent us a request → auto-accept both sides
-    reverse = await db.friend_requests.find_one({"from_id": p.target_user_id, "to_id": u["id"], "status": "pending"})
-    if reverse:
-        await db.friend_requests.update_one({"_id": reverse["_id"]}, {"$set": {"status": "accepted"}})
-        return {"status": "accepted"}
+    # Block if already accepted (friends)
+    already_accepted = await db.friend_requests.find_one({
+        "$or": [
+            {"from_id": u["id"], "to_id": p.target_user_id, "status": "accepted"},
+            {"from_id": p.target_user_id, "to_id": u["id"], "status": "accepted"},
+        ]
+    })
+    if already_accepted: return {"status": "accepted"}
     await db.friend_requests.insert_one({
         "id": str(uuid.uuid4()), 
         "from_id": u["id"], 
