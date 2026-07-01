@@ -1120,6 +1120,7 @@ async def root():
 @api.post("/auth/add-phone-init")
 async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
     """Send SMS OTP to add phone (required for email-registered users)."""
+    if u.get("signup_method") != "email": raise HTTPException(403, "This endpoint is only for email-registered accounts")
     if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
     existing = await db.users.find_one({"phone": p.phone, "is_verified": True, "id": {"$ne": u["id"]}})
     if existing: raise HTTPException(400, "This phone is already registered to another account")
@@ -1135,6 +1136,7 @@ async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
 @api.post("/auth/add-phone-verify")
 async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
     """Verify SMS OTP and save phone."""
+    if u.get("signup_method") != "email": raise HTTPException(403, "This endpoint is only for email-registered accounts")
     if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
     rec = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
     if not rec: raise HTTPException(400, "OTP not found. Please request a new one.")
@@ -1149,6 +1151,7 @@ async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
 @api.post("/auth/add-email-init")
 async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
     """Send email OTP to add email (required for phone-registered users)."""
+    if u.get("signup_method") != "phone": raise HTTPException(403, "This endpoint is only for phone-registered accounts")
     if u.get("email_verified"): raise HTTPException(400, "Email already verified")
     existing = await db.users.find_one({"email": p.email, "is_verified": True, "id": {"$ne": u["id"]}})
     if existing: raise HTTPException(400, "This email is already registered to another account")
@@ -1164,6 +1167,7 @@ async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
 @api.post("/auth/add-email-verify")
 async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
     """Verify email OTP and save email."""
+    if u.get("signup_method") != "phone": raise HTTPException(403, "This endpoint is only for phone-registered accounts")
     if u.get("email_verified"): raise HTTPException(400, "Email already verified")
     rec = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
     if not rec: raise HTTPException(400, "OTP not found. Please request a new one.")
