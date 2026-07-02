@@ -717,7 +717,8 @@ async def update_online_status(body: dict, u=Depends(current_user)):
 # ── Users ────────────────────────────────────────────────────
 @api.get("/users")
 async def list_users(continent: Optional[str] = None, q: Optional[str] = None, skip: int = 0, limit: int = 50, u=Depends(current_user)):
-    query = {"id": {"$ne": u["id"]}, "is_verified": True, "deleted_at": None}
+    excluded_ids = list(set([u["id"]] + (u.get("following") or [])))
+    query = {"id": {"$nin": excluded_ids}, "is_verified": True, "deleted_at": None}
     if continent and continent != "All": query["continent"] = continent
     if q:
         query["$or"] = [
