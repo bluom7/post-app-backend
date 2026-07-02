@@ -728,17 +728,61 @@ async def get_user(user_id: str, u=Depends(current_user)):
     """Get user profile with stats"""
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
     if not user: raise HTTPException(404, "User not found")
-    
+
+    is_self = user_id == u["id"]
+    is_follower = u["id"] in user.get("followers", [])
+    is_private = user.get("is_private", False)
+
+    # Private account: viewer is not a follower and not self → locked profile
+    is_private_locked = is_private and not is_follower and not is_self
+
+    # Check if viewer has a pending follow request to this private account
+    pending_req = None
+    if is_private_locked:
+        pending_req = await db.follow_requests.find_one(
+            {"from_id": u["id"], "to_id": user_id, "status": "pending"}
+        )
+
     posts_count = await db.posts.count_documents({"user_id": user_id})
     is_mutual = user_id in u.get("following", []) and u["id"] in (user.get("following") or [])
-    is_following_you = u["id"] in user.get("following", [])  # does this user follow the viewer?
+    is_following_you = u["id"] in user.get("following", [])
     followers_count = len(user.get("followers", []))
     following_count = len(user.get("following", []))
-    
+
+    base = {
+        "id": user["id"],
+        "name": user.get("name"),
+        "handle": user.get("handle"),
+        "username": user.get("username"),
+        "avatar_bg": user.get("avatar_bg"),
+        "avatar_letter": user.get("avatar_letter"),
+        "avatar_photo": user.get("avatar_photo"),
+        "is_private": is_private,
+        "account_type": user.get("account_type"),
+        "is_badge_verified": user.get("is_badge_verified"),
+        "category": user.get("category"),
+        "is_mutual": is_mutual,
+        "is_following_you": is_following_you,
+        "is_private_locked": is_private_locked,
+        "has_pending_request": bool(pending_req),
+        "stats": {
+            "posts": posts_count,
+            "followers": followers_count,
+            "following": following_count
+        }
+    }
+
+    if is_private_locked:
+        # Return only basic info — no about, location, website, posts
+        return base
+
+    # Full profile for public accounts or approved followers
     return {
         **user,
         "is_mutual": is_mutual,
         "is_following_you": is_following_you,
+        "is_private_locked": False,
+        "has_pending_request": False,
         "stats": {
             "posts": posts_count,
             "followers": followers_count,
@@ -766,6 +810,11 @@ async def create_post(p: PostIn, u=Depends(current_user)):
 async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, skip: int = 0, limit: int = 50, feed: bool = False, u=Depends(current_user)):
     query = {}
     if user_id:
+        # Private account check — only followers can see posts
+        target_user = await db.users.find_one({"id": user_id}, {"is_private": 1, "followers": 1})
+        if target_user and target_user.get("is_private") and user_id != u["id"]:
+            if u["id"] not in target_user.get("followers", []):
+                return {"posts": [], "total": 0, "skip": skip, "limit": limit, "private_locked": True}
         query["user_id"] = user_id
     if q:
         query["$or"] = [
