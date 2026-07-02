@@ -730,13 +730,15 @@ async def get_user(user_id: str, u=Depends(current_user)):
     if not user: raise HTTPException(404, "User not found")
     
     posts_count = await db.posts.count_documents({"user_id": user_id})
-    is_mutual = user_id in u.get("following", []) and u["id"] in (target.get("following") or [])
+    is_mutual = user_id in u.get("following", []) and u["id"] in (user.get("following") or [])
+    is_following_you = u["id"] in user.get("following", [])  # does this user follow the viewer?
     followers_count = len(user.get("followers", []))
     following_count = len(user.get("following", []))
     
     return {
         **user,
         "is_mutual": is_mutual,
+        "is_following_you": is_following_you,
         "stats": {
             "posts": posts_count,
             "followers": followers_count,
@@ -1145,12 +1147,15 @@ async def send_message(p: MessageIn, u=Depends(current_user)):
     if recipient.get("is_badge_verified"):
         raise HTTPException(403, "Cannot message verified public figures")
     
-    same_continent = (u.get("continent") or "").strip() == (recipient.get("continent") or "").strip() and u.get("continent")
-    is_connected = p.to_user_id in u.get("following", []) and u["id"] in recipient.get("following", [])
+    same_continent = (u.get("continent") or "").strip() == (recipient.get("continent") or "").strip() and bool(u.get("continent"))
     
     if not same_continent:
-        # Different continent — must be connected (mutual follow)
-        if not is_connected:
+        # Different continent — must be connected via friend/connect system
+        fr = await db.friend_requests.find_one({
+            "status": "accepted",
+            "$or": [{"from_id": u["id"], "to_id": p.to_user_id}, {"from_id": p.to_user_id, "to_id": u["id"]}]
+        })
+        if not fr:
             raise HTTPException(403, "Connect with this user first to message across countries")
     
     m = {
