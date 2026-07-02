@@ -1330,7 +1330,14 @@ async def change_password(p: ChangePasswordIn, u=Depends(current_user)):
 async def check_username(username: str, u=Depends(current_user)):
     """Check if a username is available (excluding current user)"""
     import re
-    if not re.match(r'^[a-z0-9_]{3,30} (POST's own — no Google dependency) ─────────
+    if not re.match(r'^[a-z0-9_]{3,30}$', username):
+        return {"available": False, "reason": "3-30 chars, only a-z 0-9 _"}
+    existing = await db.users.find_one({"username": username})
+    if existing and existing["id"] != u["id"]:
+        return {"available": False, "reason": "Already taken"}
+    return {"available": True, "reason": "Available!"}
+
+# ── Translation (POST own, no Google dependency) ─────────
 TRANSLATE_LANG_MAP = {
     "zh": "zh-CN", "en": "en", "hi": "hi", "ur": "ur", "es": "es",
     "fr": "fr", "ar": "ar", "pt": "pt", "de": "de", "ja": "ja",
