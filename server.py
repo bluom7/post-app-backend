@@ -806,6 +806,7 @@ async def create_post(p: PostIn, u=Depends(current_user)):
         "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
         "content": p.content, "accent": p.accent, "location": p.location or "",
         "photo_url": p.photo_url or None,
+        "user_location": u.get("location", ""),
         "likes": [], "comments": [], "views": [], "created_at": now().isoformat(),
         "edited_at": None, "is_pinned": False
     }
