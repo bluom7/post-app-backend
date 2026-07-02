@@ -1516,13 +1516,6 @@ app.include_router(api)
 
 @app.on_event("shutdown")
 async def shutdown(): client.close()
-, username):
-        return {"available": False, "reason": "3-30 chars, only a-z 0-9 _"}
-    existing = await db.users.find_one({"username": username})
-    if existing and existing["id"] != u["id"]:
-        return {"available": False, "reason": "Already taken"}
-    return {"available": True, "reason": "Available!"}
-
 # ── Translation (POST's own — no Google dependency) ─────────
 TRANSLATE_LANG_MAP = {
     "zh": "zh-CN", "en": "en", "hi": "hi", "ur": "ur", "es": "es",
