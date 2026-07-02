@@ -441,7 +441,7 @@ async def signup(p: SignupIn):
         await db.users.update_one({"id": uid}, {"$set": doc})
     else:
         await db.users.insert_one(doc)
-    asyncio.create_task(run_in_bg(send_otp_email(p.email, code)))
+    asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
     return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
 @api.post("/auth/verify-otp")
@@ -483,7 +483,7 @@ async def resend_otp(body: dict):
     if not u: raise HTTPException(400, "User not found")
     code = f"{random.randint(0,9999):04d}"
     await db.users.update_one({"id": u["id"]}, {"$set": {"otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10)}})
-    asyncio.create_task(run_in_bg(send_otp_email(u["email"], code)))
+    asyncio.create_task(run_in_bg(send_otp_email, u["email"], code))
     return {"message": "Resent", "demo_otp": code if DEMO_MODE else None}
 
 
@@ -512,10 +512,10 @@ async def forgot_password_init(p: ForgotPasswordInitIn):
     )
     is_email = "@" in identifier
     if is_email:
-        asyncio.create_task(run_in_bg(send_otp_email(identifier, code)))
+        asyncio.create_task(run_in_bg(send_otp_email, identifier, code))
         return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email"}
     else:
-        sms_sent = await run_in_bg(send_otp_sms(identifier, code))
+        sms_sent = await run_in_bg(send_otp_sms, identifier, code)
         return {"message": "OTP sent", "demo_otp": code if not sms_sent else None, "method": "sms"}
 
 @api.post("/auth/forgot-password-verify")
@@ -551,7 +551,7 @@ async def email_signup_init(p: EmailInitIn):
         {"$set": {"email": p.email, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False}},
         upsert=True
     )
-    asyncio.create_task(run_in_bg(send_otp_email(p.email, code)))
+    asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
     return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
 @api.post("/auth/email-verify-init")
@@ -609,7 +609,7 @@ async def phone_signup_init(p: PhoneInitIn):
         {"$set": {"phone": p.phone, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False}},
         upsert=True
     )
-    sms_sent = await run_in_bg(send_otp_sms(p.phone, code))
+    sms_sent = await run_in_bg(send_otp_sms, p.phone, code)
     return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
 
 @api.post("/auth/phone-verify-init")
@@ -1658,7 +1658,7 @@ async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
         {"$set": {"phone": p.phone, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
         upsert=True
     )
-    sms_sent = await run_in_bg(send_otp_sms(p.phone, code))
+    sms_sent = await run_in_bg(send_otp_sms, p.phone, code)
     return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
 
 @api.post("/auth/add-phone-verify")
@@ -1689,7 +1689,7 @@ async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
         {"$set": {"email": p.email, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
         upsert=True
     )
-    asyncio.create_task(run_in_bg(send_otp_email(p.email, code)))
+    asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
     return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
 @api.post("/auth/add-email-verify")
@@ -1846,7 +1846,7 @@ async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
         {"$set": {"phone": p.phone, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
         upsert=True
     )
-    sms_sent = await run_in_bg(send_otp_sms(p.phone, code))
+    sms_sent = await run_in_bg(send_otp_sms, p.phone, code)
     return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
 
 @api.post("/auth/add-phone-verify")
@@ -1877,7 +1877,7 @@ async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
         {"$set": {"email": p.email, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
         upsert=True
     )
-    asyncio.create_task(run_in_bg(send_otp_email(p.email, code)))
+    asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
     return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
 @api.post("/auth/add-email-verify")
@@ -1896,53 +1896,4 @@ async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
     return {"message": "Email verified successfully", "token": make_token(u["id"])}
 
 # ── Seed ─────────────────────────────────────────────────────
-@app.on_event("startup")
-async def seed():
-    if await db.users.count_documents({"is_seed": True}) > 0: return
-    WORLD = [
-        ("Aryan","@aryan_world","Mumbai, India","Photographer & traveller 📷","Asia","#FFD600"),
-        ("Bella","@bella_creates","London, UK","Designer. Coffee lover ☕","Europe","#00C853"),
-        ("Carlos","@carlos_global","Mexico City","Entrepreneur 🚀","Americas","#29B6F6"),
-        ("Yuki","@yuki_jp","Tokyo, Japan","Manga artist 🎨","Asia","#00C853"),
-        ("Fatima","@fatima_sa","Riyadh, Saudi Arabia","Writer & poet ✍️","Asia","#FF1744"),
-        ("Pierre","@pierre_fr","Paris, France","Chef & food blogger 🥐","Europe","#FF1744"),
-        ("Lucas","@lucas_br","São Paulo, Brazil","Carnaval organizer 🎉","Americas","#00C853"),
-        ("Chioma","@chioma_ng","Lagos, Nigeria","Fashion designer 👗","Africa","#29B6F6"),
-        ("Jack","@jack_au","Sydney, Australia","Surfer & barista ☕","Oceania","#00C853"),
-        ("Soo-Jin","@soojin_kr","Seoul, South Korea","K-pop enthusiast 🎵","Asia","#FF1744"),
-        ("Anna","@anna_se","Stockholm, Sweden","Environmentalist 🌿","Europe","#29B6F6"),
-        ("Amara","@amara_ke","Nairobi, Kenya","Safari guide 🦁","Africa","#FFD600"),
-    ]
-    for name, handle, loc, about, continent, color in WORLD:
-        uid = str(uuid.uuid4())
-        await db.users.insert_one({
-            "id": uid, 
-            "email": f"{handle[1:]}@post.demo", 
-            "username": handle[1:], 
-            "name": name, 
-            "handle": handle, 
-            "is_verified": True, 
-            "is_seed": True, 
-            "avatar_bg": color,
-            "avatar_letter": name[0], 
-            "location": loc, 
-            "about": about, 
-            "continent": continent,
-            "created_at": now(),
-            "followers": [],
-            "following": [],
-            "blocked_users": [],
-            "notifications_prefs": {
-                "likes": True,
-                "comments": True,
-                "friend_requests": True,
-                "messages": True
-            }
-        })
-    logging.info("✅ World users seeded")
-
-
-
-@app.on_event("shutdown")
-async def shutdown(): client.close()
 
