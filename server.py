@@ -1942,7 +1942,6 @@ async def seed():
     logging.info("✅ World users seeded")
 
 
-app.include_router(api)
 
 @app.on_event("shutdown")
 async def shutdown(): client.close()
