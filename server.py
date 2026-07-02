@@ -1806,6 +1806,24 @@ async def seed():
         })
     logging.info("✅ World users seeded")
 
+
+# ── TEMP DEV: one-time password reset (remove after use) ─────────────────────
+@api.post("/dev/reset-pw")
+async def dev_reset_pw(body: dict):
+    dev_key = body.get("dev_key", "")
+    if dev_key != "postdev2024reset":
+        raise HTTPException(403, "Forbidden")
+    email = body.get("email", "").strip()
+    new_pw = body.get("new_password", "").strip()
+    if not email or not new_pw:
+        raise HTTPException(400, "email and new_password required")
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+    new_hash = await hashpw(new_pw)
+    await db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": new_hash}})
+    return {"ok": True, "msg": f"Password reset for {email}. Login now works."}
+
 app.include_router(api)
 
 @app.on_event("shutdown")
@@ -1939,6 +1957,24 @@ async def seed():
             }
         })
     logging.info("✅ World users seeded")
+
+
+# ── TEMP DEV: one-time password reset (remove after use) ─────────────────────
+@api.post("/dev/reset-pw")
+async def dev_reset_pw(body: dict):
+    dev_key = body.get("dev_key", "")
+    if dev_key != "postdev2024reset":
+        raise HTTPException(403, "Forbidden")
+    email = body.get("email", "").strip()
+    new_pw = body.get("new_password", "").strip()
+    if not email or not new_pw:
+        raise HTTPException(400, "email and new_password required")
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+    new_hash = await hashpw(new_pw)
+    await db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": new_hash}})
+    return {"ok": True, "msg": f"Password reset for {email}. Login now works."}
 
 app.include_router(api)
 
