@@ -833,9 +833,7 @@ async def list_posts(q: Optional[str] = None, user_id: Optional[str] = None, ski
     following_ids = u.get("following", [])
     if feed:
         feed_ids = list(set(following_ids + [u["id"]]))
-        if not following_ids:
-            query["user_id"] = u["id"]
-        else:
+        if following_ids:
             query["user_id"] = {"$in": feed_ids}
     posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     total = await db.posts.count_documents(query)
