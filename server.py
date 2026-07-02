@@ -39,10 +39,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 logging.basicConfig(level=logging.INFO)
 
 def now(): return datetime.now(timezone.utc)
-def hashpw(p): return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
-def verifypw(p, h):
-    try: return bcrypt.checkpw(p.encode(), h.encode())
+async def hashpw(p):
+    return await asyncio.to_thread(lambda: bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode())
+
+async def verifypw(p, h):
+    try: return await asyncio.to_thread(lambda: bcrypt.checkpw(p.encode(), h.encode()))
     except: return False
+
+async def run_in_bg(fn, *args):
+    """Run a blocking IO/CPU function in thread pool (non-blocking for asyncio)."""
+    return await asyncio.to_thread(fn, *args)
 def make_token(uid):
     return jwt.encode({"sub": uid, "exp": now() + timedelta(days=30)}, JWT_SECRET, algorithm="HS256")
 
@@ -383,8 +389,8 @@ async def signup(p: SignupIn):
     doc = {
         "id": uid, "email": p.email, "name": p.name, "username": p.username,
         "handle": f"@{p.username}",
-        "password_hash": hashpw(p.password), "is_verified": False,
-        "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10),
+        "password_hash": await hashpw(p.password), "is_verified": False,
+        "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10),
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
         "website": "", "location": "", "about": "", "language": "en",
@@ -399,7 +405,7 @@ async def signup(p: SignupIn):
         await db.users.update_one({"id": uid}, {"$set": doc})
     else:
         await db.users.insert_one(doc)
-    send_otp_email(p.email, code)
+    asyncio.create_task(run_in_bg(send_otp_email(p.email, code)))
     return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
 @api.post("/auth/verify-otp")
@@ -410,14 +416,14 @@ async def verify_otp(p: OtpIn):
     exp = u["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
     if now() > exp: raise HTTPException(400, "Code expired")
-    if not verifypw(p.otp, u["otp_hash"]): raise HTTPException(400, "Incorrect code")
+    if not await verifypw(p.otp, u["otp_hash"]): raise HTTPException(400, "Incorrect code")
     await db.users.update_one({"id": u["id"]}, {"$set": {"is_verified": True}, "$unset": {"otp_hash":"","otp_expires_at":""}})
     return {"token": make_token(u["id"]), "user_id": u["id"]}
 
 @api.post("/auth/login")
 async def login(p: LoginIn):
     u = await db.users.find_one({"email": p.email})
-    if not u or not verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid credentials")
+    if not u or not await verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid credentials")
     if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
     resp = {"token": make_token(u["id"]), "user_id": u["id"]}
     if u.get("deleted_at"):
@@ -434,8 +440,8 @@ async def resend_otp(body: dict):
     u = await db.users.find_one({"email": body.get("email")})
     if not u: raise HTTPException(400, "User not found")
     code = f"{random.randint(0,9999):04d}"
-    await db.users.update_one({"id": u["id"]}, {"$set": {"otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10)}})
-    send_otp_email(u["email"], code)
+    await db.users.update_one({"id": u["id"]}, {"$set": {"otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10)}})
+    asyncio.create_task(run_in_bg(send_otp_email(u["email"], code)))
     return {"message": "Resent", "demo_otp": code if DEMO_MODE else None}
 
 
@@ -458,16 +464,16 @@ async def forgot_password_init(p: ForgotPasswordInitIn):
     code = f"{random.randint(0,9999):04d}"
     await db.reset_otps.update_one(
         {"identifier": identifier},
-        {"$set": {"identifier": identifier, "user_id": user["id"], "otp_hash": hashpw(code),
+        {"$set": {"identifier": identifier, "user_id": user["id"], "otp_hash": await hashpw(code),
                   "otp_expires_at": now() + timedelta(minutes=10), "verified": False}},
         upsert=True
     )
     is_email = "@" in identifier
     if is_email:
-        send_otp_email(identifier, code)
+        asyncio.create_task(run_in_bg(send_otp_email(identifier, code)))
         return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email"}
     else:
-        sms_sent = send_otp_sms(identifier, code)
+        sms_sent = await run_in_bg(send_otp_sms(identifier, code))
         return {"message": "OTP sent", "demo_otp": code if not sms_sent else None, "method": "sms"}
 
 @api.post("/auth/forgot-password-verify")
@@ -477,7 +483,7 @@ async def forgot_password_verify(p: ForgotPasswordVerifyIn):
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
     if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.reset_otps.update_one({"identifier": p.identifier.strip()}, {"$set": {"verified": True}})
     return {"message": "OTP verified"}
 
@@ -486,7 +492,7 @@ async def forgot_password_reset(p: ForgotPasswordResetIn):
     rec = await db.reset_otps.find_one({"identifier": p.identifier.strip(), "verified": True})
     if not rec: raise HTTPException(400, "Not verified. Please verify OTP first.")
     if len(p.new_password) < 6: raise HTTPException(400, "Password must be at least 6 characters")
-    await db.users.update_one({"id": rec["user_id"]}, {"$set": {"password_hash": hashpw(p.new_password)}})
+    await db.users.update_one({"id": rec["user_id"]}, {"$set": {"password_hash": await hashpw(p.new_password)}})
     await db.reset_otps.delete_one({"identifier": p.identifier.strip()})
     return {"message": "Password reset successfully! Please log in."}
 
@@ -500,10 +506,10 @@ async def email_signup_init(p: EmailInitIn):
     code = f"{random.randint(0,9999):04d}"
     await db.email_otps.update_one(
         {"email": p.email},
-        {"$set": {"email": p.email, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False}},
+        {"$set": {"email": p.email, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False}},
         upsert=True
     )
-    send_otp_email(p.email, code)
+    asyncio.create_task(run_in_bg(send_otp_email(p.email, code)))
     return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
 @api.post("/auth/email-verify-init")
@@ -513,7 +519,7 @@ async def email_verify_init(p: EmailVerifyIn):
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
     if now() > exp: raise HTTPException(400, "OTP expired")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.email_otps.update_one({"email": p.email}, {"$set": {"verified": True}})
     return {"message": "Email verified"}
 
@@ -534,7 +540,7 @@ async def email_signup(p: EmailSignupIn):
     doc = {
         "id": uid, "email": p.email, "name": p.name, "username": p.username,
         "handle": f"@{p.username}", "dob": p.dob,
-        "password_hash": hashpw(p.password), "is_verified": True,
+        "password_hash": await hashpw(p.password), "is_verified": True,
         "signup_method": "email", "phone_verified": False, "phone": None,
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
@@ -558,10 +564,10 @@ async def phone_signup_init(p: PhoneInitIn):
     code = f"{random.randint(0,9999):04d}"
     await db.phone_otps.update_one(
         {"phone": p.phone},
-        {"$set": {"phone": p.phone, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False}},
+        {"$set": {"phone": p.phone, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False}},
         upsert=True
     )
-    sms_sent = send_otp_sms(p.phone, code)
+    sms_sent = await run_in_bg(send_otp_sms(p.phone, code))
     return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
 
 @api.post("/auth/phone-verify-init")
@@ -571,7 +577,7 @@ async def phone_verify_init(p: PhoneVerifyIn):
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
     if now() > exp: raise HTTPException(400, "OTP expired")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"verified": True}})
     return {"message": "Phone verified"}
 
@@ -592,7 +598,7 @@ async def phone_signup(p: PhoneSignupIn):
     doc = {
         "id": uid, "phone": p.phone, "email": None,
         "name": p.name, "username": p.username, "handle": f"@{p.username}", "dob": p.dob,
-        "password_hash": hashpw(p.password), "is_verified": True,
+        "password_hash": await hashpw(p.password), "is_verified": True,
         "signup_method": "phone", "email_verified": False,
         "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
         "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
@@ -611,7 +617,7 @@ async def phone_signup(p: PhoneSignupIn):
 @api.post("/auth/phone-login")
 async def phone_login(p: PhoneLoginIn):
     u = await db.users.find_one({"phone": p.phone})
-    if not u or not verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid phone or password")
+    if not u or not await verifypw(p.password, u.get("password_hash","")): raise HTTPException(400, "Invalid phone or password")
     if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
     resp = {"token": make_token(u["id"]), "user_id": u["id"]}
     if u.get("deleted_at"):
@@ -1457,11 +1463,11 @@ async def change_password(p: ChangePasswordIn, u=Depends(current_user)):
     """Verify the current password and set a new one"""
     # current_user excludes password_hash for security — re-fetch it for verification
     user_with_hash = await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 1})
-    if not user_with_hash or not verifypw(p.current_password, user_with_hash.get("password_hash", "")):
+    if not user_with_hash or not await verifypw(p.current_password, user_with_hash.get("password_hash", "")):
         raise HTTPException(400, "Current password is incorrect")
     if len(p.new_password) < 6:
         raise HTTPException(400, "New password must be at least 6 characters")
-    await db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": hashpw(p.new_password)}})
+    await db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": await hashpw(p.new_password)}})
     return {"message": "Password updated successfully"}
 
 # ── Username availability check ──────────────────────────────
@@ -1579,10 +1585,10 @@ async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
     code = f"{random.randint(0,9999):04d}"
     await db.phone_otps.update_one(
         {"phone": p.phone},
-        {"$set": {"phone": p.phone, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
+        {"$set": {"phone": p.phone, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
         upsert=True
     )
-    sms_sent = send_otp_sms(p.phone, code)
+    sms_sent = await run_in_bg(send_otp_sms(p.phone, code))
     return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
 
 @api.post("/auth/add-phone-verify")
@@ -1595,7 +1601,7 @@ async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
     if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.users.update_one({"id": u["id"]}, {"$set": {"phone": p.phone, "phone_verified": True}})
     await db.phone_otps.delete_one({"phone": p.phone})
     return {"message": "Phone verified successfully", "token": make_token(u["id"])}
@@ -1610,10 +1616,10 @@ async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
     code = f"{random.randint(0,9999):04d}"
     await db.email_otps.update_one(
         {"email": p.email},
-        {"$set": {"email": p.email, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
+        {"$set": {"email": p.email, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
         upsert=True
     )
-    send_otp_email(p.email, code)
+    asyncio.create_task(run_in_bg(send_otp_email(p.email, code)))
     return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
 @api.post("/auth/add-email-verify")
@@ -1626,7 +1632,7 @@ async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
     if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.users.update_one({"id": u["id"]}, {"$set": {"email": p.email, "email_verified": True}})
     await db.email_otps.delete_one({"email": p.email})
     return {"message": "Email verified successfully", "token": make_token(u["id"])}
@@ -1756,10 +1762,10 @@ async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
     code = f"{random.randint(0,9999):04d}"
     await db.phone_otps.update_one(
         {"phone": p.phone},
-        {"$set": {"phone": p.phone, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
+        {"$set": {"phone": p.phone, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
         upsert=True
     )
-    sms_sent = send_otp_sms(p.phone, code)
+    sms_sent = await run_in_bg(send_otp_sms(p.phone, code))
     return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
 
 @api.post("/auth/add-phone-verify")
@@ -1772,7 +1778,7 @@ async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
     if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.users.update_one({"id": u["id"]}, {"$set": {"phone": p.phone, "phone_verified": True}})
     await db.phone_otps.delete_one({"phone": p.phone})
     return {"message": "Phone verified successfully", "token": make_token(u["id"])}
@@ -1787,10 +1793,10 @@ async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
     code = f"{random.randint(0,9999):04d}"
     await db.email_otps.update_one(
         {"email": p.email},
-        {"$set": {"email": p.email, "otp_hash": hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
+        {"$set": {"email": p.email, "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"]}},
         upsert=True
     )
-    send_otp_email(p.email, code)
+    asyncio.create_task(run_in_bg(send_otp_email(p.email, code)))
     return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
 @api.post("/auth/add-email-verify")
@@ -1803,7 +1809,7 @@ async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
     exp = rec["otp_expires_at"]
     if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
     if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
-    if not verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+    if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
     await db.users.update_one({"id": u["id"]}, {"$set": {"email": p.email, "email_verified": True}})
     await db.email_otps.delete_one({"email": p.email})
     return {"message": "Email verified successfully", "token": make_token(u["id"])}
