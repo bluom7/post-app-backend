@@ -144,6 +144,19 @@ try:
             raise HTTPException(403, detail={"code": "SECONDARY_REQUIRED", "type": "email"})
         return u
 
+    # ── One-time reset: force old accounts to new theme/notification defaults ──
+    async def _migrate_prefs_defaults(u: dict):
+        if u.get("prefs_migrated"):
+            return
+        await db.users.update_one(
+            {"id": u["id"]},
+            {"$set": {
+                "theme": "light",
+                "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False},
+                "prefs_migrated": True,
+            }},
+        )
+
     # ── Background hash migration helper ─────────────────────────
     async def _migrate_hash(uid: str, password: str):
         try:
@@ -506,6 +519,7 @@ postbluom.online"""
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         if _is_bcrypt(pw_hash):
             asyncio.create_task(_migrate_hash(u["id"], p.password))
+        await _migrate_prefs_defaults(u)
         resp = {"token": make_token(u["id"]), "user_id": u["id"]}
         if u.get("deleted_at"):
             deleted_at = _aware(u["deleted_at"])
@@ -717,6 +731,7 @@ postbluom.online"""
         if u and _is_bcrypt(pw_hash_p):
             asyncio.create_task(_migrate_hash(u["id"], p.password))
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
+        await _migrate_prefs_defaults(u)
         resp = {"token": make_token(u["id"]), "user_id": u["id"]}
         if u.get("deleted_at"):
             deleted_at = _aware(u["deleted_at"])
