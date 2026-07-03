@@ -1107,7 +1107,7 @@ postbluom.online"""
             viewer_can_see = set(following_ids + [u["id"]])
             priv_docs = await db.users.find(
                 {"is_private": True, "id": {"$nin": list(viewer_can_see)}}, {"id": 1, "_id": 0}
-            ).to_list(10000)
+            ).to_list(None)
             private_ids = [p["id"] for p in priv_docs]
             if private_ids:
                 query["user_id"] = {"$nin": private_ids}
