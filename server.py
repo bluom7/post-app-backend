@@ -583,12 +583,18 @@ postbluom.online"""
         await check_delete_recreate_abuse(p.email)
         existing = await db.users.find_one({"email": p.email, "is_verified": True})
         if existing: raise HTTPException(400, "Email already registered")
+                _r = await db.email_otps.find_one({"email": p.email})
+        if _r and _r.get("otp_sent_at"):
+            _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 60:
+                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
         code = f"{random.randint(0,9999):04d}"
         await db.email_otps.update_one(
             {"email": p.email},
             {"$set": {
                 "email": p.email, "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
+                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
             }},
             upsert=True,
         )
@@ -641,17 +647,25 @@ postbluom.online"""
     async def phone_signup_init(p: PhoneInitIn):
         await purge_expired_deleted_account("phone", p.phone)
         await check_delete_recreate_abuse(p.phone)
+                _r = await db.phone_otps.find_one({"phone": p.phone})
+        if _r and _r.get("otp_sent_at"):
+            _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 60:
+                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
         code = f"{random.randint(0,9999):04d}"
         await db.phone_otps.update_one(
             {"phone": p.phone},
             {"$set": {
                 "phone": p.phone, "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
+                "otp_sent_at": now(), "_plain": None,
             }},
             upsert=True,
         )
         sms_sent = await run_in_bg(send_otp_sms, p.phone, code)
-        return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
+        demo = code if not sms_sent else None
+        if demo: await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"_plain": demo}})
+        return {"message": "OTP sent", "demo_otp": demo}
 
     @api.post("/auth/phone-verify-init")
     async def phone_verify_init(p: PhoneVerifyIn):
@@ -724,17 +738,25 @@ postbluom.online"""
         if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
         existing = await db.users.find_one({"phone": p.phone, "is_verified": True, "id": {"$ne": u["id"]}})
         if existing: raise HTTPException(400, "This phone is already registered to another account")
+                _r = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
+        if _r and _r.get("otp_sent_at"):
+            _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 60:
+                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
         code = f"{random.randint(0,9999):04d}"
         await db.phone_otps.update_one(
             {"phone": p.phone},
             {"$set": {
                 "phone": p.phone, "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"],
+                "otp_sent_at": now(), "_plain": None,
             }},
             upsert=True,
         )
         sms_sent = await run_in_bg(send_otp_sms, p.phone, code)
-        return {"message": "OTP sent", "demo_otp": code if not sms_sent else None}
+        demo = code if not sms_sent else None
+        if demo: await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"_plain": demo}})
+        return {"message": "OTP sent", "demo_otp": demo}
 
     @api.post("/auth/add-phone-verify")
     async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
@@ -756,12 +778,18 @@ postbluom.online"""
         if u.get("email_verified"): raise HTTPException(400, "Email already verified")
         existing = await db.users.find_one({"email": p.email, "is_verified": True, "id": {"$ne": u["id"]}})
         if existing: raise HTTPException(400, "This email is already registered to another account")
+                _r = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
+        if _r and _r.get("otp_sent_at"):
+            _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 60:
+                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
         code = f"{random.randint(0,9999):04d}"
         await db.email_otps.update_one(
             {"email": p.email},
             {"$set": {
                 "email": p.email, "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"],
+                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
             }},
             upsert=True,
         )
