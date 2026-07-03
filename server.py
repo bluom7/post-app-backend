@@ -229,7 +229,7 @@ postbluom.online"""
 </html>"""
 
             resend.Emails.send({
-                "from": "POST App <noreply@postbluom.online>",
+                "from": "POST App <otp@postbluom.online>",
                 "to": [email],
                 "subject": "Your POST App verification code",
                 "html": html_body,
