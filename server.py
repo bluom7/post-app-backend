@@ -470,10 +470,10 @@ postbluom.online"""
             "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
             "website": "", "location": "", "about": "", "language": "en",
             "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
-            "is_online": False, "last_seen": None, "is_private": False, "theme": "dark",
+            "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
             "chat_translation_enabled": True,
             "followers": [], "following": [], "blocked_users": [],
-            "notifications_prefs": {"likes": True, "comments": True, "friend_requests": True, "messages": True},
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False},
         }
         if existing:
             await db.users.update_one({"id": uid}, {"$set": doc})
@@ -633,10 +633,10 @@ postbluom.online"""
             "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
             "website": "", "location": "", "about": "", "language": "en",
             "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
-            "is_online": False, "last_seen": None, "is_private": False, "theme": "dark",
+            "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
             "chat_translation_enabled": True,
             "followers": [], "following": [], "blocked_users": [],
-            "notifications_prefs": {"likes": True, "comments": True, "friend_requests": True, "messages": True},
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False},
         }
         await db.users.insert_one(doc)
         await db.email_otps.delete_one({"email": p.email})
@@ -699,10 +699,10 @@ postbluom.online"""
             "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
             "website": "", "location": "", "about": "", "language": "en",
             "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
-            "is_online": False, "last_seen": None, "is_private": False, "theme": "dark",
+            "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
             "chat_translation_enabled": True,
             "followers": [], "following": [], "blocked_users": [],
-            "notifications_prefs": {"likes": True, "comments": True, "friend_requests": True, "messages": True},
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False},
         }
         await db.users.insert_one(doc)
         await db.phone_otps.delete_one({"phone": p.phone})
