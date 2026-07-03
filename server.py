@@ -1522,6 +1522,11 @@ postbluom.online"""
         )
         return {"ok": True}
 
+    @api.delete("/notifications/{notif_id}")
+    async def delete_notification(notif_id: str, u=Depends(current_user)):
+        await db.notifications.delete_one({"id": notif_id, "to_id": u["id"]})
+        return {"ok": True}
+
     @api.get("/notifications/unread-count")
     async def get_notif_unread_count(u=Depends(current_user)):
         count = await db.notifications.count_documents({"user_id": u["id"], "read": False})
