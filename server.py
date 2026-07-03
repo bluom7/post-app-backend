@@ -609,7 +609,7 @@ postbluom.online"""
         if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
         if now() > exp: raise HTTPException(400, "OTP expired")
         if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
-        await db.email_otps.update_one({"email": p.email}, {"$set": {"verified": True}})
+        await db.email_otps.update_one({"email": p.email}, {"$set": {"verified": True}, "$unset": {"_plain": ""}})
         return {"message": "Email verified"}
 
     @api.post("/auth/email-signup")
@@ -675,7 +675,7 @@ postbluom.online"""
         if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
         if now() > exp: raise HTTPException(400, "OTP expired")
         if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
-        await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"verified": True}})
+        await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"verified": True}, "$unset": {"_plain": ""}})
         return {"message": "Phone verified"}
 
     @api.post("/auth/phone-signup")
