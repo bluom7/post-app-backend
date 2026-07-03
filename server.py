@@ -1652,6 +1652,23 @@ postbluom.online"""
     async def shutdown():
         client.close()
 
+    # ── TEMP ADMIN: one-use account deletion (remove after use) ──
+    @api.delete("/admin/delete-account")
+    async def admin_delete_account(email: str, key: str):
+        if key != "POSTADMIN2026DELETE":
+            raise HTTPException(403, "Forbidden")
+        user = await db.users.find_one({"email": email})
+        if not user:
+            raise HTTPException(404, "User not found")
+        uid = user["id"]
+        await db.posts.delete_many({"user_id": uid})
+        await db.messages.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
+        await db.notifications.delete_many({"$or": [{"user_id": uid}, {"from_user_id": uid}]})
+        await db.friend_requests.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
+        await db.users.update_many({}, {"$pull": {"followers": uid, "following": uid, "blocked_users": uid}})
+        await db.users.delete_one({"id": uid})
+        return {"ok": True, "deleted": email}
+
     # Register all routes
     app.include_router(api)
 
