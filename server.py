@@ -1105,10 +1105,10 @@ postbluom.online"""
                     {"location": {"$regex": q, "$options": "i"}},
                 ]
             viewer_can_see = set(following_ids + [u["id"]])
-            priv_cursor = db.users.find(
+            priv_docs = await db.users.find(
                 {"is_private": True, "id": {"$nin": list(viewer_can_see)}}, {"id": 1, "_id": 0}
-            )
-            private_ids = [p["id"] async for p in priv_cursor]
+            ).to_list(10000)
+            private_ids = [p["id"] for p in priv_docs]
             if private_ids:
                 query["user_id"] = {"$nin": private_ids}
         if q and user_id:
