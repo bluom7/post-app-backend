@@ -1652,6 +1652,11 @@ postbluom.online"""
     async def shutdown():
         client.close()
 
+    # ── Health / keep-alive ping ─────────────────────────────────
+    @api.get("/ping")
+    async def ping():
+        return {"ok": True}
+
     # Register all routes
     app.include_router(api)
 
