@@ -138,10 +138,6 @@ try:
 
     async def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
         u = await raw_user(creds)
-        if u.get("signup_method") == "email" and not u.get("phone_verified", True):
-            raise HTTPException(403, detail={"code": "SECONDARY_REQUIRED", "type": "phone"})
-        if u.get("signup_method") == "phone" and not u.get("email_verified", True):
-            raise HTTPException(403, detail={"code": "SECONDARY_REQUIRED", "type": "email"})
         return u
 
     # ── One-time reset: force old accounts to new theme/notification defaults ──
