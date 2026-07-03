@@ -1148,14 +1148,14 @@ postbluom.online"""
         posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
         unviewed_ids = [p["id"] for p in posts if u["id"] not in p.get("views", [])]
         if unviewed_ids:
-            asyncio.create_task(db.posts.update_many(
+            await db.posts.update_many(
                 {"id": {"$in": unviewed_ids}}, {"$addToSet": {"views": u["id"]}}
-            ))
+            )
         return {"posts": posts, "has_more": len(posts) == limit, "skip": skip, "limit": limit}
 
     @api.get("/posts/{pid}")
     async def get_post(pid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0})
         if not post: raise HTTPException(404, "Post not found")
         if u["id"] not in post.get("views", []):
             await db.posts.update_one({"id": pid}, {"$push": {"views": u["id"]}})
@@ -1178,7 +1178,7 @@ postbluom.online"""
         upd = {"content": p.content, "accent": p.accent, "location": p.location or "", "edited_at": now().isoformat()}
         if p.photo_url is not None: upd["photo_url"] = p.photo_url
         await db.posts.update_one({"id": pid}, {"$set": upd})
-        return await db.posts.find_one({"id": pid})
+        return await db.posts.find_one({"id": pid}, {"_id": 0})
 
     @api.post("/posts/{pid}/like")
     async def like_post(pid: str, p: LikeIn, u=Depends(current_user)):
