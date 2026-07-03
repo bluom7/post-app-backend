@@ -1147,7 +1147,10 @@ postbluom.online"""
                     return {"posts": [], "total": 0, "skip": skip, "limit": limit, "private_locked": True}
             query["user_id"] = user_id
         elif feed:
-            feed_ids = list(set(following_ids + [u["id"]]))
+            followers_ids = u.get("followers", [])
+            verified_docs = await db.users.find({"is_badge_verified": True}, {"id": 1, "_id": 0}).to_list(100)
+            verified_ids = [v["id"] for v in verified_docs]
+            feed_ids = list(set(following_ids + followers_ids + verified_ids + [u["id"]]))
             query["user_id"] = {"$in": feed_ids}
         else:
             if q:
