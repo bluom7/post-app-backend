@@ -1148,9 +1148,26 @@ postbluom.online"""
             query["user_id"] = user_id
         elif feed:
             followers_ids = u.get("followers", [])
-            verified_docs = await db.users.find({"is_badge_verified": True}, {"id": 1, "_id": 0}).to_list(100)
+            # Users we already have read access to (following + self)
+            can_see_ids = set(following_ids + [u["id"]])
+            # Followers we can see: public followers OR followers we follow back (private)
+            if followers_ids:
+                visible_follower_docs = await db.users.find(
+                    {"id": {"$in": followers_ids},
+                     "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": list(can_see_ids)}}]},
+                    {"id": 1, "_id": 0},
+                ).to_list(None)
+                visible_follower_ids = [v["id"] for v in visible_follower_docs]
+            else:
+                visible_follower_ids = []
+            # Verified badge users we can see: public verified OR verified we follow
+            verified_docs = await db.users.find(
+                {"is_badge_verified": True,
+                 "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": list(can_see_ids)}}]},
+                {"id": 1, "_id": 0},
+            ).to_list(None)
             verified_ids = [v["id"] for v in verified_docs]
-            feed_ids = list(set(following_ids + followers_ids + verified_ids + [u["id"]]))
+            feed_ids = list(set(following_ids + visible_follower_ids + verified_ids + [u["id"]]))
             query["user_id"] = {"$in": feed_ids}
         else:
             if q:
