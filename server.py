@@ -863,32 +863,45 @@ postbluom.online"""
             upd["handle"] = f"@{upd['username']}"
         if upd:
             await db.users.update_one({"id": u["id"]}, {"$set": upd})
+
+            # Build denormalized updates and run them in the background
+            # so the response returns immediately to the client
             post_upd = {}
             if "name" in upd: post_upd["user_name"] = upd["name"]
             if "handle" in upd: post_upd["user_handle"] = upd["handle"]
             if "avatar_bg" in upd: post_upd["avatar_bg"] = upd["avatar_bg"]
             if "avatar_letter" in upd: post_upd["avatar_letter"] = upd["avatar_letter"]
             if "avatar_photo" in upd: post_upd["avatar_photo"] = upd["avatar_photo"]
-            if post_upd:
-                await db.posts.update_many({"user_id": u["id"]}, {"$set": post_upd})
+
             comment_upd = {}
             if "name" in upd: comment_upd["comments.$[c].user_name"] = upd["name"]
             if "handle" in upd: comment_upd["comments.$[c].user_handle"] = upd["handle"]
             if "avatar_bg" in upd: comment_upd["comments.$[c].avatar_bg"] = upd["avatar_bg"]
             if "avatar_letter" in upd: comment_upd["comments.$[c].avatar_letter"] = upd["avatar_letter"]
             if "avatar_photo" in upd: comment_upd["comments.$[c].avatar_photo"] = upd["avatar_photo"]
-            if comment_upd:
-                await db.posts.update_many(
-                    {"comments.user_id": u["id"]},
-                    {"$set": comment_upd},
-                    array_filters=[{"c.user_id": u["id"]}],
-                )
+
             msg_upd = {}
             if "name" in upd: msg_upd["from_name"] = upd["name"]
             if "avatar_bg" in upd: msg_upd["avatar_bg"] = upd["avatar_bg"]
             if "avatar_photo" in upd: msg_upd["avatar_photo"] = upd["avatar_photo"]
-            if msg_upd:
-                await db.messages.update_many({"from_user_id": u["id"]}, {"$set": msg_upd})
+
+            uid = u["id"]
+            async def _bg():
+                try:
+                    if post_upd:
+                        await db.posts.update_many({"user_id": uid}, {"$set": post_upd})
+                    if comment_upd:
+                        await db.posts.update_many(
+                            {"comments.user_id": uid},
+                            {"$set": comment_upd},
+                            array_filters=[{"c.user_id": uid}],
+                        )
+                    if msg_upd:
+                        await db.messages.update_many({"from_user_id": uid}, {"$set": msg_upd})
+                except Exception:
+                    pass
+            asyncio.create_task(_bg())
+
         return await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
 
     @api.patch("/profile/online")
