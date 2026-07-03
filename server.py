@@ -396,6 +396,7 @@ postbluom.online"""
         chat_translation_enabled: Optional[bool] = None
         account_type: Optional[str] = None
         is_badge_verified: Optional[bool] = None
+        user_status: Optional[str] = None
 
         @field_validator("username")
         @classmethod
