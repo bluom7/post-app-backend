@@ -1442,7 +1442,7 @@ postbluom.online"""
         if u["id"] not in _typing_state:
             _typing_state[u["id"]] = {}
         if p.is_typing:
-            _typing_state[u["id"]][p.to_user_id] = now() + timedelta(seconds=5)
+            _typing_state[u["id"]][p.to_user_id] = now() + timedelta(seconds=3)
         else:
             _typing_state[u["id"]].pop(p.to_user_id, None)
         return {"ok": True}
