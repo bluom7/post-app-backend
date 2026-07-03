@@ -583,7 +583,7 @@ postbluom.online"""
         await check_delete_recreate_abuse(p.email)
         existing = await db.users.find_one({"email": p.email, "is_verified": True})
         if existing: raise HTTPException(400, "Email already registered")
-                _r = await db.email_otps.find_one({"email": p.email})
+        _r = await db.email_otps.find_one({"email": p.email})
         if _r and _r.get("otp_sent_at"):
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
@@ -647,7 +647,7 @@ postbluom.online"""
     async def phone_signup_init(p: PhoneInitIn):
         await purge_expired_deleted_account("phone", p.phone)
         await check_delete_recreate_abuse(p.phone)
-                _r = await db.phone_otps.find_one({"phone": p.phone})
+        _r = await db.phone_otps.find_one({"phone": p.phone})
         if _r and _r.get("otp_sent_at"):
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
@@ -738,7 +738,7 @@ postbluom.online"""
         if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
         existing = await db.users.find_one({"phone": p.phone, "is_verified": True, "id": {"$ne": u["id"]}})
         if existing: raise HTTPException(400, "This phone is already registered to another account")
-                _r = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
+        _r = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
         if _r and _r.get("otp_sent_at"):
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
@@ -778,7 +778,7 @@ postbluom.online"""
         if u.get("email_verified"): raise HTTPException(400, "Email already verified")
         existing = await db.users.find_one({"email": p.email, "is_verified": True, "id": {"$ne": u["id"]}})
         if existing: raise HTTPException(400, "This email is already registered to another account")
-                _r = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
+        _r = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
         if _r and _r.get("otp_sent_at"):
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
