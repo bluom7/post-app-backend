@@ -185,22 +185,33 @@ try:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, fn, *args)
 
-    def _pbkdf2_hash(password: str, salt: str) -> str:
-        return _hl.pbkdf2_hmac("sha256", password.encode(), salt.encode(), _PBKDF2_ITER).hex()
+    _PBKDF2_ITER_LEGACY = 260_000   # iterations used by all existing DB hashes
+
+    def _pbkdf2_hash(password: str, salt: str, iters: int = _PBKDF2_ITER) -> str:
+        return _hl.pbkdf2_hmac("sha256", password.encode(), salt.encode(), iters).hex()
 
     async def hashpw(p: str, rounds=None) -> str:
+        iters  = _PBKDF2_ITER
         salt   = _os.urandom(16).hex()
-        digest = await _run_sync(lambda: _pbkdf2_hash(p, salt))
-        return f"{_PBKDF2_PREFIX}{salt}${digest}"
+        digest = await _run_sync(lambda: _pbkdf2_hash(p, salt, iters))
+        # New format: $pbkdf2$<iters>$<salt>$<digest>  (5 parts when split on "$")
+        return f"{_PBKDF2_PREFIX}{iters}${salt}${digest}"
 
     async def verifypw(p: str, h: str) -> bool:
         if not h:
             return False
         if h.startswith(_PBKDF2_PREFIX):
             try:
-                parts = h.split("$")          # ["", "pbkdf2", salt, digest]
-                salt, stored = parts[2], parts[3]
-                computed = await _run_sync(lambda: _pbkdf2_hash(p, salt))
+                parts = h.split("$")
+                if len(parts) == 5:
+                    # New format: ["", "pbkdf2", iters, salt, digest]
+                    iters  = int(parts[2])
+                    salt, stored = parts[3], parts[4]
+                else:
+                    # Legacy format: ["", "pbkdf2", salt, digest] — always 260k
+                    iters  = _PBKDF2_ITER_LEGACY
+                    salt, stored = parts[2], parts[3]
+                computed = await _run_sync(lambda: _pbkdf2_hash(p, salt, iters))
                 return _hmac.compare_digest(computed, stored)
             except Exception:
                 return False
@@ -630,8 +641,8 @@ postbluom.online"""
         pw_hash = u.get("password_hash", "")
         if not await verifypw(p.password, pw_hash): raise HTTPException(400, "Invalid credentials")
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
-        if _is_bcrypt(pw_hash):
-            asyncio.create_task(_migrate_hash(u["id"], p.password))
+        if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
+            asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
         resp = {"token": make_token(u["id"]), "user_id": u["id"]}
         if u.get("deleted_at"):
@@ -841,8 +852,8 @@ postbluom.online"""
         pw_hash_p = u.get("password_hash", "") if u else ""
         if not u or not await verifypw(p.password, pw_hash_p):
             raise HTTPException(400, "Invalid phone or password")
-        if u and _is_bcrypt(pw_hash_p):
-            asyncio.create_task(_migrate_hash(u["id"], p.password))
+        if u and (_is_bcrypt(pw_hash_p) or (pw_hash_p.startswith(_PBKDF2_PREFIX) and len(pw_hash_p.split("$")) == 4)):
+            asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
         resp = {"token": make_token(u["id"]), "user_id": u["id"]}
