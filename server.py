@@ -1256,11 +1256,15 @@ postbluom.online"""
     async def list_posts(
         q: Optional[str] = None, user_id: Optional[str] = None,
         skip: int = 0, limit: int = 20, feed: bool = False,
+        following_only: bool = False,
         u=Depends(current_user),
     ):
         query: dict = {}
         following_ids = u.get("following", [])
-        if user_id:
+        if following_only:
+            ids = list(set(following_ids + [u["id"]]))
+            query["user_id"] = {"$in": ids} if ids else {"$in": [u["id"]]}
+        elif user_id:
             target_user = await db.users.find_one({"id": user_id}, {"is_private": 1, "followers": 1})
             if target_user and target_user.get("is_private") and user_id != u["id"]:
                 if u["id"] not in target_user.get("followers", []):
