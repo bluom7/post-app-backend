@@ -174,7 +174,7 @@ try:
         return datetime.now(timezone.utc)
 
     # ── Password hashing (PBKDF2-HMAC-SHA256) ────────────────────
-    _PBKDF2_ITER   = 260_000
+    _PBKDF2_ITER   = 100_000
     _PBKDF2_PREFIX = "$pbkdf2$"
 
     async def _run_sync(fn):
@@ -632,12 +632,12 @@ postbluom.online"""
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         if _is_bcrypt(pw_hash):
             asyncio.create_task(_migrate_hash(u["id"], p.password))
-        await _migrate_prefs_defaults(u)
+        asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
         resp = {"token": make_token(u["id"]), "user_id": u["id"]}
         if u.get("deleted_at"):
             deleted_at = _aware(u["deleted_at"])
             if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
-                await permanently_delete_user(u["id"])
+                asyncio.create_task(permanently_delete_user(u["id"]))  # background delete
                 raise HTTPException(400, "Invalid credentials")
             resp["pending_delete"] = True
             resp["restore_deadline"] = (deleted_at + timedelta(days=DELETE_GRACE_DAYS)).isoformat()
@@ -844,12 +844,12 @@ postbluom.online"""
         if u and _is_bcrypt(pw_hash_p):
             asyncio.create_task(_migrate_hash(u["id"], p.password))
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
-        await _migrate_prefs_defaults(u)
+        asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
         resp = {"token": make_token(u["id"]), "user_id": u["id"]}
         if u.get("deleted_at"):
             deleted_at = _aware(u["deleted_at"])
             if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
-                await permanently_delete_user(u["id"])
+                asyncio.create_task(permanently_delete_user(u["id"]))  # background delete
                 raise HTTPException(400, "Invalid phone or password")
             resp["pending_delete"] = True
             resp["restore_deadline"] = (deleted_at + timedelta(days=DELETE_GRACE_DAYS)).isoformat()
