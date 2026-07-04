@@ -210,6 +210,11 @@ try:
             except Exception:
                 return False
 
+
+    def _email_q(email: str) -> dict:
+        """Case-insensitive email lookup for MongoDB."""
+        return {"email": {"": f"^{re.escape(email.strip())}$", "": "i"}}
+
     def _is_bcrypt(h: str) -> bool:
         return h.startswith("$2b$") or h.startswith("$2a$")
 
@@ -577,7 +582,7 @@ postbluom.online"""
     # ── Auth Email ────────────────────────────────────────────────
     @api.post("/auth/signup")
     async def signup(p: SignupIn):
-        existing = await db.users.find_one({"email": p.email})
+        existing = await db.users.find_one(_email_q(p.email))
         if existing and existing.get("is_verified"):
             raise HTTPException(400, "Email already registered")
         try:
@@ -610,7 +615,7 @@ postbluom.online"""
 
     @api.post("/auth/verify-otp")
     async def verify_otp(p: OtpIn):
-        u = await db.users.find_one({"email": p.email})
+        u = await db.users.find_one(_email_q(p.email))
         if not u: raise HTTPException(400, "User not found")
         if u.get("is_verified"): raise HTTPException(400, "Already verified")
         exp = u["otp_expires_at"]
@@ -625,11 +630,11 @@ postbluom.online"""
 
     @api.post("/auth/login")
     async def login(p: LoginIn):
-        u = await db.users.find_one({"email": p.email})
+        u = await db.users.find_one(_email_q(p.email))
         if not u: raise HTTPException(400, "Invalid credentials")
         pw_hash = u.get("password_hash", "")
         if not await verifypw(p.password, pw_hash): raise HTTPException(400, "Invalid credentials")
-        if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
+        if not u.get("is_verified"): raise HTTPException(400, "Account not verified. Please check your email for the OTP verification code.")
         if _is_bcrypt(pw_hash):
             asyncio.create_task(_migrate_hash(u["id"], p.password))
         await _migrate_prefs_defaults(u)
@@ -645,7 +650,7 @@ postbluom.online"""
 
     @api.post("/auth/resend-otp")
     async def resend_otp(body: dict):
-        u = await db.users.find_one({"email": body.get("email")})
+        u = await db.users.find_one(_email_q(body.get("email", "")))
         if not u: raise HTTPException(400, "User not found")
         code = f"{random.randint(0,9999):04d}"
         await db.users.update_one(
@@ -1929,3 +1934,4 @@ except Exception as _boot_err:
     print(f"==> [DIAG] FATAL BOOT ERROR: {type(_boot_err).__name__}: {_boot_err}", file=_sys.stderr, flush=True)
     _tb.print_exc(file=_sys.stderr)
     _sys.exit(1)
+
