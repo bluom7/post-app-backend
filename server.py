@@ -1638,21 +1638,21 @@ postbluom.online"""
         return {"ok": True}
 
     @api.get("/notifications/vapid-key")
-async def get_vapid_key(u=Depends(current_user)):
-    pub, _ = await get_vapid_keys()
-    return {"public_key": pub}
+    async def get_vapid_key(u=Depends(current_user)):
+        pub, _ = await get_vapid_keys()
+        return {"public_key": pub}
 
-@api.post("/notifications/push-subscribe")
-async def push_subscribe(req: Request, u=Depends(current_user)):
-    data = await req.json()
-    await db.push_subscriptions.update_one(
-        {"user_id": u["id"]},
-        {"$set": {"user_id": u["id"], "subscription": data, "updated_at": now().isoformat()}},
-        upsert=True
-    )
-    return {"ok": True}
+    @api.post("/notifications/push-subscribe")
+    async def push_subscribe(req: Request, u=Depends(current_user)):
+        data = await req.json()
+        await db.push_subscriptions.update_one(
+            {"user_id": u["id"]},
+            {"$set": {"user_id": u["id"], "subscription": data, "updated_at": now().isoformat()}},
+            upsert=True
+        )
+        return {"ok": True}
 
-@api.post("/notifications/read-all")
+    @api.post("/notifications/read-all")
     async def mark_all_notifications_read(u=Depends(current_user)):
         await db.notifications.update_many(
             {"user_id": u["id"], "read": False}, {"$set": {"read": True}}
