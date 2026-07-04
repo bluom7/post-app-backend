@@ -15,6 +15,12 @@ try:
     from typing import Optional, List
     from datetime import datetime, timezone, timedelta
     import base64, asyncio, urllib.request, urllib.parse, json as _json
+    try:
+        from pywebpush import webpush, WebPushException
+        from py_vapid import Vapid
+        _PUSH_AVAILABLE = True
+    except ImportError:
+        _PUSH_AVAILABLE = False
     import time as _time
     import hashlib as _hl, hmac as _hmac, os as _os
 
@@ -23,6 +29,44 @@ try:
     MONGO_URL      = os.environ["MONGO_URL"]
     DB_NAME        = os.environ.get("DB_NAME", "postapp")
     JWT_SECRET     = os.environ.get("JWT_SECRET", "change-me-in-production")
+
+    _vapid_cache = {}
+    async def get_vapid_keys():
+        if _vapid_cache: return _vapid_cache.get('pub',''), _vapid_cache.get('priv','')
+        existing = await db.settings.find_one({'key': 'vapid_keys'})
+        if existing:
+            _vapid_cache['pub'] = existing['public_key']
+            _vapid_cache['priv'] = existing['private_key']
+            return existing['public_key'], existing['private_key']
+        if not _PUSH_AVAILABLE: return '', ''
+        v = Vapid()
+        v.generate_keys()
+        pub = v.public_key_urlsafe_base64
+        priv = v.private_key_urlsafe_base64
+        from datetime import datetime as _dt
+        await db.settings.insert_one({'key': 'vapid_keys', 'public_key': pub, 'private_key': priv, 'created_at': _dt.utcnow().isoformat()})
+        _vapid_cache['pub'] = pub
+        _vapid_cache['priv'] = priv
+        return pub, priv
+
+    async def send_push(user_id, title, body):
+        if not _PUSH_AVAILABLE: return
+        try:
+            sub_doc = await db.push_subscriptions.find_one({'user_id': user_id})
+            if not sub_doc: return
+            pub_key, priv_key = await get_vapid_keys()
+            if not priv_key: return
+            loop = asyncio.get_event_loop()
+            def _do_push():
+                webpush(
+                    subscription_info=sub_doc['subscription'],
+                    data=_json.dumps({'title': title, 'body': body, 'url': '/'}),
+                    vapid_private_key=priv_key,
+                    vapid_claims={'sub': 'mailto:noreply@postapp.com'}
+                )
+            await loop.run_in_executor(None, _do_push)
+        except Exception:
+            pass
     RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
     TWILIO_SID     = os.environ.get("TWILIO_SID", "").strip()
     TWILIO_TOKEN   = os.environ.get("TWILIO_TOKEN", "").strip()
@@ -1043,6 +1087,7 @@ postbluom.online"""
                 "from_user_id": u["id"], "from_user_name": u["name"],
                 "type": "follow_request", "created_at": now().isoformat(), "read": False,
             })
+            asyncio.create_task(send_push(user_id, "New follow request", u["name"] + " wants to follow you"))
             return {"ok": True, "pending": True}
         if u["id"] not in target.get("followers", []):
             await db.users.update_one({"id": user_id}, {"$push": {"followers": u["id"]}})
@@ -1053,6 +1098,7 @@ postbluom.online"""
             "from_user_id": u["id"], "from_user_name": u["name"],
             "type": "follow", "created_at": now().isoformat(), "read": False,
         })
+        asyncio.create_task(send_push(user_id, "New follower", u["name"] + " started following you"))
         return {"ok": True, "pending": False}
 
     @api.post("/users/{user_id}/unfollow")
@@ -1097,6 +1143,7 @@ postbluom.online"""
             "from_user_id": u["id"], "from_user_name": u["name"],
             "type": "follow_accept", "created_at": now().isoformat(), "read": False,
         })
+        asyncio.create_task(send_push(user_id, "Follow accepted", u["name"] + " accepted your follow request"))
         return {"ok": True}
 
     @api.post("/users/{user_id}/follow-request/decline")
@@ -1239,6 +1286,7 @@ postbluom.online"""
                 "from_user_id": u["id"], "from_user_name": u["name"],
                 "type": "like", "post_id": pid, "created_at": now().isoformat(), "read": False,
             })
+            asyncio.create_task(send_push(post["user_id"], "New like ♥️", u["name"] + " liked your post"))
         return {"likes": likes, "total": len(likes)}
 
     @api.post("/posts/{pid}/comments")
@@ -1258,6 +1306,7 @@ postbluom.online"""
                 "from_user_id": u["id"], "from_user_name": u["name"],
                 "type": "comment", "post_id": pid, "created_at": now().isoformat(), "read": False,
             })
+            asyncio.create_task(send_push(post["user_id"], "New comment 💬", u["name"] + " commented on your post"))
         return c
 
     @api.delete("/posts/{pid}/comments/{cid}")
@@ -1299,6 +1348,7 @@ postbluom.online"""
             "from_user_id": u["id"], "from_user_name": u["name"],
             "type": "friend_request", "created_at": now().isoformat(), "read": False,
         })
+        asyncio.create_task(send_push(p.target_user_id, "Connect request", u["name"] + " sent you a connect request"))
         return {"status": "pending"}
 
     @api.post("/friends/accept")
@@ -1515,7 +1565,22 @@ postbluom.online"""
         )
         return {"ok": True}
 
-    @api.post("/notifications/read-all")
+    @api.get("/notifications/vapid-key")
+async def get_vapid_key(u=Depends(current_user)):
+    pub, _ = await get_vapid_keys()
+    return {"public_key": pub}
+
+@api.post("/notifications/push-subscribe")
+async def push_subscribe(req: Request, u=Depends(current_user)):
+    data = await req.json()
+    await db.push_subscriptions.update_one(
+        {"user_id": u["id"]},
+        {"$set": {"user_id": u["id"], "subscription": data, "updated_at": now().isoformat()}},
+        upsert=True
+    )
+    return {"ok": True}
+
+@api.post("/notifications/read-all")
     async def mark_all_notifications_read(u=Depends(current_user)):
         await db.notifications.update_many(
             {"user_id": u["id"], "read": False}, {"$set": {"read": True}}
@@ -1524,7 +1589,7 @@ postbluom.online"""
 
     @api.delete("/notifications/{notif_id}")
     async def delete_notification(notif_id: str, u=Depends(current_user)):
-        await db.notifications.delete_one({"id": notif_id, "to_id": u["id"]})
+        await db.notifications.delete_one({"id": notif_id, "user_id": u["id"]})
         return {"ok": True}
 
     @api.get("/notifications/unread-count")
