@@ -982,7 +982,7 @@ postbluom.online"""
     # ── Profile ───────────────────────────────────────────────────
     @api.patch("/profile")
     async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
-        upd = {k: v for k, v in p.dict().items() if v is not None}
+        upd = {k: v for k, v in p.model_dump().items() if v is not None}
         if "username" in upd:
             try:
                 await ensure_username_unique(upd["username"], exclude_uid=u["id"])
@@ -1744,7 +1744,7 @@ postbluom.online"""
     # ── Settings ──────────────────────────────────────────────────
     @api.patch("/settings/notifications")
     async def update_notifications_prefs(p: NotificationsPrefsIn, u=Depends(current_user)):
-        upd = {k: v for k, v in p.dict().items() if v is not None}
+        upd = {k: v for k, v in p.model_dump().items() if v is not None}
         if upd:
             await db.users.update_one(
                 {"id": u["id"]},
