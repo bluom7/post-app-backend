@@ -163,6 +163,10 @@ try:
     bearer = HTTPBearer(auto_error=False)
 
     app.add_middleware(GZipMiddleware, minimum_size=500)
+
+    @app.get("/ping")
+    async def ping():
+        return {"status": "ok"}
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"], allow_credentials=True,
