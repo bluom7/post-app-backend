@@ -293,7 +293,7 @@ try:
     def send_otp_email(email, code):
         if DEMO_MODE:
             logging.info(f"[DEMO] Email OTP for {email}: {code}")
-            return
+            return True
         try:
             import resend
             resend.api_key = RESEND_API_KEY
@@ -374,8 +374,10 @@ postbluom.online"""
                 "headers": {"X-Entity-Ref-ID": str(uuid.uuid4())},
             })
             logging.info(f"✅ OTP email sent to {email}")
+            return True
         except Exception as e:
             logging.warning(f"Email failed: {e}")
+            return False
 
     def send_otp_sms(phone, code):
         if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_PHONE:
@@ -685,8 +687,11 @@ postbluom.online"""
         )
         is_email = "@" in identifier
         if is_email:
-            asyncio.create_task(run_in_bg(send_otp_email, identifier, code))
-            return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email"}
+            # Await email send so we can detect failure and surface OTP as fallback
+            email_sent = await run_in_bg(send_otp_email, identifier, code)
+            fallback_otp = code if not email_sent else None
+            return {"message": "OTP sent", "demo_otp": fallback_otp, "method": "email",
+                    "email_failed": not bool(email_sent)}
         else:
             sms_sent = await run_in_bg(send_otp_sms, identifier, code)
             return {"message": "OTP sent", "demo_otp": code if not sms_sent else None, "method": "sms"}
