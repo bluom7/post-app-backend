@@ -646,11 +646,12 @@ postbluom.online"""
 
     @api.post("/auth/login")
     async def login(p: LoginIn):
-        u = await db.users.find_one({"email": p.email})
+        u = await db.users.find_one(_email_q(p.email))          # case-insensitive lookup
         if not u: raise HTTPException(400, "Invalid credentials")
+        if not u.get("is_verified"):                             # fast check BEFORE slow hash
+            raise HTTPException(400, "Account not verified. Please check your email for the OTP verification code.")
         pw_hash = u.get("password_hash", "")
         if not await verifypw(p.password, pw_hash): raise HTTPException(400, "Invalid credentials")
-        if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
