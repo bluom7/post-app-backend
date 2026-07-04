@@ -1914,6 +1914,25 @@ postbluom.online"""
         except Exception as e:
             logging.warning(f"Index creation warning: {e}")
 
+    # ── Startup: self-ping keepalive (prevents Render free tier sleep) ───────
+    @app.on_event("startup")
+    async def start_keepalive():
+        SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://post-app-backend-dqtp.onrender.com")
+        async def _loop():
+            await asyncio.sleep(60)          # wait 1 min after boot before first ping
+            while True:
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: urllib.request.urlopen(f"{SELF_URL}/ping", timeout=10)
+                    )
+                    logging.info("[keepalive] self-ping ok")
+                except Exception as ex:
+                    logging.warning(f"[keepalive] ping failed: {ex}")
+                await asyncio.sleep(14 * 60)  # every 14 min (Render sleeps at 15)
+        asyncio.create_task(_loop())
+
     # ── Startup: seed demo users ──────────────────────────────────
     @app.on_event("startup")
     async def seed():
