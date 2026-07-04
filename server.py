@@ -1274,22 +1274,23 @@ postbluom.online"""
             followers_ids = u.get("followers", [])
             # Users we already have read access to (following + self)
             can_see_ids = set(following_ids + [u["id"]])
-            # Followers we can see: public followers OR followers we follow back (private)
-            if followers_ids:
-                visible_follower_docs = await db.users.find(
+            can_see_list = list(can_see_ids)
+            # Run both user-set queries in PARALLEL for speed
+            follower_query = (
+                db.users.find(
                     {"id": {"$in": followers_ids},
-                     "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": list(can_see_ids)}}]},
+                     "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
                     {"id": 1, "_id": 0},
                 ).to_list(None)
-                visible_follower_ids = [v["id"] for v in visible_follower_docs]
-            else:
-                visible_follower_ids = []
-            # Verified badge users we can see: public verified OR verified we follow
-            verified_docs = await db.users.find(
+                if followers_ids else asyncio.coroutine(lambda: [])()
+            )
+            verified_query = db.users.find(
                 {"is_badge_verified": True,
-                 "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": list(can_see_ids)}}]},
+                 "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
                 {"id": 1, "_id": 0},
             ).to_list(None)
+            visible_follower_docs, verified_docs = await asyncio.gather(follower_query, verified_query)
+            visible_follower_ids = [v["id"] for v in visible_follower_docs]
             verified_ids = [v["id"] for v in verified_docs]
             feed_ids = list(set(following_ids + visible_follower_ids + verified_ids + [u["id"]]))
             query["user_id"] = {"$in": feed_ids}
@@ -1316,9 +1317,15 @@ postbluom.online"""
         posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
         unviewed_ids = [p["id"] for p in posts if u["id"] not in p.get("views", [])]
         if unviewed_ids:
-            await db.posts.update_many(
-                {"id": {"$in": unviewed_ids}}, {"$addToSet": {"views": u["id"]}}
-            )
+            # Fire-and-forget: don't block the response for view tracking
+            async def _mark_viewed():
+                try:
+                    await db.posts.update_many(
+                        {"id": {"$in": unviewed_ids}}, {"$addToSet": {"views": u["id"]}}
+                    )
+                except Exception:
+                    pass
+            asyncio.create_task(_mark_viewed())
         return {"posts": posts, "has_more": len(posts) == limit, "skip": skip, "limit": limit}
 
     @api.get("/posts/{pid}")
@@ -1875,6 +1882,10 @@ postbluom.online"""
             await db.email_otps.create_index("email", background=True)
             await db.phone_otps.create_index("phone", background=True)
             await db.account_deletions.create_index("identifier", background=True)
+            # Feed query indexes
+            await db.users.create_index("is_badge_verified", background=True)
+            await db.users.create_index("is_private", background=True)
+            await db.users.create_index("followers", background=True)
             logging.info("✅ MongoDB indexes created")
         except Exception as e:
             logging.warning(f"Index creation warning: {e}")
@@ -1917,7 +1928,7 @@ postbluom.online"""
             await asyncio.sleep(30)  # Let server fully boot first
             port = os.environ.get("PORT", "10000")
             ping_url = f"http://127.0.0.1:{port}/api/ping"
-            logging.info(f"[KeepAlive] Self-ping started → {ping_url} every 10 min")
+            logging.info(f"[KeepAlive] Self-ping started → {ping_url} every 4 min")
             import urllib.request as _ur2
             def _do_ping():
                 with _ur2.urlopen(ping_url, timeout=10):
@@ -1930,7 +1941,7 @@ postbluom.online"""
                     logging.info("[KeepAlive] ✅ Self-ping OK — server awake")
                 except Exception as _pe:
                     logging.warning(f"[KeepAlive] ⚠️ Self-ping failed: {_pe}")
-                await asyncio.sleep(10 * 60)  # every 10 minutes
+                await asyncio.sleep(4 * 60)   # every 4 minutes — keeps Render free tier awake
         asyncio.create_task(_ping_loop())
 
     # ── Shutdown ──────────────────────────────────────────────────
@@ -1952,3 +1963,4 @@ except Exception as _boot_err:
     print(f"==> [DIAG] FATAL BOOT ERROR: {type(_boot_err).__name__}: {_boot_err}", file=_sys.stderr, flush=True)
     _tb.print_exc(file=_sys.stderr)
     _sys.exit(1)
+
