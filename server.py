@@ -1910,6 +1910,28 @@ postbluom.online"""
             })
         logging.info("✅ World users seeded")
 
+    # ── Self-ping keepalive (prevents Render free tier sleep) ────
+    @app.on_event("startup")
+    async def keepalive_self_ping():
+        async def _ping_loop():
+            await asyncio.sleep(90)  # Let server fully boot first
+            self_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+            if not self_url:
+                logging.info("[KeepAlive] RENDER_EXTERNAL_URL not set — self-ping disabled")
+                return
+            ping_url = self_url + "/api/ping"
+            logging.info(f"[KeepAlive] Self-ping started → {ping_url} every 10 min")
+            import urllib.request as _ur2, urllib.error as _ue2
+            while True:
+                try:
+                    with _ur2.urlopen(ping_url, timeout=30):
+                        pass
+                    logging.info("[KeepAlive] ✅ Self-ping OK — server awake")
+                except Exception as _pe:
+                    logging.warning(f"[KeepAlive] ⚠️ Self-ping failed: {_pe}")
+                await asyncio.sleep(10 * 60)  # every 10 minutes
+        asyncio.create_task(_ping_loop())
+
     # ── Shutdown ──────────────────────────────────────────────────
     @app.on_event("shutdown")
     async def shutdown():
