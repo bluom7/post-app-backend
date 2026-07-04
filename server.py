@@ -1915,25 +1915,6 @@ postbluom.online"""
         except Exception as e:
             logging.warning(f"Index creation warning: {e}")
 
-    # ── Startup: self-ping keepalive (prevents Render free tier sleep) ───────
-    @app.on_event("startup")
-    async def start_keepalive():
-        SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://post-app-backend-dqtp.onrender.com")
-        async def _loop():
-            await asyncio.sleep(60)          # wait 1 min after boot before first ping
-            while True:
-                try:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(
-                        None,
-                        lambda: urllib.request.urlopen(f"{SELF_URL}/ping", timeout=10)
-                    )
-                    logging.info("[keepalive] self-ping ok")
-                except Exception as ex:
-                    logging.warning(f"[keepalive] ping failed: {ex}")
-                await asyncio.sleep(14 * 60)  # every 14 min (Render sleeps at 15)
-        asyncio.create_task(_loop())
-
     # ── Startup: seed demo users ──────────────────────────────────
     @app.on_event("startup")
     async def seed():
@@ -1966,27 +1947,32 @@ postbluom.online"""
         logging.info("✅ World users seeded")
 
     # ── Self-ping keepalive (prevents Render free tier sleep) ────
+    _keepalive_task = None   # module-level strong ref — prevents GC
+
     @app.on_event("startup")
     async def keepalive_self_ping():
+        nonlocal _keepalive_task
+        port = os.environ.get("PORT", "10000")
+        ping_url = f"http://127.0.0.1:{port}/api/ping"
+        logging.info(f"[KeepAlive] starting → {ping_url} every 10 min")
+
+        import urllib.request as _ur2
+
         async def _ping_loop():
-            await asyncio.sleep(30)  # Let server fully boot first
-            port = os.environ.get("PORT", "10000")
-            ping_url = f"http://127.0.0.1:{port}/api/ping"
-            logging.info(f"[KeepAlive] Self-ping started → {ping_url} every 4 min")
-            import urllib.request as _ur2
+            await asyncio.sleep(30)   # let server fully boot first
+            loop = asyncio.get_running_loop()   # correct for Python 3.10+
             def _do_ping():
                 with _ur2.urlopen(ping_url, timeout=10):
                     pass
-            loop = asyncio.get_event_loop()
             while True:
                 try:
-                    # run_in_executor so urllib (sync) never blocks the async event loop
                     await loop.run_in_executor(None, _do_ping)
-                    logging.info("[KeepAlive] ✅ Self-ping OK — server awake")
+                    logging.info("[KeepAlive] ✅ ping OK")
                 except Exception as _pe:
-                    logging.warning(f"[KeepAlive] ⚠️ Self-ping failed: {_pe}")
-                await asyncio.sleep(4 * 60)   # every 4 minutes — keeps Render free tier awake
-        asyncio.create_task(_ping_loop())
+                    logging.warning(f"[KeepAlive] ⚠️ ping failed: {_pe}")
+                await asyncio.sleep(10 * 60)   # every 10 min — safe margin under 15 min limit
+
+        _keepalive_task = asyncio.ensure_future(_ping_loop())   # stored → never GC'd
 
     # ── Shutdown ──────────────────────────────────────────────────
     @app.on_event("shutdown")
