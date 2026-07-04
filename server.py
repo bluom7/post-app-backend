@@ -205,12 +205,16 @@ try:
                 parts = h.split("$")
                 if len(parts) == 5:
                     # New format: ["", "pbkdf2", iters, salt, digest]
-                    iters  = int(parts[2])
+                    iters = int(parts[2])
+                    if not (10_000 <= iters <= 1_000_000):  # sanity-check iteration bounds
+                        return False
                     salt, stored = parts[3], parts[4]
-                else:
+                elif len(parts) == 4:
                     # Legacy format: ["", "pbkdf2", salt, digest] — always 260k
                     iters  = _PBKDF2_ITER_LEGACY
                     salt, stored = parts[2], parts[3]
+                else:
+                    return False  # malformed — reject
                 computed = await _run_sync(lambda: _pbkdf2_hash(p, salt, iters))
                 return _hmac.compare_digest(computed, stored)
             except Exception:
@@ -687,11 +691,11 @@ postbluom.online"""
         )
         is_email = "@" in identifier
         if is_email:
-            # Await email send so we can detect failure and surface OTP as fallback
+            # Await send so we can detect and report failure; never leak OTP in response
             email_sent = await run_in_bg(send_otp_email, identifier, code)
-            fallback_otp = code if not email_sent else None
-            return {"message": "OTP sent", "demo_otp": fallback_otp, "method": "email",
-                    "email_failed": not bool(email_sent)}
+            if not email_sent and not DEMO_MODE:
+                raise HTTPException(503, "Failed to send verification email. Please try again in a moment.")
+            return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email"}
         else:
             sms_sent = await run_in_bg(send_otp_sms, identifier, code)
             return {"message": "OTP sent", "demo_otp": code if not sms_sent else None, "method": "sms"}
