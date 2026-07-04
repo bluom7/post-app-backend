@@ -1245,8 +1245,8 @@ postbluom.online"""
             "content": p.content, "accent": p.accent, "location": p.location or "",
             "photo_url": p.photo_url or None,
             "user_location": u.get("location", ""),
-            "likes": [], "comments": [], "views": [], "created_at": now().isoformat(),
-            "edited_at": None, "is_pinned": False,
+            "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
+            "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
         }
         await db.posts.insert_one(doc.copy())
         doc.pop("_id", None)
@@ -1322,7 +1322,7 @@ postbluom.online"""
         post = await db.posts.find_one({"id": pid}, {"_id": 0})
         if not post: raise HTTPException(404, "Post not found")
         if u["id"] not in post.get("views", []):
-            await db.posts.update_one({"id": pid}, {"$push": {"views": u["id"]}})
+            await db.posts.update_one({"id": pid}, {"$addToSet": {"views": u["id"]}})
             post["views"] = post.get("views", []) + [u["id"]]
         return post
 
