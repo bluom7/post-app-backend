@@ -1454,6 +1454,16 @@ postbluom.online"""
         asyncio.create_task(send_push(target["id"], "Mention", u["name"] + " mentioned you in a post"))
         return {"ok": True}
 
+    @api.get("/users/me/saved-posts")
+    async def get_saved_posts(u=Depends(current_user)):
+        user_id = u["id"]
+        posts_cursor = db.posts.find({"saves": user_id}).sort("created_at", -1).limit(50)
+        result = []
+        async for p in posts_cursor:
+            p.pop("_id", None)
+            result.append(p)
+        return {"posts": result}
+
     # ── Friends ───────────────────────────────────────────────────
     @api.post("/friends/request")
     async def friend_request(p: FriendIn, u=Depends(current_user)):
