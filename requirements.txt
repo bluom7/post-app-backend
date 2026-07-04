@@ -12,3 +12,4 @@ email-validator==2.1.1
 dnspython==2.6.1
 resend>=2.4.0
 twilio==9.0.4
+pywebpush>=2.0.0
