@@ -1866,7 +1866,7 @@ postbluom.online"""
             await db.posts.create_index("id", unique=True, background=True)
             await db.messages.create_index([("from_id", 1), ("to_id", 1)], background=True)
             await db.messages.create_index([("created_at", 1)], background=True)
-            await db.notifications.create_index("to_id", background=True)
+            await db.notifications.create_index("user_id", background=True)
             await db.notifications.create_index([("created_at", -1)], background=True)
             await db.follow_requests.create_index([("from_id", 1), ("to_id", 1)], background=True)
             await db.follow_requests.create_index("status", background=True)
@@ -1919,10 +1919,14 @@ postbluom.online"""
             ping_url = f"http://127.0.0.1:{port}/api/ping"
             logging.info(f"[KeepAlive] Self-ping started → {ping_url} every 10 min")
             import urllib.request as _ur2
+            def _do_ping():
+                with _ur2.urlopen(ping_url, timeout=10):
+                    pass
+            loop = asyncio.get_event_loop()
             while True:
                 try:
-                    with _ur2.urlopen(ping_url, timeout=10):
-                        pass
+                    # run_in_executor so urllib (sync) never blocks the async event loop
+                    await loop.run_in_executor(None, _do_ping)
                     logging.info("[KeepAlive] ✅ Self-ping OK — server awake")
                 except Exception as _pe:
                     logging.warning(f"[KeepAlive] ⚠️ Self-ping failed: {_pe}")
