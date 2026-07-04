@@ -1392,6 +1392,68 @@ postbluom.online"""
         await db.posts.update_one({"id": pid}, {"$pull": {"comments": {"id": cid}}})
         return {"ok": True}
 
+    @api.post("/posts/{pid}/view")
+    async def view_post(pid: str, u=Depends(current_user)):
+        await db.posts.update_one({"id": pid}, {"$addToSet": {"views": u["id"]}})
+        return {"ok": True}
+
+    @api.post("/posts/{pid}/save")
+    async def save_post(pid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        if u["id"] in (post.get("saves") or []):
+            await db.posts.update_one({"id": pid}, {"$pull": {"saves": u["id"]}})
+            return {"saved": False}
+        await db.posts.update_one({"id": pid}, {"$addToSet": {"saves": u["id"]}})
+        return {"saved": True}
+
+    @api.post("/posts/{pid}/repost")
+    async def repost_post(pid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        already = await db.posts.find_one({"repost_of": pid, "user_id": u["id"]})
+        if already:
+            await db.posts.delete_one({"id": already["id"]})
+            await db.posts.update_one({"id": pid}, {"$pull": {"reposts": u["id"]}})
+            return {"reposted": False}
+        doc = {
+            "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
+            "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
+            "content": post.get("content", ""), "accent": post.get("accent", "#FFD600"),
+            "location": "", "photo_url": post.get("photo_url"),
+            "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
+            "repost_of": pid, "repost_user_name": post.get("user_name"),
+            "repost_user_handle": post.get("user_handle"),
+            "created_at": now().isoformat(), "is_pinned": False,
+        }
+        await db.posts.insert_one(doc.copy())
+        await db.posts.update_one({"id": pid}, {"$addToSet": {"reposts": u["id"]}})
+        if post["user_id"] != u["id"]:
+            await db.notifications.insert_one({
+                "id": str(uuid.uuid4()), "user_id": post["user_id"],
+                "from_user_id": u["id"], "from_user_name": u["name"],
+                "type": "repost", "post_id": pid, "created_at": now().isoformat(), "read": False,
+            })
+            asyncio.create_task(send_push(post["user_id"], "Repost", u["name"] + " reposted your post"))
+        doc.pop("_id", None)
+        return {"reposted": True, "post": doc}
+
+    @api.post("/posts/{pid}/mention")
+    async def mention_in_post(pid: str, body: dict, u=Depends(current_user)):
+        mentioned_username = (body.get("username") or "").lstrip("@")
+        if not mentioned_username: raise HTTPException(400, "username required")
+        target = await db.users.find_one({"username": mentioned_username})
+        if not target: raise HTTPException(404, "User not found")
+        if target["id"] == u["id"]: return {"ok": True}
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": target["id"],
+            "from_user_id": u["id"], "from_user_name": u["name"],
+            "type": "mention", "post_id": pid, "created_at": now().isoformat(), "read": False,
+        })
+        asyncio.create_task(send_push(target["id"], "Mention", u["name"] + " mentioned you in a post"))
+        return {"ok": True}
+
     # ── Friends ───────────────────────────────────────────────────
     @api.post("/friends/request")
     async def friend_request(p: FriendIn, u=Depends(current_user)):
