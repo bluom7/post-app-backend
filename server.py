@@ -1914,17 +1914,14 @@ postbluom.online"""
     @app.on_event("startup")
     async def keepalive_self_ping():
         async def _ping_loop():
-            await asyncio.sleep(90)  # Let server fully boot first
-            self_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
-            if not self_url:
-                logging.info("[KeepAlive] RENDER_EXTERNAL_URL not set — self-ping disabled")
-                return
-            ping_url = self_url + "/api/ping"
+            await asyncio.sleep(30)  # Let server fully boot first
+            port = os.environ.get("PORT", "10000")
+            ping_url = f"http://127.0.0.1:{port}/api/ping"
             logging.info(f"[KeepAlive] Self-ping started → {ping_url} every 10 min")
-            import urllib.request as _ur2, urllib.error as _ue2
+            import urllib.request as _ur2
             while True:
                 try:
-                    with _ur2.urlopen(ping_url, timeout=30):
+                    with _ur2.urlopen(ping_url, timeout=10):
                         pass
                     logging.info("[KeepAlive] ✅ Self-ping OK — server awake")
                 except Exception as _pe:
