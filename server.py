@@ -232,6 +232,10 @@ try:
     def _is_bcrypt(h: str) -> bool:
         return h.startswith("$2b$") or h.startswith("$2a$")
 
+    def _email_q(email: str) -> dict:
+        """Case-insensitive email lookup for MongoDB."""
+        return {"email": {"$regex": f"^{re.escape(email.strip())}$", "$options": "i"}}
+
     def make_token(uid):
         return jwt.encode(
             {"sub": uid, "exp": now() + timedelta(days=30)},
