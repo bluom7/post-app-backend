@@ -688,6 +688,20 @@ postbluom.online"""
         user = await db.users.find_one({"$or": [{"email": identifier}, {"phone": identifier}]})
         if not user or not user.get("is_verified"):
             raise HTTPException(400, "No account found with this email or phone number")
+        is_email = "@" in identifier
+        # Cooldown: if a valid OTP was already sent recently, don't invalidate it with a
+        # fresh one — this previously caused "OTP arrived but verify fails" for email,
+        # since a slow-arriving email could be invalidated by an impatient resend.
+        _existing = await db.reset_otps.find_one({"identifier": identifier})
+        if _existing and _existing.get("otp_sent_at") and not _existing.get("verified"):
+            _sa = _existing["otp_sent_at"]
+            _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 45:
+                return {
+                    "message": "OTP recently sent",
+                    "demo_otp": _existing.get("_plain"),
+                    "method": "email" if is_email else "sms",
+                }
         code = f"{random.randint(0,9999):04d}"
         await db.reset_otps.update_one(
             {"identifier": identifier},
@@ -695,10 +709,10 @@ postbluom.online"""
                 "identifier": identifier, "user_id": user["id"],
                 "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
+                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
             }},
             upsert=True,
         )
-        is_email = "@" in identifier
         if is_email:
             # Await send so we can detect and report failure; never leak OTP in response
             email_sent = await run_in_bg(send_otp_email, identifier, code)
