@@ -1253,6 +1253,10 @@ postbluom.online"""
         await db.users.update_one({"id": u["id"]}, {"$addToSet": {"followers": user_id}})
         await db.users.update_one({"id": user_id}, {"$addToSet": {"following": u["id"]}})
         await db.follow_requests.delete_one({"from_id": user_id, "to_id": u["id"]})
+        # Delete the follow_request notification so it never reappears
+        await db.notifications.delete_one(
+            {"user_id": u["id"], "from_user_id": user_id, "type": "follow_request"}
+        )
         await db.notifications.insert_one({
             "id": str(uuid.uuid4()), "user_id": user_id,
             "from_user_id": u["id"], "from_user_name": u["name"],
@@ -1264,6 +1268,10 @@ postbluom.online"""
     @api.post("/users/{user_id}/follow-request/decline")
     async def decline_follow_request(user_id: str, u=Depends(current_user)):
         await db.follow_requests.delete_one({"from_id": user_id, "to_id": u["id"]})
+        # Delete the follow_request notification so it never reappears
+        await db.notifications.delete_one(
+            {"user_id": u["id"], "from_user_id": user_id, "type": "follow_request"}
+        )
         return {"ok": True}
 
     # ── Block / Unblock ───────────────────────────────────────────
@@ -1557,11 +1565,19 @@ postbluom.online"""
             {"from_id": p.target_user_id, "to_id": u["id"], "status": "pending"},
             {"$set": {"status": "accepted"}},
         )
+        # Delete the notification from DB so it never reappears
+        await db.notifications.delete_one(
+            {"user_id": u["id"], "from_user_id": p.target_user_id, "type": "friend_request"}
+        )
         return {"ok": True}
 
     @api.post("/friends/decline")
     async def friend_decline(p: FriendIn, u=Depends(current_user)):
         await db.friend_requests.delete_one({"from_id": p.target_user_id, "to_id": u["id"]})
+        # Delete the notification from DB so it never reappears
+        await db.notifications.delete_one(
+            {"user_id": u["id"], "from_user_id": p.target_user_id, "type": "friend_request"}
+        )
         return {"ok": True}
 
     @api.post("/friends/cancel")
