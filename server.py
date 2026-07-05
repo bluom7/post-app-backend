@@ -1947,16 +1947,15 @@ postbluom.online"""
         logging.info("✅ World users seeded")
 
     # ── Self-ping keepalive (prevents Render free tier sleep) ────
-    _keepalive_task = None   # module-level strong ref — prevents GC
+    # List holds a strong ref to the task — no nonlocal / global needed
+    _keepalive_holder = []
 
     @app.on_event("startup")
     async def keepalive_self_ping():
-        nonlocal _keepalive_task
+        import urllib.request as _ur2
         port = os.environ.get("PORT", "10000")
         ping_url = f"http://127.0.0.1:{port}/api/ping"
         logging.info(f"[KeepAlive] starting → {ping_url} every 10 min")
-
-        import urllib.request as _ur2
 
         async def _ping_loop():
             await asyncio.sleep(30)   # let server fully boot first
@@ -1967,12 +1966,13 @@ postbluom.online"""
             while True:
                 try:
                     await loop.run_in_executor(None, _do_ping)
-                    logging.info("[KeepAlive] ✅ ping OK")
+                    logging.info("[KeepAlive] ✅ ping OK — server awake")
                 except Exception as _pe:
                     logging.warning(f"[KeepAlive] ⚠️ ping failed: {_pe}")
                 await asyncio.sleep(10 * 60)   # every 10 min — safe margin under 15 min limit
 
-        _keepalive_task = asyncio.ensure_future(_ping_loop())   # stored → never GC'd
+        task = asyncio.ensure_future(_ping_loop())
+        _keepalive_holder.append(task)   # strong ref → GC can never collect this
 
     # ── Shutdown ──────────────────────────────────────────────────
     @app.on_event("shutdown")
