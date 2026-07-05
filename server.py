@@ -1305,13 +1305,15 @@ postbluom.online"""
             can_see_ids = set(following_ids + [u["id"]])
             can_see_list = list(can_see_ids)
             # Run both user-set queries in PARALLEL for speed
+            async def _empty_list():
+                return []
             follower_query = (
                 db.users.find(
                     {"id": {"$in": followers_ids},
                      "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
                     {"id": 1, "_id": 0},
                 ).to_list(None)
-                if followers_ids else asyncio.coroutine(lambda: [])()
+                if followers_ids else _empty_list()
             )
             verified_query = db.users.find(
                 {"is_badge_verified": True,
