@@ -651,11 +651,11 @@ postbluom.online"""
     @api.post("/auth/login")
     async def login(p: LoginIn):
         u = await db.users.find_one(_email_q(p.email))          # case-insensitive lookup
-        if not u: raise HTTPException(400, "Invalid credentials")
+        if not u: raise HTTPException(404, "User not found")
         if not u.get("is_verified"):                             # fast check BEFORE slow hash
             raise HTTPException(400, "Account not verified. Please check your email for the OTP verification code.")
         pw_hash = u.get("password_hash", "")
-        if not await verifypw(p.password, pw_hash): raise HTTPException(400, "Invalid credentials")
+        if not await verifypw(p.password, pw_hash): raise HTTPException(401, "Wrong password")
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
@@ -881,9 +881,10 @@ postbluom.online"""
     @api.post("/auth/phone-login")
     async def phone_login(p: PhoneLoginIn):
         u = await db.users.find_one({"phone": p.phone})
-        pw_hash_p = u.get("password_hash", "") if u else ""
-        if not u or not await verifypw(p.password, pw_hash_p):
-            raise HTTPException(400, "Invalid phone or password")
+        if not u: raise HTTPException(404, "User not found")
+        pw_hash_p = u.get("password_hash", "")
+        if not await verifypw(p.password, pw_hash_p):
+            raise HTTPException(401, "Wrong password")
         if u and (_is_bcrypt(pw_hash_p) or (pw_hash_p.startswith(_PBKDF2_PREFIX) and len(pw_hash_p.split("$")) == 4)):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
