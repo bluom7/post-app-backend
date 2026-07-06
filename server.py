@@ -1717,7 +1717,8 @@ postbluom.online"""
             q = {"$or": [{"from_id": u["id"], "to_id": with_user}, {"from_id": with_user, "to_id": u["id"]}]}
         else:
             q = {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]}
-        msgs  = await db.messages.find(q, {"_id": 0}).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
+        msgs  = await db.messages.find(q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        msgs  = list(reversed(msgs))
         total = await db.messages.count_documents(q)
         if with_user:
             await db.messages.update_many(
