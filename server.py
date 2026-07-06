@@ -660,7 +660,8 @@ postbluom.online"""
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        resp = {"token": make_token(u["id"]), "user_id": u["id"]}
+        user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
+        resp = {"token": make_token(u["id"]), "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
             deleted_at = _aware(u["deleted_at"])
             if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
@@ -890,7 +891,8 @@ postbluom.online"""
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        resp = {"token": make_token(u["id"]), "user_id": u["id"]}
+        user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
+        resp = {"token": make_token(u["id"]), "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
             deleted_at = _aware(u["deleted_at"])
             if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
