@@ -1143,10 +1143,14 @@ postbluom.online"""
                 {"username": {"$regex": q, "$options": "i"}},
                 {"location": {"$regex": q, "$options": "i"}},
             ]
-        users = await db.users.find(
-            query, {"_id": 0, "password_hash": 0, "otp_hash": 0}
-        ).skip(skip).limit(limit).to_list(limit)
-        total = await db.users.count_documents(query)
+        _DISCOVER_FIELDS = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+                            "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1,
+                            "is_badge_verified": 1, "category": 1, "is_private": 1,
+                            "location": 1, "about": 1, "continent": 1, "user_status": 1}
+        users, total = await asyncio.gather(
+            db.users.find(query, _DISCOVER_FIELDS).skip(skip).limit(limit).to_list(limit),
+            db.users.count_documents(query),
+        )
         return {"users": users, "total": total, "skip": skip, "limit": limit}
 
     @api.get("/users/{user_id}")
@@ -1229,23 +1233,27 @@ postbluom.online"""
         await db.users.update_one({"id": u["id"]}, {"$pull": {"following": user_id}})
         return {"ok": True}
 
+    # Only the fields the UI actually needs — avoids sending blocked_users, following lists, etc.
+    _PUBLIC_MINI = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+                    "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1,
+                    "is_badge_verified": 1, "category": 1, "is_private": 1,
+                    "location": 1, "about": 1}
+
     @api.get("/users/{user_id}/followers")
     async def get_followers(user_id: str, u=Depends(current_user)):
-        user = await db.users.find_one({"id": user_id})
+        user = await db.users.find_one({"id": user_id}, {"followers": 1})
         if not user: raise HTTPException(404, "User not found")
-        return await db.users.find(
-            {"id": {"$in": user.get("followers", [])}},
-            {"_id": 0, "password_hash": 0, "otp_hash": 0},
-        ).to_list(500)
+        ids = user.get("followers", [])
+        if not ids: return []
+        return await db.users.find({"id": {"$in": ids}}, _PUBLIC_MINI).to_list(500)
 
     @api.get("/users/{user_id}/following")
     async def get_following(user_id: str, u=Depends(current_user)):
-        user = await db.users.find_one({"id": user_id})
+        user = await db.users.find_one({"id": user_id}, {"following": 1})
         if not user: raise HTTPException(404, "User not found")
-        return await db.users.find(
-            {"id": {"$in": user.get("following", [])}},
-            {"_id": 0, "password_hash": 0, "otp_hash": 0},
-        ).to_list(500)
+        ids = user.get("following", [])
+        if not ids: return []
+        return await db.users.find({"id": {"$in": ids}}, _PUBLIC_MINI).to_list(500)
 
     # ── Follow Requests (private accounts) ───────────────────────
     @api.post("/users/{user_id}/follow-request/cancel")
@@ -1983,6 +1991,32 @@ postbluom.online"""
             await db.users.create_index("is_badge_verified", background=True)
             await db.users.create_index("is_private", background=True)
             await db.users.create_index("followers", background=True)
+            await db.users.create_index("deleted_at", background=True)
+            # ── Compound indexes for critical hot paths ──────────────
+            # unread message count (called every 15s per user)
+            await db.messages.create_index(
+                [("to_id", 1), ("status", 1)], background=True
+            )
+            # conversation query + message list
+            await db.messages.create_index(
+                [("from_id", 1), ("to_id", 1), ("created_at", -1)], background=True
+            )
+            # message deletion filter
+            await db.messages.create_index("deleted_for_everyone", background=True)
+            # unread notification count (called every 15s per user)
+            await db.notifications.create_index(
+                [("user_id", 1), ("read", 1)], background=True
+            )
+            # user profile post feed (sorted by time)
+            await db.posts.create_index(
+                [("user_id", 1), ("created_at", -1)], background=True
+            )
+            # saved-posts query
+            await db.posts.create_index("saves", background=True)
+            # reposts query
+            await db.posts.create_index("reposts", background=True)
+            # push subscriptions lookup
+            await db.push_subscriptions.create_index("user_id", background=True)
             logging.info("✅ MongoDB indexes created")
         except Exception as e:
             logging.warning(f"Index creation warning: {e}")
