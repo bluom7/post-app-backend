@@ -583,6 +583,7 @@ postbluom.online"""
     class MessageIn(BaseModel):
         to_user_id: str; text: str = ""
         photo_url: Optional[str] = None; mood_color: Optional[str] = None
+        reply_to_id: Optional[str] = None
 
     class TypingIn(BaseModel):
         to_user_id: str; is_typing: bool = True
@@ -1645,11 +1646,24 @@ postbluom.online"""
                 is_silent = (recv_hour >= 23 or recv_hour < 6)
             except Exception:
                 pass
+        reply_to_preview = None
+        if p.reply_to_id:
+            ref = await db.messages.find_one({"id": p.reply_to_id}, {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "photo_url": 1})
+            if ref:
+                reply_to_preview = {
+                    "id": p.reply_to_id,
+                    "from_name": ref.get("from_name", ""),
+                    "from_id": ref.get("from_id", ""),
+                    "text": (ref.get("text") or "")[:120],
+                    "has_photo": bool(ref.get("photo_url")),
+                }
         m = {
             "id": str(uuid.uuid4()), "from_id": u["id"], "from_name": u["name"],
             "to_id": p.to_user_id, "text": p.text, "photo_url": p.photo_url,
             "mood_color": p.mood_color, "created_at": now().isoformat(),
             "status": "sent", "deleted_for": [], "deleted_for_everyone": False, "is_silent": is_silent,
+            "reply_to_id": p.reply_to_id or None,
+            "reply_to_preview": reply_to_preview,
         }
         await db.messages.insert_one(m.copy())
         m.pop("_id", None)
