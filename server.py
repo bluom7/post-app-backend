@@ -1787,6 +1787,19 @@ postbluom.online"""
         notifs = await db.notifications.find(
             {"user_id": u["id"]}, {"_id": 0}
         ).sort("created_at", -1).limit(100).to_list(100)
+        from_ids = list({n["from_user_id"] for n in notifs if n.get("from_user_id")})
+        if from_ids:
+            from_users = await db.users.find(
+                {"id": {"$in": from_ids}},
+                {"_id": 0, "id": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1}
+            ).to_list(len(from_ids))
+            avatar_map = {fu["id"]: fu for fu in from_users}
+            for n in notifs:
+                fu = avatar_map.get(n.get("from_user_id"))
+                if fu:
+                    n["from_user_avatar_photo"] = fu.get("avatar_photo")
+                    n["from_user_avatar_bg"] = fu.get("avatar_bg")
+                    n["from_user_avatar_letter"] = fu.get("avatar_letter")
         unread_count = await db.notifications.count_documents({"user_id": u["id"], "read": False})
         return {"notifications": notifs, "unread_count": unread_count}
 
