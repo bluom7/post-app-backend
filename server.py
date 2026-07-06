@@ -421,6 +421,11 @@ postbluom.online"""
                 raise ValueError("Username already taken")
 
     def _aware(dt):
+        if isinstance(dt, str):
+            try:
+                dt = datetime.fromisoformat(dt)
+            except ValueError:
+                return None
         if dt and dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
         return dt
@@ -1331,19 +1336,21 @@ postbluom.online"""
             # Run both user-set queries in PARALLEL for speed
             async def _empty_list():
                 return []
+            # Bounded to_list() caps below avoid an unbounded in-memory fetch
+            # if the follower/verified-user collections grow very large.
             follower_query = (
                 db.users.find(
                     {"id": {"$in": followers_ids},
                      "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
                     {"id": 1, "_id": 0},
-                ).to_list(None)
+                ).to_list(5000)
                 if followers_ids else _empty_list()
             )
             verified_query = db.users.find(
                 {"is_badge_verified": True,
                  "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
                 {"id": 1, "_id": 0},
-            ).to_list(None)
+            ).to_list(5000)
             visible_follower_docs, verified_docs = await asyncio.gather(follower_query, verified_query)
             visible_follower_ids = [v["id"] for v in visible_follower_docs]
             verified_ids = [v["id"] for v in verified_docs]
@@ -1359,7 +1366,7 @@ postbluom.online"""
             viewer_can_see = set(following_ids + [u["id"]])
             priv_docs = await db.users.find(
                 {"is_private": True, "id": {"$nin": list(viewer_can_see)}}, {"id": 1, "_id": 0}
-            ).to_list(None)
+            ).to_list(5000)
             private_ids = [p["id"] for p in priv_docs]
             if private_ids:
                 query["user_id"] = {"$nin": private_ids}
@@ -1701,12 +1708,18 @@ postbluom.online"""
                "is_online": 1, "last_seen": 1}
         users_list = await db.users.find({"id": {"$in": user_ids}}, pub).to_list(200)
         users_map  = {uu["id"]: uu for uu in users_list}
-        async def _unread(cid):
-            return await db.messages.count_documents({
-                "from_id": cid, "to_id": u["id"],
+        # Single aggregation instead of one count_documents() per conversation
+        # (was N queries per page load — this collapses it to 1 round-trip).
+        unread_pipeline = [
+            {"$match": {
+                "to_id": u["id"], "from_id": {"$in": user_ids},
                 "status": {"$ne": "seen"}, "deleted_for_everyone": {"$ne": True},
-            })
-        unread_counts = await asyncio.gather(*[_unread(c["_id"]) for c in convs])
+            }},
+            {"$group": {"_id": "$from_id", "count": {"$sum": 1}}},
+        ]
+        unread_docs = await db.messages.aggregate(unread_pipeline).to_list(len(user_ids) or 1)
+        unread_map = {d["_id"]: d["count"] for d in unread_docs}
+        unread_counts = [unread_map.get(c["_id"], 0) for c in convs]
         for c, uc in zip(convs, unread_counts):
             c["user"]   = users_map.get(c["_id"], {})
             c["unread"] = uc
