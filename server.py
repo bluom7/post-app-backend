@@ -1414,10 +1414,15 @@ postbluom.online"""
     async def like_post(pid: str, p: LikeIn, u=Depends(current_user)):
         post = await db.posts.find_one({"id": pid})
         if not post: raise HTTPException(404, "Not found")
-        likes = [l for l in post.get("likes", []) if l["user_id"] != u["id"]]
+        # Atomic pull-then-push avoids clobbering concurrent likes from other users
+        await db.posts.update_one({"id": pid}, {"$pull": {"likes": {"user_id": u["id"]}}})
         if p.color:
-            likes.append({"user_id": u["id"], "color": p.color, "liked_at": now().isoformat()})
-        await db.posts.update_one({"id": pid}, {"$set": {"likes": likes}})
+            await db.posts.update_one(
+                {"id": pid},
+                {"$push": {"likes": {"user_id": u["id"], "color": p.color, "liked_at": now().isoformat()}}},
+            )
+        updated_post = await db.posts.find_one({"id": pid}, {"_id": 0, "likes": 1})
+        likes = updated_post.get("likes", []) if updated_post else []
         if p.color and post["user_id"] != u["id"]:
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": post["user_id"],
@@ -1731,6 +1736,9 @@ postbluom.online"""
             q = {"$or": [{"from_id": u["id"], "to_id": with_user}, {"from_id": with_user, "to_id": u["id"]}]}
         else:
             q = {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]}
+        # Exclude messages this user deleted (for self or everyone) directly in the query
+        # so `total` matches the actual number of messages returned across pages.
+        q = {"$and": [q, {"deleted_for_everyone": {"$ne": True}}, {"deleted_for": {"$ne": u["id"]}}]}
         msgs  = await db.messages.find(q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
         msgs  = list(reversed(msgs))
         total = await db.messages.count_documents(q)
@@ -1739,7 +1747,6 @@ postbluom.online"""
                 {"from_id": with_user, "to_id": u["id"], "status": "sent"},
                 {"$set": {"status": "delivered"}},
             )
-        msgs = [m for m in msgs if u["id"] not in m.get("deleted_for", []) and not m.get("deleted_for_everyone")]
         return {"messages": msgs, "total": total, "skip": skip, "limit": limit}
 
     @api.post("/messages/{msg_id}/seen")
