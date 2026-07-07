@@ -1203,7 +1203,7 @@ postbluom.online"""
             })
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": user_id,
-                "from_user_id": u["id"], "from_user_name": u["name"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
                 "type": "follow_request", "created_at": now().isoformat(), "read": False,
             })
             asyncio.create_task(send_push(user_id, "New follow request", u["name"] + " wants to follow you"))
@@ -1214,7 +1214,7 @@ postbluom.online"""
             await db.users.update_one({"id": u["id"]}, {"$push": {"following": user_id}})
         await db.notifications.insert_one({
             "id": str(uuid.uuid4()), "user_id": user_id,
-            "from_user_id": u["id"], "from_user_name": u["name"],
+            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
             "type": "follow", "created_at": now().isoformat(), "read": False,
         })
         asyncio.create_task(send_push(user_id, "New follower", u["name"] + " started following you"))
@@ -1263,7 +1263,7 @@ postbluom.online"""
         )
         await db.notifications.insert_one({
             "id": str(uuid.uuid4()), "user_id": user_id,
-            "from_user_id": u["id"], "from_user_name": u["name"],
+            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
             "type": "follow_accept", "created_at": now().isoformat(), "read": False,
         })
         asyncio.create_task(send_push(user_id, "Follow accepted", u["name"] + " accepted your follow request"))
@@ -1423,7 +1423,7 @@ postbluom.online"""
         if p.color and post["user_id"] != u["id"]:
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": post["user_id"],
-                "from_user_id": u["id"], "from_user_name": u["name"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
                 "type": "like", "post_id": pid, "created_at": now().isoformat(), "read": False,
             })
             asyncio.create_task(send_push(post["user_id"], "New like ♥️", u["name"] + " liked your post"))
@@ -1443,7 +1443,7 @@ postbluom.online"""
         if post["user_id"] != u["id"]:
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": post["user_id"],
-                "from_user_id": u["id"], "from_user_name": u["name"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
                 "type": "comment", "post_id": pid, "created_at": now().isoformat(), "read": False,
             })
             asyncio.create_task(send_push(post["user_id"], "New comment 💬", u["name"] + " commented on your post"))
@@ -1500,7 +1500,7 @@ postbluom.online"""
         if post["user_id"] != u["id"]:
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": post["user_id"],
-                "from_user_id": u["id"], "from_user_name": u["name"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
                 "type": "repost", "post_id": pid, "created_at": now().isoformat(), "read": False,
             })
             asyncio.create_task(send_push(post["user_id"], "Repost", u["name"] + " reposted your post"))
@@ -1516,7 +1516,7 @@ postbluom.online"""
         if target["id"] == u["id"]: return {"ok": True}
         await db.notifications.insert_one({
             "id": str(uuid.uuid4()), "user_id": target["id"],
-            "from_user_id": u["id"], "from_user_name": u["name"],
+            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
             "type": "mention", "post_id": pid, "created_at": now().isoformat(), "read": False,
         })
         asyncio.create_task(send_push(target["id"], "Mention", u["name"] + " mentioned you in a post"))
@@ -1557,7 +1557,7 @@ postbluom.online"""
         })
         await db.notifications.insert_one({
             "id": str(uuid.uuid4()), "user_id": p.target_user_id,
-            "from_user_id": u["id"], "from_user_name": u["name"],
+            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
             "type": "friend_request", "created_at": now().isoformat(), "read": False,
         })
         asyncio.create_task(send_push(p.target_user_id, "Connect request", u["name"] + " sent you a connect request"))
