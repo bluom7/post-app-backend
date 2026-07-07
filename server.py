@@ -1752,6 +1752,15 @@ postbluom.online"""
         )
         return {"ok": True}
 
+    @api.post("/messages/conversations/{partner_id}/seen")
+    async def mark_conversation_seen(partner_id: str, u=Depends(current_user)):
+        """Bulk-mark all unread messages from partner_id to current user as seen."""
+        await db.messages.update_many(
+            {"from_id": partner_id, "to_id": u["id"], "status": {"$ne": "seen"}, "deleted_for_everyone": {"$ne": True}},
+            {"$set": {"status": "seen", "seen_at": now().isoformat()}}
+        )
+        return {"ok": True}
+
     @api.delete("/messages/{msg_id}")
     async def delete_message(msg_id: str, delete_for: str = "self", u=Depends(current_user)):
         msg = await db.messages.find_one({"id": msg_id})
