@@ -1527,6 +1527,26 @@ postbluom.online"""
         asyncio.create_task(send_push(target["id"], "Mention", u["name"] + " mentioned you in a post"))
         return {"ok": True}
 
+
+    @api.post("/posts/{pid}/report")
+    async def report_post(pid: str, body: dict, u=Depends(current_user)):
+        reason = (body.get("reason") or "").strip()
+        if not reason: raise HTTPException(400, "Reason required")
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        already = await db.reports.find_one({"post_id": pid, "reported_by": u["id"]})
+        if already: return {"ok": True, "already": True}
+        await db.reports.insert_one({"id": str(uuid.uuid4()), "post_id": pid, "reported_by": u["id"], "reported_user_id": post.get("user_id"), "reason": reason, "created_at": now().isoformat(), "status": "pending"})
+        return {"ok": True}
+
+    @api.post("/users/me/badge-request")
+    async def request_badge(body: dict, u=Depends(current_user)):
+        if u.get("is_badge_verified"): raise HTTPException(400, "Already verified")
+        existing = await db.badge_requests.find_one({"user_id": u["id"], "status": "pending"})
+        if existing: raise HTTPException(400, "A request is already pending review")
+        await db.badge_requests.insert_one({"id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"], "user_handle": u.get("handle"), "reason": (body.get("reason") or "").strip(), "created_at": now().isoformat(), "status": "pending"})
+        return {"ok": True}
+
     @api.get("/users/me/saved-posts")
     async def get_saved_posts(u=Depends(current_user)):
         user_id = u["id"]
