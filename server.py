@@ -573,6 +573,7 @@ postbluom.online"""
     class PostIn(BaseModel):
         content: str; accent: str = "#FFD600"; location: Optional[str] = None
         photo_url: Optional[str] = None
+        photo_urls: Optional[List[str]] = None  # up to 5 photos
 
     class CommentIn(BaseModel):
         text: str
@@ -1298,7 +1299,8 @@ postbluom.online"""
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
             "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
             "content": p.content, "accent": p.accent, "location": p.location or "",
-            "photo_url": p.photo_url or None,
+            "photo_url": (p.photo_urls[0] if p.photo_urls else None) or p.photo_url or None,
+            "photo_urls": p.photo_urls or ([p.photo_url] if p.photo_url else []),
             "user_location": u.get("location", ""),
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
