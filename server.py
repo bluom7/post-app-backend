@@ -1411,6 +1411,9 @@ postbluom.online"""
         if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
         upd = {"content": p.content, "accent": p.accent, "location": p.location or "", "edited_at": now().isoformat()}
         if p.photo_url is not None: upd["photo_url"] = p.photo_url
+        if p.photo_urls is not None:
+            upd["photo_urls"] = p.photo_urls
+            upd["photo_url"] = p.photo_urls[0] if p.photo_urls else None
         await db.posts.update_one({"id": pid}, {"$set": upd})
         return await db.posts.find_one({"id": pid}, {"_id": 0})
 
@@ -1491,7 +1494,7 @@ postbluom.online"""
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
             "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
             "content": post.get("content", ""), "accent": post.get("accent", "#FFD600"),
-            "location": "", "photo_url": post.get("photo_url"),
+            "location": "", "photo_url": post.get("photo_url"), "photo_urls": post.get("photo_urls", []),
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "repost_of": pid, "repost_user_name": post.get("user_name"),
             "repost_user_handle": post.get("user_handle"),
