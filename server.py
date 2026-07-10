@@ -574,6 +574,9 @@ postbluom.online"""
         content: str; accent: str = "#FFD600"; location: Optional[str] = None
         photo_url: Optional[str] = None
         photo_urls: Optional[List[str]] = None  # up to 5 photos
+        feeling: Optional[str] = None           # e.g. "😊 Happy"
+        tagged_users: Optional[List[str]] = None  # list of @handles
+        audience: Optional[str] = "public"       # public | followers
 
     class CommentIn(BaseModel):
         text: str
@@ -1319,6 +1322,9 @@ postbluom.online"""
             "photo_url": (p.photo_urls[0] if p.photo_urls else None) or p.photo_url or None,
             "photo_urls": p.photo_urls or ([p.photo_url] if p.photo_url else []),
             "user_location": u.get("location", ""),
+            "feeling": p.feeling or None,
+            "tagged_users": p.tagged_users or [],
+            "audience": p.audience or "public",
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
         }
