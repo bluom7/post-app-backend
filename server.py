@@ -1817,6 +1817,18 @@ postbluom.online"""
             await db.messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
         return {"ok": True}
 
+    @api.delete("/messages/conversations/{partner_id}")
+    async def delete_conversation(partner_id: str, u=Depends(current_user)):
+        """Soft-delete entire conversation for current user only."""
+        await db.messages.update_many(
+            {"$or": [
+                {"from_id": u["id"], "to_id": partner_id},
+                {"from_id": partner_id, "to_id": u["id"]}
+            ]},
+            {"$addToSet": {"deleted_for": u["id"]}}
+        )
+        return {"ok": True}
+
     @api.post("/messages/typing")
     async def set_typing(p: TypingIn, u=Depends(current_user)):
         if u["id"] not in _typing_state:
