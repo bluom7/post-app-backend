@@ -13,3 +13,4 @@ dnspython==2.6.1
 resend>=2.4.0
 twilio==9.0.4
 cryptography>=41.0.0
+cloudinary
