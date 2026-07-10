@@ -1716,7 +1716,11 @@ postbluom.online"""
     @api.get("/messages/conversations")
     async def get_conversations(u=Depends(current_user)):
         pipeline = [
-            {"$match": {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}], "deleted_for_everyone": {"$ne": True}}},
+            {"$match": {
+                "$or": [{"from_id": u["id"]}, {"to_id": u["id"]}],
+                "deleted_for_everyone": {"$ne": True},
+                "deleted_for": {"$nin": [u["id"]]},
+            }},
             {"$sort": {"created_at": -1}},
             {"$project": {
                 "_id": 0,
@@ -1744,6 +1748,7 @@ postbluom.online"""
             return await db.messages.count_documents({
                 "from_id": cid, "to_id": u["id"],
                 "status": {"$ne": "seen"}, "deleted_for_everyone": {"$ne": True},
+                "deleted_for": {"$nin": [u["id"]]},
             })
         unread_counts = await asyncio.gather(*[_unread(c["_id"]) for c in convs])
         for c, uc in zip(convs, unread_counts):
