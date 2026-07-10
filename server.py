@@ -1291,6 +1291,23 @@ postbluom.online"""
         await db.users.update_one({"id": u["id"]}, {"$pull": {"blocked_users": user_id}})
         return {"ok": True}
 
+    @api.post("/users/{user_id}/mute")
+    async def mute_user(user_id: str, u=Depends(current_user)):
+        if user_id == u["id"]: raise HTTPException(400, "Can't mute yourself")
+        await db.users.update_one({"id": u["id"]}, {"$addToSet": {"muted_users": user_id}})
+        return {"ok": True}
+
+    @api.post("/users/{user_id}/unmute")
+    async def unmute_user(user_id: str, u=Depends(current_user)):
+        await db.users.update_one({"id": u["id"]}, {"$pull": {"muted_users": user_id}})
+        return {"ok": True}
+
+    @api.post("/posts/{pid}/not-interested")
+    async def not_interested(pid: str, u=Depends(current_user)):
+        await db.users.update_one({"id": u["id"]}, {"$addToSet": {"not_interested": pid}})
+        return {"ok": True}
+
+
     # ── Posts ─────────────────────────────────────────────────────
     @api.post("/posts")
     async def create_post(p: PostIn, u=Depends(current_user)):
