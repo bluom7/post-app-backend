@@ -1386,6 +1386,74 @@ postbluom.online"""
             "bytes": result.get("bytes"),
         }
 
+    # ── One-time migration: move old base64 videos to Cloudinary ────
+    # Posts/profile/cover videos created before the Cloudinary upload was
+    # added are still stored as huge base64 "data:video/..." strings, so
+    # they still stutter/buffer for existing users. This endpoint finds
+    # every one of those, re-uploads the bytes to Cloudinary, and rewrites
+    # the field to the new streamable URL. Safe to call more than once —
+    # already-migrated (http/https) values are skipped.
+    MIGRATION_SECRET = os.environ.get("MIGRATION_SECRET", "").strip()
+
+    def _decode_data_uri_video(data_uri: str) -> bytes:
+        header, _, b64data = data_uri.partition(",")
+        return base64.b64decode(b64data)
+
+    async def _migrate_one_video(data_uri: str, public_id: str) -> Optional[str]:
+        try:
+            raw = _decode_data_uri_video(data_uri)
+            result = cloudinary.uploader.upload(
+                raw, resource_type="video", folder="post-app/videos-migrated",
+                public_id=public_id, overwrite=False,
+            )
+            return result.get("secure_url")
+        except Exception:
+            logging.exception(f"Video migration failed for {public_id}")
+            return None
+
+    @api.post("/admin/migrate-videos-to-cloudinary")
+    async def migrate_videos_to_cloudinary(request: Request):
+        if not MIGRATION_SECRET or request.headers.get("x-migration-key") != MIGRATION_SECRET:
+            raise HTTPException(403, "Not authorized")
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Video hosting is not configured on the server")
+
+        posts_migrated, posts_failed = 0, 0
+        users_migrated, users_failed = 0, 0
+
+        async for post in db.posts.find({"video_url": {"$regex": "^data:video/"}}):
+            new_url = await _migrate_one_video(post["video_url"], f"post_{post['id']}")
+            if new_url:
+                await db.posts.update_one({"id": post["id"]}, {"$set": {"video_url": new_url}})
+                posts_migrated += 1
+            else:
+                posts_failed += 1
+
+        async for user in db.users.find({
+            "$or": [
+                {"profile_video": {"$regex": "^data:video/"}},
+                {"cover_video": {"$regex": "^data:video/"}},
+            ]
+        }):
+            upd = {}
+            if user.get("profile_video", "").startswith("data:video/"):
+                new_url = await _migrate_one_video(user["profile_video"], f"profile_{user['id']}")
+                if new_url: upd["profile_video"] = new_url
+                else: users_failed += 1
+            if user.get("cover_video", "").startswith("data:video/"):
+                new_url = await _migrate_one_video(user["cover_video"], f"cover_{user['id']}")
+                if new_url: upd["cover_video"] = new_url
+                else: users_failed += 1
+            if upd:
+                await db.users.update_one({"id": user["id"]}, {"$set": upd})
+                users_migrated += 1
+
+        return {
+            "ok": True,
+            "posts_migrated": posts_migrated, "posts_failed": posts_failed,
+            "users_migrated": users_migrated, "users_failed": users_failed,
+        }
+
     @api.post("/posts")
     async def create_post(p: PostIn, u=Depends(current_user)):
         _validate_post_video(p.video_url, p.video_duration)
