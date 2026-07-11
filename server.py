@@ -1396,8 +1396,14 @@ postbluom.online"""
         try:
             result = cloudinary.uploader.upload(raw, **upload_kwargs)
         except Exception as e:
+            # Log the full Cloudinary error server-side only — it can include
+            # internal signing details ("String to sign - ...") that must never
+            # be shown to end users.
             logging.exception("Cloudinary video upload failed")
-            raise HTTPException(502, f"Video upload failed: {e}")
+            msg = str(e)
+            if "Invalid Signature" in msg or "String to sign" in msg:
+                raise HTTPException(500, "Video hosting is misconfigured on the server (invalid Cloudinary credentials). Please contact the app admin.")
+            raise HTTPException(502, "Video upload failed. Please try again.")
 
         return {
             "url": result.get("secure_url"),
