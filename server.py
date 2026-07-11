@@ -574,6 +574,8 @@ postbluom.online"""
         content: str; accent: str = "#FFD600"; location: Optional[str] = None
         photo_url: Optional[str] = None
         photo_urls: Optional[List[str]] = None  # up to 5 photos
+        video_url: Optional[str] = None         # base64 data URI, max 30s (mutually exclusive with photos)
+        video_duration: Optional[float] = None  # seconds, must be <= 30
         feeling: Optional[str] = None           # e.g. "😊 Happy"
         tagged_users: Optional[List[str]] = None  # list of @handles
         audience: Optional[str] = "public"       # public | followers
@@ -1313,15 +1315,34 @@ postbluom.online"""
 
 
     # ── Posts ─────────────────────────────────────────────────────
+    MAX_POST_VIDEO_SECONDS = 30
+    MAX_POST_VIDEO_DATA_URI_CHARS = 15 * 1024 * 1024  # ~15M chars of base64, keeps the Mongo doc under its 16MB cap
+
+    def _validate_post_video(video_url: Optional[str], video_duration: Optional[float]):
+        """Raises HTTPException if the given video data URI is missing, oversized, or too long."""
+        if not video_url:
+            return
+        if not video_url.startswith("data:video/"):
+            raise HTTPException(400, "Invalid video data")
+        if len(video_url) > MAX_POST_VIDEO_DATA_URI_CHARS:
+            raise HTTPException(400, "Video is too large. Please choose a smaller clip.")
+        if video_duration is not None and video_duration > MAX_POST_VIDEO_SECONDS + 0.5:
+            raise HTTPException(400, f"Videos must be {MAX_POST_VIDEO_SECONDS} seconds or less")
+
     @api.post("/posts")
     async def create_post(p: PostIn, u=Depends(current_user)):
+        _validate_post_video(p.video_url, p.video_duration)
+        # A post is either a photo carousel or a single video, never both
+        has_video = bool(p.video_url)
         doc = {
             "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
             "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
             "content": p.content, "accent": p.accent, "location": p.location or "",
-            "photo_url": (p.photo_urls[0] if p.photo_urls else None) or p.photo_url or None,
-            "photo_urls": p.photo_urls or ([p.photo_url] if p.photo_url else []),
+            "photo_url": None if has_video else ((p.photo_urls[0] if p.photo_urls else None) or p.photo_url or None),
+            "photo_urls": [] if has_video else (p.photo_urls or ([p.photo_url] if p.photo_url else [])),
+            "video_url": p.video_url if has_video else None,
+            "video_duration": min(p.video_duration, MAX_POST_VIDEO_SECONDS) if (has_video and p.video_duration is not None) else None,
             "user_location": u.get("location", ""),
             "feeling": p.feeling or None,
             "tagged_users": p.tagged_users or [],
@@ -1434,11 +1455,22 @@ postbluom.online"""
         post = await db.posts.find_one({"id": pid})
         if not post: raise HTTPException(404, "Post not found")
         if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
+        _validate_post_video(p.video_url, p.video_duration)
         upd = {"content": p.content, "accent": p.accent, "location": p.location or "", "edited_at": now().isoformat()}
-        if p.photo_url is not None: upd["photo_url"] = p.photo_url
-        if p.photo_urls is not None:
-            upd["photo_urls"] = p.photo_urls
-            upd["photo_url"] = p.photo_urls[0] if p.photo_urls else None
+        if p.video_url is not None:
+            # Switching to a video clears any existing photos, keeping the two mutually exclusive
+            upd["video_url"] = p.video_url
+            upd["video_duration"] = min(p.video_duration, MAX_POST_VIDEO_SECONDS) if p.video_duration is not None else None
+            upd["photo_url"] = None
+            upd["photo_urls"] = []
+        elif p.photo_url is not None or p.photo_urls is not None:
+            # Switching to photos clears any existing video
+            upd["video_url"] = None
+            upd["video_duration"] = None
+            if p.photo_url is not None: upd["photo_url"] = p.photo_url
+            if p.photo_urls is not None:
+                upd["photo_urls"] = p.photo_urls
+                upd["photo_url"] = p.photo_urls[0] if p.photo_urls else None
         await db.posts.update_one({"id": pid}, {"$set": upd})
         return await db.posts.find_one({"id": pid}, {"_id": 0})
 
@@ -1522,6 +1554,7 @@ postbluom.online"""
             "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
             "content": post.get("content", ""), "accent": post.get("accent", "#FFD600"),
             "location": "", "photo_url": post.get("photo_url"), "photo_urls": post.get("photo_urls", []),
+            "video_url": post.get("video_url"), "video_duration": post.get("video_duration"),
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "repost_of": pid, "repost_user_name": post.get("user_name"),
             "repost_user_handle": post.get("user_handle"),
