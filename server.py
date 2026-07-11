@@ -577,6 +577,7 @@ postbluom.online"""
         feeling: Optional[str] = None           # e.g. "😊 Happy"
         tagged_users: Optional[List[str]] = None  # list of @handles
         audience: Optional[str] = "public"       # public | followers
+        comments_enabled: Optional[bool] = True  # False = comments turned off for this post
 
     class CommentIn(BaseModel):
         text: str
@@ -1325,6 +1326,7 @@ postbluom.online"""
             "feeling": p.feeling or None,
             "tagged_users": p.tagged_users or [],
             "audience": p.audience or "public",
+            "comments_enabled": False if p.audience == "only_me" else (p.comments_enabled if p.comments_enabled is not None else True),
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
         }
@@ -1461,6 +1463,8 @@ postbluom.online"""
     async def add_comment(pid: str, p: CommentIn, u=Depends(current_user)):
         post = await db.posts.find_one({"id": pid})
         if not post: raise HTTPException(404, "Post not found")
+        if not post.get("comments_enabled", True):
+            raise HTTPException(403, "Comments are turned off for this post")
         c = {
             "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
