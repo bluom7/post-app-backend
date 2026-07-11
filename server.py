@@ -30,6 +30,22 @@ try:
     DB_NAME        = os.environ.get("DB_NAME", "postapp")
     JWT_SECRET     = os.environ.get("JWT_SECRET", "change-me-in-production")
 
+    # ── Cloudinary (video/photo hosting — enables smooth streaming) ──
+    import cloudinary
+    import cloudinary.uploader
+    CLOUDINARY_URL        = os.environ.get("CLOUDINARY_URL", "").strip()
+    CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+    CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+    CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
+    if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+        cloudinary.config(
+            cloud_name=CLOUDINARY_CLOUD_NAME,
+            api_key=CLOUDINARY_API_KEY,
+            api_secret=CLOUDINARY_API_SECRET,
+            secure=True,
+        )
+    # else: falls back to CLOUDINARY_URL env var, which the SDK reads automatically on import
+
     def _b64ue(b):
         import base64 as _b64
         return _b64.urlsafe_b64encode(b).rstrip(b'=').decode()
@@ -1316,18 +1332,59 @@ postbluom.online"""
 
     # ── Posts ─────────────────────────────────────────────────────
     MAX_POST_VIDEO_SECONDS = 30
-    MAX_POST_VIDEO_DATA_URI_CHARS = 15 * 1024 * 1024  # ~15M chars of base64, keeps the Mongo doc under its 16MB cap
+    MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024  # 100MB raw file, uploaded straight to Cloudinary (no base64 inflation)
 
     def _validate_post_video(video_url: Optional[str], video_duration: Optional[float]):
-        """Raises HTTPException if the given video data URI is missing, oversized, or too long."""
+        """Raises HTTPException if the given video URL is missing/invalid or too long.
+
+        Videos are now hosted on Cloudinary (real files, streamed with HTTP range
+        support) instead of being embedded as base64 data URIs — that's what used
+        to make playback stall/buffer since a data URI can't be streamed or seeked.
+        """
         if not video_url:
             return
-        if not video_url.startswith("data:video/"):
-            raise HTTPException(400, "Invalid video data")
-        if len(video_url) > MAX_POST_VIDEO_DATA_URI_CHARS:
-            raise HTTPException(400, "Video is too large. Please choose a smaller clip.")
+        if not (video_url.startswith("https://") or video_url.startswith("http://")):
+            raise HTTPException(400, "Invalid video URL — please upload the video again")
         if video_duration is not None and video_duration > MAX_POST_VIDEO_SECONDS + 0.5:
             raise HTTPException(400, f"Videos must be {MAX_POST_VIDEO_SECONDS} seconds or less")
+
+    @api.post("/upload/video")
+    async def upload_video(file: UploadFile = File(...), u=Depends(current_user)):
+        """Uploads a raw video file to Cloudinary and returns its streamable URL.
+
+        Cloudinary serves videos over HTTP with byte-range support, so playback
+        can start immediately and seek/buffer smoothly — unlike a base64 data URI,
+        which forces the browser to download the entire clip up front before it
+        can play anything. The original file is uploaded as-is, so quality is
+        unchanged (no re-encoding/transcoding).
+        """
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Video hosting is not configured on the server")
+        if not file.content_type or not file.content_type.startswith("video/"):
+            raise HTTPException(400, "Please upload a valid video file")
+
+        raw = await file.read()
+        if len(raw) > MAX_UPLOAD_VIDEO_BYTES:
+            raise HTTPException(400, "Video is too large. Please choose a smaller clip.")
+
+        try:
+            result = cloudinary.uploader.upload(
+                raw,
+                resource_type="video",
+                folder="post-app/videos",
+                public_id=f"{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
+                # Preserve original quality/encoding — no transformation applied.
+            )
+        except Exception as e:
+            logging.exception("Cloudinary video upload failed")
+            raise HTTPException(502, f"Video upload failed: {e}")
+
+        return {
+            "url": result.get("secure_url"),
+            "duration": result.get("duration"),
+            "bytes": result.get("bytes"),
+        }
 
     @api.post("/posts")
     async def create_post(p: PostIn, u=Depends(current_user)):
