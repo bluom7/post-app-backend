@@ -4,7 +4,7 @@ import traceback as _tb
 print('==> [DIAG] server.py starting load...', file=_sys.stderr, flush=True)
 
 try:
-    from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Query, Request
+    from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Query, Request
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.middleware.gzip import GZipMiddleware
@@ -1349,14 +1349,24 @@ postbluom.online"""
             raise HTTPException(400, f"Videos must be {MAX_POST_VIDEO_SECONDS} seconds or less")
 
     @api.post("/upload/video")
-    async def upload_video(file: UploadFile = File(...), u=Depends(current_user)):
+    async def upload_video(
+        file: UploadFile = File(...),
+        start_offset: Optional[float] = Form(None),
+        end_offset: Optional[float] = Form(None),
+        u=Depends(current_user),
+    ):
         """Uploads a raw video file to Cloudinary and returns its streamable URL.
 
         Cloudinary serves videos over HTTP with byte-range support, so playback
         can start immediately and seek/buffer smoothly — unlike a base64 data URI,
         which forces the browser to download the entire clip up front before it
         can play anything. The original file is uploaded as-is, so quality is
-        unchanged (no re-encoding/transcoding).
+        unchanged (no re-encoding/transcoding) unless a trim window is given.
+
+        If start_offset/end_offset are given (seconds), the clip is cut down to
+        that window during upload — this lets users pick up to a 1-minute video
+        and trim it to the 30s max before it's ever stored, keeping the same
+        resolution/bitrate (only the length changes).
         """
         if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
             raise HTTPException(500, "Video hosting is not configured on the server")
@@ -1367,15 +1377,24 @@ postbluom.online"""
         if len(raw) > MAX_UPLOAD_VIDEO_BYTES:
             raise HTTPException(400, "Video is too large. Please choose a smaller clip.")
 
+        upload_kwargs = dict(
+            resource_type="video",
+            folder="post-app/videos",
+            public_id=f"{u['id']}_{uuid.uuid4().hex}",
+            overwrite=False,
+        )
+        if start_offset is not None and end_offset is not None:
+            if end_offset <= start_offset:
+                raise HTTPException(400, "Invalid trim range")
+            if end_offset - start_offset > MAX_POST_VIDEO_SECONDS + 0.5:
+                raise HTTPException(400, f"Trimmed clip must be {MAX_POST_VIDEO_SECONDS} seconds or less")
+            upload_kwargs["transformation"] = [{
+                "start_offset": round(start_offset, 2),
+                "end_offset": round(end_offset, 2),
+            }]
+
         try:
-            result = cloudinary.uploader.upload(
-                raw,
-                resource_type="video",
-                folder="post-app/videos",
-                public_id=f"{u['id']}_{uuid.uuid4().hex}",
-                overwrite=False,
-                # Preserve original quality/encoding — no transformation applied.
-            )
+            result = cloudinary.uploader.upload(raw, **upload_kwargs)
         except Exception as e:
             logging.exception("Cloudinary video upload failed")
             raise HTTPException(502, f"Video upload failed: {e}")
