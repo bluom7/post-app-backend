@@ -2398,19 +2398,12 @@ postbluom.online"""
 
     @api.post("/admin/cleanup-demo-accounts")
     async def admin_cleanup_demo_accounts(admin=Depends(_is_admin)):
-        """ONE-TIME: permanently delete all is_seed accounts + phone 8081880223 account."""
+        """ONE-TIME: permanently delete all is_seed/demo accounts."""
         deleted = []
-        # 1. All seed/demo accounts
         seed_users = await db.users.find({"is_seed": True}, {"id": 1, "username": 1}).to_list(None)
         for u in seed_users:
             await permanently_delete_user(u["id"])
-            deleted.append({"id": u["id"], "username": u.get("username"), "reason": "seed"})
-        # 2. Account with phone 8081880223 (with or without +91)
-        phone_user = await db.users.find_one({"phone": {"$in": ["+918081880223", "8081880223"]}})
-        if phone_user:
-            await permanently_delete_user(phone_user["id"])
-            deleted.append({"id": phone_user["id"], "username": phone_user.get("username"), "reason": "phone:8081880223"})
-        # 3. Clean up seed re-seeding block so new seed won't run (remove is_seed docs count)
+            deleted.append({"username": u.get("username")})
         return {"ok": True, "deleted_count": len(deleted), "deleted": deleted}
 
     @api.post("/admin/users/{user_id}/toggle-admin")
