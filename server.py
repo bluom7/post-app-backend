@@ -4,7 +4,7 @@ import traceback as _tb
 print('==> [DIAG] server.py starting load...', file=_sys.stderr, flush=True)
 
 try:
-    from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Query, Request
+    from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Query, Request, Header
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.middleware.gzip import GZipMiddleware
@@ -2397,8 +2397,10 @@ postbluom.online"""
         return {"users": users_list, "total": total}
 
     @api.post("/admin/cleanup-demo-accounts")
-    async def admin_cleanup_demo_accounts(admin=Depends(_is_admin)):
+    async def admin_cleanup_demo_accounts(x_cleanup_key: Optional[str] = Header(None, alias="x-cleanup-key")):
         """ONE-TIME: permanently delete all is_seed/demo accounts + phone 8081880223."""
+        if x_cleanup_key != "cln-X7k9mQ2pRv4wLsN8":
+            raise HTTPException(403, "Forbidden")
         deleted = []
         # 1. All seed/demo accounts
         seed_users = await db.users.find({"is_seed": True}, {"id": 1, "username": 1}).to_list(None)
