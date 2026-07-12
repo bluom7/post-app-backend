@@ -2416,7 +2416,7 @@ postbluom.online"""
     async def create_indexes():
         try:
             await db.users.create_index("id", unique=True, background=True)
-            await db.users.create_index("username", background=True)
+            await db.users.create_index("username", unique=True, sparse=True, background=True)
             await db.users.create_index("email", background=True)
             await db.users.create_index("phone", background=True)
             await db.users.create_index("handle", background=True)
