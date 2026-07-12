@@ -409,8 +409,9 @@ postbluom.online"""
 
     def send_otp_sms(phone, code):
         if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_PHONE:
-            logging.info(f"[DEMO] SMS OTP for {phone}: {code}")
-            return False
+            missing = [k for k,v in {"TWILIO_SID": TWILIO_SID, "TWILIO_TOKEN": TWILIO_TOKEN, "TWILIO_PHONE": TWILIO_PHONE}.items() if not v]
+            logging.warning(f"[SMS] Missing env vars: {missing}. OTP for {phone}: {code}")
+            return None  # None = not configured
         try:
             from twilio.rest import Client
             twilio = Client(TWILIO_SID, TWILIO_TOKEN)
@@ -419,11 +420,11 @@ postbluom.online"""
                 from_=TWILIO_PHONE,
                 to=phone,
             )
-            logging.info(f"SMS sent to {phone}")
+            logging.info(f"[SMS] Sent to {phone}")
             return True
         except Exception as e:
-            logging.warning(f"SMS failed: {e}")
-            return False
+            logging.error(f"[SMS] FAILED to {phone}: {e}")
+            return str(e)  # Return error string so callers can surface it
 
     # ── Misc helpers ──────────────────────────────────────────────
     async def ensure_username_unique(username: str, exclude_uid: Optional[str] = None):
@@ -765,8 +766,10 @@ postbluom.online"""
                 raise HTTPException(503, "Failed to send verification email. Please try again in a moment.")
             return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email"}
         else:
-            sms_sent = await run_in_bg(send_otp_sms, identifier, code)
-            return {"message": "OTP sent", "demo_otp": code if not sms_sent else None, "method": "sms"}
+            sms_result = await run_in_bg(send_otp_sms, identifier, code)
+            sms_ok = sms_result is True
+            sms_err = sms_result if isinstance(sms_result, str) else None
+            return {"message": "OTP sent", "demo_otp": code if not sms_ok else None, "method": "sms", "sms_error": sms_err}
 
     @api.post("/auth/forgot-password-verify")
     async def forgot_password_verify(p: ForgotPasswordVerifyIn):
@@ -877,10 +880,12 @@ postbluom.online"""
             }},
             upsert=True,
         )
-        sms_sent = await run_in_bg(send_otp_sms, p.phone, code)
-        demo = code if not sms_sent else None
+        sms_result = await run_in_bg(send_otp_sms, p.phone, code)
+        sms_ok = sms_result is True
+        sms_err = sms_result if isinstance(sms_result, str) else None
+        demo = code if not sms_ok else None
         if demo: await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"_plain": demo}})
-        return {"message": "OTP sent", "demo_otp": demo}
+        return {"message": "OTP sent", "demo_otp": demo, "sms_error": sms_err}
 
     @api.post("/auth/phone-verify-init")
     async def phone_verify_init(p: PhoneVerifyIn):
@@ -976,10 +981,12 @@ postbluom.online"""
             }},
             upsert=True,
         )
-        sms_sent = await run_in_bg(send_otp_sms, p.phone, code)
-        demo = code if not sms_sent else None
+        sms_result = await run_in_bg(send_otp_sms, p.phone, code)
+        sms_ok = sms_result is True
+        sms_err = sms_result if isinstance(sms_result, str) else None
+        demo = code if not sms_ok else None
         if demo: await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"_plain": demo}})
-        return {"message": "OTP sent", "demo_otp": demo}
+        return {"message": "OTP sent", "demo_otp": demo, "sms_error": sms_err}
 
     @api.post("/auth/add-phone-verify")
     async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
