@@ -2445,7 +2445,7 @@ postbluom.online"""
         except Exception as e:
             logging.warning(f"Index creation warning: {e}")
 
-    # ── Startup: make official account an admin ─────────────────────
+    # ── Startup: make official account an admin + verified ──────────
     @app.on_event("startup")
     async def promote_official_account():
         if not OFFICIAL_ACCOUNT_ID:
@@ -2453,10 +2453,20 @@ postbluom.online"""
         try:
             result = await db.users.update_one(
                 {"id": OFFICIAL_ACCOUNT_ID},
-                {"$set": {"is_admin": True}},
+                {"$set": {
+                    "is_admin": True,
+                    "is_badge_verified": True,
+                    "verified_category": "Business / Brand",
+                    "badge_verified_at": now().isoformat(),
+                    "username_locked": True,
+                }},
             )
             if result.matched_count:
-                logging.info("✅ Official account promoted to admin")
+                await db.posts.update_many(
+                    {"user_id": OFFICIAL_ACCOUNT_ID},
+                    {"$set": {"is_badge_verified": True, "verified_category": "Business / Brand"}},
+                )
+                logging.info("✅ Official account promoted to admin + verified badge")
             else:
                 logging.warning("⚠️ OFFICIAL_ACCOUNT_ID set but no matching user found")
         except Exception as e:
