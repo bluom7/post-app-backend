@@ -723,7 +723,14 @@ postbluom.online"""
     @api.post("/auth/forgot-password-init")
     async def forgot_password_init(p: ForgotPasswordInitIn):
         identifier = p.identifier.strip()
-        user = await db.users.find_one({"$or": [{"email": identifier}, {"phone": identifier}]})
+        if "@" in identifier:
+            user = await db.users.find_one({"email": identifier})
+        else:
+            _ph_v = [identifier]
+            if identifier.startswith("+91") and len(identifier) == 13: _ph_v.append(identifier[3:])
+            elif not identifier.startswith("+") and len(identifier) == 10: _ph_v.append("+91" + identifier)
+            user = await db.users.find_one({"phone": {"$in": _ph_v}})
+            if user: identifier = user.get("phone", identifier)  # normalise to stored format
         if not user or not user.get("is_verified"):
             raise HTTPException(400, "No account found with this email or phone number")
         is_email = "@" in identifier
@@ -918,8 +925,13 @@ postbluom.online"""
 
     @api.post("/auth/phone-login")
     async def phone_login(p: PhoneLoginIn):
-        u = await db.users.find_one({"phone": p.phone})
-        if not u: raise HTTPException(404, "User not found")
+        # Flexible lookup: match +91XXXXXXXXXX or bare 10-digit, whichever is stored
+        _ph = p.phone
+        _ph_variants = [_ph]
+        if _ph.startswith("+91") and len(_ph) == 13: _ph_variants.append(_ph[3:])
+        elif not _ph.startswith("+") and len(_ph) == 10: _ph_variants.append("+91" + _ph)
+        u = await db.users.find_one({"phone": {"$in": _ph_variants}})
+        if not u: raise HTTPException(400, "No account found with this phone number")
         pw_hash_p = u.get("password_hash", "")
         if not await verifypw(p.password, pw_hash_p):
             raise HTTPException(401, "Wrong password")
