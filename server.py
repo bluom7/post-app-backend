@@ -1553,14 +1553,14 @@ postbluom.online"""
                     {"id": {"$in": followers_ids},
                      "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
                     {"id": 1, "_id": 0},
-                ).to_list(None)
+                ).to_list(500)
                 if followers_ids else _empty_list()
             )
             verified_query = db.users.find(
                 {"is_badge_verified": True,
                  "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
                 {"id": 1, "_id": 0},
-            ).to_list(None)
+            ).to_list(500)
             visible_follower_docs, verified_docs = await asyncio.gather(follower_query, verified_query)
             visible_follower_ids = [v["id"] for v in visible_follower_docs]
             verified_ids = [v["id"] for v in verified_docs]
