@@ -2415,41 +2415,53 @@ postbluom.online"""
     # ── Startup: indexes ──────────────────────────────────────────
     @app.on_event("startup")
     async def create_indexes():
-        try:
-            await db.users.create_index("id", unique=True, background=True)
-            await db.users.create_index("username", unique=True, sparse=True, background=True)
-            await db.users.create_index("email", background=True)
-            await db.users.create_index("phone", background=True)
-            await db.users.create_index("handle", background=True)
-            await db.posts.create_index("user_id", background=True)
-            await db.posts.create_index([("created_at", -1)], background=True)
-            await db.posts.create_index("id", unique=True, background=True)
-            await db.messages.create_index([("from_id", 1), ("to_id", 1)], background=True)
-            await db.messages.create_index([("created_at", 1)], background=True)
-            await db.notifications.create_index("user_id", background=True)
-            await db.notifications.create_index([("created_at", -1)], background=True)
-            await db.follow_requests.create_index([("from_id", 1), ("to_id", 1)], background=True)
-            await db.follow_requests.create_index("status", background=True)
-            await db.friend_requests.create_index([("from_id", 1), ("to_id", 1)], background=True)
-            await db.friend_requests.create_index("status", background=True)
-            await db.email_otps.create_index("email", background=True)
-            await db.phone_otps.create_index("phone", background=True)
-            await db.account_deletions.create_index("identifier", background=True)
+        # Each index is created independently — a name/option conflict on one
+        # (e.g. an older non-sparse "username_1" index already existing) must
+        # not abort the rest. Previously all calls shared a single try/except,
+        # so a conflict on an early index (users.username) silently skipped
+        # every index declared after it, including the newer world_reports /
+        # world_active indexes added for the Join World feature.
+        index_specs = [
+            (db.users, "id", {"unique": True, "background": True}),
+            (db.users, "username", {"unique": True, "sparse": True, "background": True}),
+            (db.users, "email", {"background": True}),
+            (db.users, "phone", {"background": True}),
+            (db.users, "handle", {"background": True}),
+            (db.posts, "user_id", {"background": True}),
+            (db.posts, [("created_at", -1)], {"background": True}),
+            (db.posts, "id", {"unique": True, "background": True}),
+            (db.messages, [("from_id", 1), ("to_id", 1)], {"background": True}),
+            (db.messages, [("created_at", 1)], {"background": True}),
+            (db.notifications, "user_id", {"background": True}),
+            (db.notifications, [("created_at", -1)], {"background": True}),
+            (db.follow_requests, [("from_id", 1), ("to_id", 1)], {"background": True}),
+            (db.follow_requests, "status", {"background": True}),
+            (db.friend_requests, [("from_id", 1), ("to_id", 1)], {"background": True}),
+            (db.friend_requests, "status", {"background": True}),
+            (db.email_otps, "email", {"background": True}),
+            (db.phone_otps, "phone", {"background": True}),
+            (db.account_deletions, "identifier", {"background": True}),
             # Feed query indexes
-            await db.users.create_index("is_badge_verified", background=True)
-            await db.users.create_index("is_private", background=True)
-            await db.verification_requests.create_index("user_id", background=True)
-            await db.verification_requests.create_index("status", background=True)
-            await db.verification_requests.create_index("id", unique=True, sparse=True, background=True)
-            await db.users.create_index("followers", background=True)
-            await db.world_reports.create_index([("created_at", -1)], background=True)
-            await db.world_reports.create_index("location_type", background=True)
-            await db.world_reports.create_index("id", unique=True, sparse=True, background=True)
-            await db.world_active.create_index("user_id", unique=True, background=True)
-            await db.world_active.create_index("last_ping", background=True)
-            logging.info("✅ MongoDB indexes created")
-        except Exception as e:
-            logging.warning(f"Index creation warning: {e}")
+            (db.users, "is_badge_verified", {"background": True}),
+            (db.users, "is_private", {"background": True}),
+            (db.verification_requests, "user_id", {"background": True}),
+            (db.verification_requests, "status", {"background": True}),
+            (db.verification_requests, "id", {"unique": True, "sparse": True, "background": True}),
+            (db.users, "followers", {"background": True}),
+            (db.world_reports, [("created_at", -1)], {"background": True}),
+            (db.world_reports, "location_type", {"background": True}),
+            (db.world_reports, "id", {"unique": True, "sparse": True, "background": True}),
+            (db.world_active, "user_id", {"unique": True, "background": True}),
+            (db.world_active, "last_ping", {"background": True}),
+        ]
+        ok_count = 0
+        for collection, keys, options in index_specs:
+            try:
+                await collection.create_index(keys, **options)
+                ok_count += 1
+            except Exception as e:
+                logging.warning(f"Index creation warning ({collection.name}.{keys}): {e}")
+        logging.info(f"✅ MongoDB indexes created ({ok_count}/{len(index_specs)})")
 
     # ── Startup: make official account an admin + verified ──────────
     @app.on_event("startup")
