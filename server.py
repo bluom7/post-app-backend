@@ -160,6 +160,7 @@ try:
     TWILIO_SID     = os.environ.get("TWILIO_SID", "").strip()
     TWILIO_TOKEN   = os.environ.get("TWILIO_TOKEN", "").strip()
     TWILIO_PHONE   = os.environ.get("TWILIO_PHONE", "").strip()
+    NEWS_API_KEY   = os.environ.get("NEWS_API_KEY", "").strip()
 
     DEMO_MODE = not bool(RESEND_API_KEY)
 
@@ -2441,6 +2442,11 @@ postbluom.online"""
             await db.verification_requests.create_index("status", background=True)
             await db.verification_requests.create_index("id", unique=True, sparse=True, background=True)
             await db.users.create_index("followers", background=True)
+            await db.world_reports.create_index([("created_at", -1)], background=True)
+            await db.world_reports.create_index("location_type", background=True)
+            await db.world_reports.create_index("id", unique=True, sparse=True, background=True)
+            await db.world_active.create_index("user_id", unique=True, background=True)
+            await db.world_active.create_index("last_ping", background=True)
             logging.info("✅ MongoDB indexes created")
         except Exception as e:
             logging.warning(f"Index creation warning: {e}")
@@ -2549,6 +2555,251 @@ postbluom.online"""
     # ── Health / keep-alive ping ─────────────────────────────────
     @api.get("/ping")
     async def ping():
+        return {"ok": True}
+
+    # ── Join World ────────────────────────────────────────────────
+    _NEWS_NATIVE = {
+        "top": "general", "business": "business", "technology": "technology",
+        "sports": "sports", "health": "health", "science": "science",
+        "entertainment": "entertainment",
+    }
+    _NEWS_KEYWORDS = {
+        "politics": "politics OR government OR parliament OR election OR senate",
+        "economy": "economy OR inflation OR GDP OR recession OR economic policy",
+        "ai": '"artificial intelligence" OR "machine learning" OR GPT OR LLM OR OpenAI',
+        "infrastructure": '"infrastructure development" OR "smart city" OR highway OR railway OR metro',
+        "automobile": "electric vehicle OR EV OR car industry OR Tesla OR automotive OR automobile",
+        "manufacturing": "manufacturing OR factory OR industrial production OR supply chain",
+        "environment": "climate change OR environment OR carbon OR global warming OR pollution OR renewable energy",
+        "education": "education OR school OR university OR student OR curriculum OR learning",
+        "crime": "crime OR law enforcement OR court OR arrest OR verdict OR criminal justice",
+        "world-affairs": "diplomacy OR foreign policy OR UN OR summit OR bilateral OR treaty OR geopolitics",
+        "weather": "weather OR storm OR flood OR drought OR hurricane OR cyclone OR earthquake OR tsunami",
+        "startups": "startup OR venture capital OR IPO OR funding OR fintech OR unicorn OR entrepreneur",
+        "energy": "energy OR oil OR gas OR solar OR wind power OR nuclear OR electricity grid",
+    }
+
+    _news_cache: dict = {}
+    _NEWS_CACHE_TTL = 180  # 3 minutes
+
+    def _news_cache_get(key):
+        entry = _news_cache.get(key)
+        if entry and (_time.monotonic() - entry[1]) < _NEWS_CACHE_TTL:
+            return entry[0]
+        return None
+
+    def _news_cache_set(key, value):
+        _news_cache[key] = (value, _time.monotonic())
+
+    async def _fetch_news_articles(category: str, country: Optional[str], page_size: int = 20) -> list:
+        if not NEWS_API_KEY:
+            return []
+        loop = asyncio.get_running_loop()
+        def _do_fetch():
+            cat_lower = (category or "top").lower()
+            if cat_lower in _NEWS_NATIVE:
+                params: dict = {
+                    "apiKey": NEWS_API_KEY,
+                    "category": _NEWS_NATIVE[cat_lower],
+                    "pageSize": min(page_size * 3, 100),
+                    "language": "en",
+                }
+                if country:
+                    params["country"] = country.lower()[:2]
+                url = "https://newsapi.org/v2/top-headlines?" + urllib.parse.urlencode(params)
+            else:
+                kw = _NEWS_KEYWORDS.get(cat_lower, cat_lower)
+                if country:
+                    kw = f"({kw}) AND {country}"
+                params = {
+                    "apiKey": NEWS_API_KEY,
+                    "q": kw,
+                    "pageSize": min(page_size * 3, 100),
+                    "language": "en",
+                    "sortBy": "publishedAt",
+                }
+                url = "https://newsapi.org/v2/everything?" + urllib.parse.urlencode(params)
+            req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = _json.loads(resp.read())
+            return data.get("articles", [])
+        try:
+            articles = await loop.run_in_executor(None, _do_fetch)
+            filtered = [
+                a for a in articles
+                if a.get("urlToImage") and a.get("title") and "[Removed]" not in a.get("title", "")
+            ]
+            return filtered[:page_size]
+        except Exception as e:
+            logging.warning(f"[News] fetch failed: {e}")
+            return []
+
+    @api.get("/world/news")
+    async def world_news(
+        category: str = "top",
+        country: Optional[str] = None,
+        u=Depends(current_user),
+    ):
+        cache_key = f"news:{(category or 'top').lower()}:{(country or 'world').lower()}"
+        cached = _news_cache_get(cache_key)
+        if cached:
+            return cached
+        articles = await _fetch_news_articles(category, country, page_size=20)
+        result = {
+            "articles": [
+                {
+                    "title": a.get("title", ""),
+                    "description": a.get("description") or "",
+                    "url": a.get("url", ""),
+                    "image": a.get("urlToImage", ""),
+                    "source": (a.get("source") or {}).get("name", "Unknown"),
+                    "published_at": a.get("publishedAt", ""),
+                }
+                for a in articles
+            ],
+            "category": category,
+            "country": country,
+            "no_key": not bool(NEWS_API_KEY),
+        }
+        _news_cache_set(cache_key, result)
+        return result
+
+    @api.get("/world/active-count")
+    async def world_active_count(u=Depends(current_user)):
+        cutoff = (now() - timedelta(seconds=45)).isoformat()
+        count = await db.world_active.count_documents({"last_ping": {"$gte": cutoff}})
+        return {"count": count}
+
+    @api.post("/world/active-ping")
+    async def world_active_ping(u=Depends(current_user)):
+        await db.world_active.update_one(
+            {"user_id": u["id"]},
+            {"$set": {"user_id": u["id"], "last_ping": now().isoformat()}},
+            upsert=True,
+        )
+        cutoff = (now() - timedelta(seconds=45)).isoformat()
+        count = await db.world_active.count_documents({"last_ping": {"$gte": cutoff}})
+        return {"count": count}
+
+    class WorldReportIn(BaseModel):
+        text: str
+        photo_url: Optional[str] = None
+        location_type: str = "world"
+        location_label: Optional[str] = None
+
+    @api.get("/world/reports")
+    async def world_reports_list(
+        location_type: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20,
+        u=Depends(current_user),
+    ):
+        query: dict = {"is_flagged": {"$ne": True}}
+        if location_type and location_type.lower() != "world":
+            query["location_type"] = location_type.upper()
+        reports = await db.world_reports.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        total = await db.world_reports.count_documents(query)
+        for r in reports:
+            r["is_liked"] = u["id"] in r.get("likes", [])
+            r["like_count"] = len(r.get("likes", []))
+            r["comment_count"] = len(r.get("comments", []))
+        return {"reports": reports, "total": total}
+
+    @api.post("/world/reports")
+    async def create_world_report(p: WorldReportIn, u=Depends(current_user)):
+        if not p.text or len(p.text.strip()) < 5:
+            raise HTTPException(400, "Report too short (min 5 chars)")
+        if len(p.text) > 2000:
+            raise HTTPException(400, "Report too long (max 2000 chars)")
+        loc_type = p.location_type.upper() if p.location_type and p.location_type.lower() != "world" else "world"
+        doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": u["id"],
+            "user_name": u["name"],
+            "user_handle": u["handle"],
+            "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo": u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "verified_category": u.get("verified_category") or None,
+            "text": p.text.strip(),
+            "photo_url": p.photo_url or None,
+            "location_type": loc_type,
+            "location_label": p.location_label or ("World" if loc_type == "world" else loc_type),
+            "likes": [], "like_count": 0,
+            "comments": [], "comment_count": 0,
+            "flag_count": 0, "is_flagged": False,
+            "created_at": now().isoformat(),
+        }
+        await db.world_reports.insert_one(doc.copy())
+        doc.pop("_id", None)
+        doc["is_liked"] = False
+        return doc
+
+    @api.post("/world/reports/{report_id}/like")
+    async def like_world_report(report_id: str, u=Depends(current_user)):
+        report = await db.world_reports.find_one({"id": report_id})
+        if not report:
+            raise HTTPException(404, "Not found")
+        likes = report.get("likes", [])
+        if u["id"] in likes:
+            likes.remove(u["id"])
+            liked = False
+        else:
+            likes.append(u["id"])
+            liked = True
+        await db.world_reports.update_one({"id": report_id}, {"$set": {"likes": likes, "like_count": len(likes)}})
+        return {"liked": liked, "like_count": len(likes)}
+
+    @api.post("/world/reports/{report_id}/flag")
+    async def flag_world_report(report_id: str, u=Depends(current_user)):
+        report = await db.world_reports.find_one({"id": report_id})
+        if not report:
+            raise HTTPException(404, "Not found")
+        new_flag_count = report.get("flag_count", 0) + 1
+        await db.world_reports.update_one(
+            {"id": report_id},
+            {"$set": {"flag_count": new_flag_count, "is_flagged": new_flag_count >= 5}}
+        )
+        return {"ok": True}
+
+    @api.get("/world/reports/{report_id}/comments")
+    async def get_world_report_comments(report_id: str, u=Depends(current_user)):
+        report = await db.world_reports.find_one({"id": report_id}, {"comments": 1, "_id": 0})
+        if not report:
+            raise HTTPException(404, "Not found")
+        return {"comments": report.get("comments", [])}
+
+    @api.post("/world/reports/{report_id}/comments")
+    async def add_world_report_comment(report_id: str, body: dict, u=Depends(current_user)):
+        text = (body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(400, "Empty comment")
+        comment = {
+            "id": str(uuid.uuid4()),
+            "user_id": u["id"],
+            "user_name": u["name"],
+            "user_handle": u["handle"],
+            "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo": u.get("avatar_photo"),
+            "text": text,
+            "created_at": now().isoformat(),
+        }
+        await db.world_reports.update_one(
+            {"id": report_id},
+            {"$push": {"comments": comment}, "$inc": {"comment_count": 1}}
+        )
+        return comment
+
+    @api.delete("/world/reports/{report_id}")
+    async def delete_world_report(report_id: str, u=Depends(current_user)):
+        report = await db.world_reports.find_one({"id": report_id})
+        if not report:
+            raise HTTPException(404, "Not found")
+        if report["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Not your report")
+        await db.world_reports.delete_one({"id": report_id})
         return {"ok": True}
 
     # Register all routes
