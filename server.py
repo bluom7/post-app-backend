@@ -730,7 +730,7 @@ postbluom.online"""
             if identifier.startswith("+91") and len(identifier) == 13: _ph_v.append(identifier[3:])
             elif not identifier.startswith("+") and len(identifier) == 10: _ph_v.append("+91" + identifier)
             user = await db.users.find_one({"phone": {"$in": _ph_v}})
-            if user: identifier = user.get("phone", identifier)  # normalise to stored format
+            # Do NOT change identifier — keep frontend-sent value so verify/reset calls match
         if not user or not user.get("is_verified"):
             raise HTTPException(400, "No account found with this email or phone number")
         is_email = "@" in identifier
