@@ -155,6 +155,7 @@ try:
             await loop.run_in_executor(None, _req)
         except Exception:
             pass
+    OFFICIAL_ACCOUNT_ID = os.environ.get("OFFICIAL_ACCOUNT_ID", "").strip()
     RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
     TWILIO_SID     = os.environ.get("TWILIO_SID", "").strip()
     TWILIO_TOKEN   = os.environ.get("TWILIO_TOKEN", "").strip()
@@ -2443,6 +2444,23 @@ postbluom.online"""
             logging.info("✅ MongoDB indexes created")
         except Exception as e:
             logging.warning(f"Index creation warning: {e}")
+
+    # ── Startup: make official account an admin ─────────────────────
+    @app.on_event("startup")
+    async def promote_official_account():
+        if not OFFICIAL_ACCOUNT_ID:
+            return
+        try:
+            result = await db.users.update_one(
+                {"id": OFFICIAL_ACCOUNT_ID},
+                {"$set": {"is_admin": True}},
+            )
+            if result.matched_count:
+                logging.info("✅ Official account promoted to admin")
+            else:
+                logging.warning("⚠️ OFFICIAL_ACCOUNT_ID set but no matching user found")
+        except Exception as e:
+            logging.warning(f"Official account admin promotion warning: {e}")
 
     # ── Startup: seed demo users ──────────────────────────────────
     @app.on_event("startup")
