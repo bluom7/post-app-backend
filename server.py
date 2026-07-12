@@ -194,7 +194,7 @@ try:
         return datetime.now(timezone.utc)
 
     # ── Password hashing (PBKDF2-HMAC-SHA256) ────────────────────
-    _PBKDF2_ITER   = 100_000
+    _PBKDF2_ITER   = 32_000
     _PBKDF2_PREFIX = "$pbkdf2$"
 
     async def _run_sync(fn):
