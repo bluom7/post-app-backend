@@ -623,6 +623,19 @@ postbluom.online"""
     class ForgotPasswordResetIn(BaseModel):
         identifier: str; otp: str; new_password: str
 
+    class VerificationRequestIn(BaseModel):
+        full_name: str
+        category: str          # Politician / Blogger / Journalist / Public Figure / Business / Other
+        id_proof_url: Optional[str] = None
+        social_links: Optional[str] = None
+
+    class AdminGrantIn(BaseModel):
+        user_id: str
+        category: str
+
+    class AdminRejectIn(BaseModel):
+        reason: Optional[str] = "Does not meet verification criteria"
+
     # ── Auth Email ────────────────────────────────────────────────
     @api.post("/auth/signup")
     async def signup(p: SignupIn):
@@ -1054,6 +1067,8 @@ postbluom.online"""
     async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
         upd = {k: v for k, v in p.model_dump().items() if v is not None}
         if "username" in upd:
+            if u.get("username_locked") and upd["username"] != u.get("username"):
+                raise HTTPException(400, "Verified accounts cannot change their username")
             try:
                 await ensure_username_unique(upd["username"], exclude_uid=u["id"])
             except ValueError as e:
@@ -1498,6 +1513,8 @@ postbluom.online"""
             "tagged_users": p.tagged_users or [],
             "audience": p.audience or "public",
             "comments_enabled": False if p.audience == "only_me" else (p.comments_enabled if p.comments_enabled is not None else True),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "verified_category": u.get("verified_category") or None,
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
         }
@@ -2194,6 +2211,181 @@ postbluom.online"""
         _cache_set(cache_key, translated)
         return {"translated": translated, "tone_hint": _detect_tone_hint(text) if include_tone else None}
 
+
+    # ── Verification ─────────────────────────────────────────────────────
+
+    async def _is_admin(u=Depends(current_user)):
+        if not u.get("is_admin"):
+            raise HTTPException(403, "Admin access required")
+        return u
+
+    @api.post("/verification/request")
+    async def submit_verification_request(p: VerificationRequestIn, u=Depends(current_user)):
+        if u.get("is_badge_verified"):
+            raise HTTPException(400, "Your account is already verified")
+        existing_pending = await db.verification_requests.find_one({"user_id": u["id"], "status": "pending"})
+        if existing_pending:
+            raise HTTPException(400, "You already have a pending verification request")
+        similar = await db.users.find_one({
+            "is_badge_verified": True,
+            "$or": [
+                {"username": {"$regex": f"^{re.escape(u.get('username',''))}$", "$options": "i"}},
+                {"name": {"$regex": f"^{re.escape(p.full_name)}$", "$options": "i"}},
+            ]
+        })
+        req = {
+            "id": str(uuid.uuid4()),
+            "user_id": u["id"],
+            "user_name": u["name"],
+            "user_handle": u.get("handle", ""),
+            "user_username": u.get("username", ""),
+            "user_avatar_photo": u.get("avatar_photo"),
+            "user_avatar_bg": u.get("avatar_bg"),
+            "user_avatar_letter": u.get("avatar_letter"),
+            "full_name": p.full_name,
+            "category": p.category,
+            "id_proof_url": p.id_proof_url or "",
+            "social_links": p.social_links or "",
+            "status": "pending",
+            "flagged": bool(similar),
+            "flag_reason": (f"Similar name/username matches verified @{similar.get('username')}" if similar else None),
+            "submitted_at": now().isoformat(),
+            "reviewed_at": None,
+            "reject_reason": None,
+        }
+        await db.verification_requests.insert_one(req)
+        req.pop("_id", None)
+        return {"ok": True, "flagged": req["flagged"]}
+
+    @api.get("/verification/my-status")
+    async def my_verification_status(u=Depends(current_user)):
+        if u.get("is_badge_verified"):
+            return {
+                "status": "verified",
+                "category": u.get("verified_category") or u.get("category") or "",
+                "verified_at": u.get("badge_verified_at"),
+            }
+        req = await db.verification_requests.find_one(
+            {"user_id": u["id"]}, {"_id": 0}, sort=[("submitted_at", -1)]
+        )
+        if not req:
+            return {"status": "none"}
+        return {"status": req["status"], "category": req.get("category"), "reject_reason": req.get("reject_reason"), "submitted_at": req.get("submitted_at")}
+
+    @api.get("/admin/verification/requests")
+    async def admin_list_requests(status: Optional[str] = "pending", skip: int = 0, limit: int = 100, admin=Depends(_is_admin)):
+        query = {} if status == "all" else {"status": status}
+        reqs = await db.verification_requests.find(query, {"_id": 0}).sort("submitted_at", -1).skip(skip).limit(limit).to_list(limit)
+        total = await db.verification_requests.count_documents(query)
+        return {"requests": reqs, "total": total}
+
+    @api.post("/admin/verification/approve/{request_id}")
+    async def admin_approve_request(request_id: str, admin=Depends(_is_admin)):
+        req = await db.verification_requests.find_one({"id": request_id})
+        if not req:
+            raise HTTPException(404, "Request not found")
+        if req["status"] != "pending":
+            raise HTTPException(400, f"Request is already {req['status']}")
+        now_str = now().isoformat()
+        category = req.get("category", "Public Figure")
+        uid = req["user_id"]
+        await db.users.update_one(
+            {"id": uid},
+            {"$set": {"is_badge_verified": True, "verified_category": category, "badge_verified_at": now_str, "username_locked": True}}
+        )
+        await db.posts.update_many({"user_id": uid}, {"$set": {"is_badge_verified": True, "verified_category": category}})
+        await db.verification_requests.update_one(
+            {"id": request_id},
+            {"$set": {"status": "approved", "reviewed_at": now_str, "reviewed_by": admin["id"]}}
+        )
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": uid,
+            "from_user_id": admin["id"], "from_user_name": "POST Team",
+            "type": "verification_approved",
+            "text": f"Congratulations! Your account is now verified as '{category}'. ✅",
+            "created_at": now_str, "read": False,
+        })
+        return {"ok": True}
+
+    @api.post("/admin/verification/reject/{request_id}")
+    async def admin_reject_request(request_id: str, p: AdminRejectIn, admin=Depends(_is_admin)):
+        req = await db.verification_requests.find_one({"id": request_id})
+        if not req:
+            raise HTTPException(404, "Request not found")
+        if req["status"] != "pending":
+            raise HTTPException(400, f"Request is already {req['status']}")
+        now_str = now().isoformat()
+        await db.verification_requests.update_one(
+            {"id": request_id},
+            {"$set": {"status": "rejected", "reject_reason": p.reason, "reviewed_at": now_str, "reviewed_by": admin["id"]}}
+        )
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": req["user_id"],
+            "from_user_id": admin["id"], "from_user_name": "POST Team",
+            "type": "verification_rejected",
+            "text": f"Your verification request was not approved. Reason: {p.reason}",
+            "created_at": now_str, "read": False,
+        })
+        return {"ok": True}
+
+    @api.post("/admin/verification/grant")
+    async def admin_grant_badge(p: AdminGrantIn, admin=Depends(_is_admin)):
+        target = await db.users.find_one({"id": p.user_id})
+        if not target:
+            raise HTTPException(404, "User not found")
+        now_str = now().isoformat()
+        await db.users.update_one(
+            {"id": p.user_id},
+            {"$set": {"is_badge_verified": True, "verified_category": p.category, "badge_verified_at": now_str, "username_locked": True}}
+        )
+        await db.posts.update_many({"user_id": p.user_id}, {"$set": {"is_badge_verified": True, "verified_category": p.category}})
+        await db.verification_requests.update_many(
+            {"user_id": p.user_id, "status": "pending"},
+            {"$set": {"status": "approved", "reviewed_at": now_str, "reviewed_by": admin["id"]}}
+        )
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": p.user_id,
+            "from_user_id": admin["id"], "from_user_name": "POST Team",
+            "type": "verification_approved",
+            "text": f"Congratulations! Your account is now verified as '{p.category}'. ✅",
+            "created_at": now_str, "read": False,
+        })
+        return {"ok": True}
+
+    @api.post("/admin/verification/revoke/{user_id}")
+    async def admin_revoke_badge(user_id: str, admin=Depends(_is_admin)):
+        target = await db.users.find_one({"id": user_id})
+        if not target:
+            raise HTTPException(404, "User not found")
+        await db.users.update_one(
+            {"id": user_id},
+            {"$unset": {"is_badge_verified": "", "verified_category": "", "badge_verified_at": "", "username_locked": ""}}
+        )
+        await db.posts.update_many({"user_id": user_id}, {"$unset": {"is_badge_verified": "", "verified_category": ""}})
+        return {"ok": True}
+
+    @api.get("/admin/users")
+    async def admin_list_users(q: Optional[str] = None, skip: int = 0, limit: int = 50, admin=Depends(_is_admin)):
+        query: dict = {}
+        if q:
+            query["$or"] = [
+                {"name": {"$regex": q, "$options": "i"}},
+                {"username": {"$regex": q, "$options": "i"}},
+                {"email": {"$regex": q, "$options": "i"}},
+            ]
+        users_list = await db.users.find(query, {"_id": 0, "password_hash": 0, "otp_hash": 0}).skip(skip).limit(limit).to_list(limit)
+        total = await db.users.count_documents(query)
+        return {"users": users_list, "total": total}
+
+    @api.post("/admin/users/{user_id}/toggle-admin")
+    async def admin_toggle_admin(user_id: str, admin=Depends(_is_admin)):
+        target = await db.users.find_one({"id": user_id})
+        if not target:
+            raise HTTPException(404, "User not found")
+        new_val = not target.get("is_admin", False)
+        await db.users.update_one({"id": user_id}, {"$set": {"is_admin": new_val}})
+        return {"ok": True, "is_admin": new_val}
+
     # ── Health ────────────────────────────────────────────────────
     @api.get("/")
     async def root():
@@ -2225,6 +2417,9 @@ postbluom.online"""
             # Feed query indexes
             await db.users.create_index("is_badge_verified", background=True)
             await db.users.create_index("is_private", background=True)
+            await db.verification_requests.create_index("user_id", background=True)
+            await db.verification_requests.create_index("status", background=True)
+            await db.verification_requests.create_index("id", unique=True, sparse=True, background=True)
             await db.users.create_index("followers", background=True)
             logging.info("✅ MongoDB indexes created")
         except Exception as e:
