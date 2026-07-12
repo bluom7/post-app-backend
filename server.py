@@ -2463,15 +2463,25 @@ postbluom.online"""
     @app.on_event("startup")
     async def keepalive_self_ping():
         import urllib.request as _ur2
-        port = os.environ.get("PORT", "10000")
-        ping_url = f"http://127.0.0.1:{port}/api/ping"
+        # Render only resets its 15-min inactivity/sleep timer on requests that
+        # arrive through its public edge — pinging 127.0.0.1 never reaches the
+        # edge, so it did NOT prevent the free-tier service from sleeping.
+        # RENDER_EXTERNAL_URL is auto-injected by Render with the real public
+        # URL (e.g. https://post-app-backend.onrender.com); use that instead,
+        # and only fall back to localhost when running outside Render.
+        external_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+        if external_url:
+            ping_url = f"{external_url}/api/ping"
+        else:
+            port = os.environ.get("PORT", "10000")
+            ping_url = f"http://127.0.0.1:{port}/api/ping"
         logging.info(f"[KeepAlive] starting → {ping_url} every 10 min")
 
         async def _ping_loop():
             await asyncio.sleep(30)   # let server fully boot first
             loop = asyncio.get_running_loop()   # correct for Python 3.10+
             def _do_ping():
-                with _ur2.urlopen(ping_url, timeout=10):
+                with _ur2.urlopen(ping_url, timeout=15):
                     pass
             while True:
                 try:
