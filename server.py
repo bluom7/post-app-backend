@@ -599,6 +599,9 @@ postbluom.online"""
         tagged_users: Optional[List[str]] = None  # list of @handles
         audience: Optional[str] = "public"       # public | followers
         comments_enabled: Optional[bool] = True  # False = comments turned off for this post
+        photo_width: Optional[int] = None         # px width of first photo (from compressPhoto)
+        photo_height: Optional[int] = None        # px height of first photo
+        aspect_ratio: Optional[float] = None      # precomputed width/height
 
     class CommentIn(BaseModel):
         text: str
@@ -1534,6 +1537,9 @@ postbluom.online"""
             "tagged_users": p.tagged_users or [],
             "audience": p.audience or "public",
             "comments_enabled": False if p.audience == "only_me" else (p.comments_enabled if p.comments_enabled is not None else True),
+            "photo_width": p.photo_width or None,
+            "photo_height": p.photo_height or None,
+            "aspect_ratio": p.aspect_ratio or (round(p.photo_width/p.photo_height,4) if p.photo_width and p.photo_height else None),
             "is_badge_verified": bool(u.get("is_badge_verified")),
             "verified_category": u.get("verified_category") or None,
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
@@ -2732,6 +2738,9 @@ postbluom.online"""
             "avatar_bg": u["avatar_bg"],
             "avatar_letter": u["avatar_letter"],
             "avatar_photo": u.get("avatar_photo"),
+            "photo_width": p.photo_width or None,
+            "photo_height": p.photo_height or None,
+            "aspect_ratio": p.aspect_ratio or (round(p.photo_width/p.photo_height,4) if p.photo_width and p.photo_height else None),
             "is_badge_verified": bool(u.get("is_badge_verified")),
             "verified_category": u.get("verified_category") or None,
             "text": p.text.strip(),
