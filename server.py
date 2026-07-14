@@ -613,6 +613,8 @@ postbluom.online"""
         to_user_id: str; text: str = ""
         photo_url: Optional[str] = None; mood_color: Optional[str] = None
         reply_to_id: Optional[str] = None
+        shared_post_id: Optional[str] = None
+        shared_reel_id: Optional[str] = None
 
     class TypingIn(BaseModel):
         to_user_id: str; is_typing: bool = True
@@ -1897,7 +1899,7 @@ postbluom.online"""
 
     @api.post("/messages")
     async def send_message(p: MessageIn, u=Depends(current_user)):
-        if not p.text.strip() and not p.photo_url:
+        if not p.text.strip() and not p.photo_url and not p.shared_post_id and not p.shared_reel_id:
             raise HTTPException(400, "Message cannot be empty")
         recipient = await db.users.find_one({"id": p.to_user_id})
         if not recipient: raise HTTPException(404, "Recipient not found")
@@ -1938,6 +1940,36 @@ postbluom.online"""
                     "text": (ref.get("text") or "")[:120],
                     "has_photo": bool(ref.get("photo_url")),
                 }
+        shared_post = None
+        if p.shared_post_id:
+            sp = await db.posts.find_one({"id": p.shared_post_id}, {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1, "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1})
+            if sp:
+                shared_post = {
+                    "id": sp["id"],
+                    "content": (sp.get("content") or "")[:200],
+                    "photo_url": sp.get("photo_url") or ((sp.get("photo_urls") or [None])[0]),
+                    "user_name": sp.get("user_name", ""),
+                    "user_handle": sp.get("user_handle", ""),
+                    "avatar_bg": sp.get("avatar_bg", ""),
+                    "avatar_letter": sp.get("avatar_letter", ""),
+                    "avatar_photo": sp.get("avatar_photo"),
+                    "type": "post",
+                }
+        shared_reel = None
+        if p.shared_reel_id:
+            sr = await db.reels.find_one({"id": p.shared_reel_id}, {"_id": 0, "id": 1, "caption": 1, "video_url": 1, "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1})
+            if sr:
+                shared_reel = {
+                    "id": sr["id"],
+                    "caption": (sr.get("caption") or "")[:200],
+                    "video_url": sr.get("video_url"),
+                    "user_name": sr.get("user_name", ""),
+                    "user_handle": sr.get("user_handle", ""),
+                    "avatar_bg": sr.get("avatar_bg", ""),
+                    "avatar_letter": sr.get("avatar_letter", ""),
+                    "avatar_photo": sr.get("avatar_photo"),
+                    "type": "reel",
+                }
         m = {
             "id": str(uuid.uuid4()), "from_id": u["id"], "from_name": u["name"],
             "to_id": p.to_user_id, "text": p.text, "photo_url": p.photo_url,
@@ -1945,6 +1977,8 @@ postbluom.online"""
             "status": "sent", "deleted_for": [], "deleted_for_everyone": False, "is_silent": is_silent,
             "reply_to_id": p.reply_to_id or None,
             "reply_to_preview": reply_to_preview,
+            "shared_post": shared_post,
+            "shared_reel": shared_reel,
         }
         await db.messages.insert_one(m.copy())
         m.pop("_id", None)
