@@ -602,6 +602,11 @@ postbluom.online"""
         photo_width: Optional[int] = None         # px width of first photo (from compressPhoto)
         photo_height: Optional[int] = None        # px height of first photo
         aspect_ratio: Optional[float] = None      # precomputed width/height
+        music_title: Optional[str] = None             # iTunes track name
+        music_artist: Optional[str] = None            # artist name
+        music_artwork: Optional[str] = None           # 100x100 artwork URL
+        music_preview_url: Optional[str] = None       # 30-sec preview URL from iTunes
+        music_duration_ms: Optional[int] = None       # track duration in ms
 
     class CommentIn(BaseModel):
         text: str
@@ -1544,6 +1549,11 @@ postbluom.online"""
             "aspect_ratio": p.aspect_ratio or (round(p.photo_width/p.photo_height,4) if p.photo_width and p.photo_height else None),
             "is_badge_verified": bool(u.get("is_badge_verified")),
             "verified_category": u.get("verified_category") or None,
+            "music_title": p.music_title or None,
+            "music_artist": p.music_artist or None,
+            "music_artwork": p.music_artwork or None,
+            "music_preview_url": p.music_preview_url or None,
+            "music_duration_ms": p.music_duration_ms or None,
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
         }
