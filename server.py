@@ -2838,17 +2838,12 @@ postbluom.online"""
         if len(raw) > MAX_UPLOAD_VIDEO_BYTES:
             raise HTTPException(400, "Video is too large. Max 100 MB.")
         try:
-            loop = asyncio.get_event_loop()
-            pub_id = f"reel_{u['id']}_{uuid.uuid4().hex}"
-            result = await loop.run_in_executor(
-                None,
-                lambda: cloudinary.uploader.upload(
-                    raw,
-                    resource_type="video",
-                    folder="post-app/reels",
-                    public_id=pub_id,
-                    overwrite=False,
-                )
+            result = cloudinary.uploader.upload(
+                raw,
+                resource_type="video",
+                folder="post-app/reels",
+                public_id=f"reel_{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
             )
         except Exception as e:
             logging.exception("Cloudinary reel upload failed")
