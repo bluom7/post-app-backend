@@ -1551,6 +1551,46 @@ postbluom.online"""
         doc.pop("_id", None)
         return doc
 
+    def _reel_to_feed_item(r: dict) -> dict:
+        """Shapes a raw `reels` doc so it can sit alongside `posts` docs in the
+        home feed / profile grid — same field names the frontend post card and
+        PostMedia component already know how to render (video_url, content,
+        likes as [{user_id,color}], etc). `is_reel` lets the frontend route
+        interactions (like/comment/save/delete/open) to the /reels/* endpoints.
+        """
+        likes_ids = r.get("likes", [])
+        return {
+            "id": r["id"],
+            "user_id": r["user_id"],
+            "user_name": r.get("user_name"),
+            "user_handle": r.get("user_handle"),
+            "avatar_bg": r.get("avatar_bg"),
+            "avatar_letter": r.get("avatar_letter"),
+            "avatar_photo": r.get("avatar_photo"),
+            "is_badge_verified": bool(r.get("is_badge_verified")),
+            "verified_category": None,
+            "content": r.get("caption") or "",
+            "accent": None,
+            "location": None,
+            "photo_url": None,
+            "photo_urls": None,
+            "video_url": r.get("video_url"),
+            "video_duration": r.get("duration"),
+            "photo_width": None, "photo_height": None, "aspect_ratio": 9/16,
+            "audience": "public",
+            "comments_enabled": True,
+            "likes": [{"user_id": uid, "color": "#FF3B30"} for uid in likes_ids],
+            "comments": r.get("comments", []),
+            "views": [],
+            "saves": r.get("saves", []),
+            "reposts": [],
+            "created_at": r.get("created_at"),
+            "edited_at": None,
+            "is_pinned": False,
+            "is_reel": True,
+            "audio_label": r.get("audio_label"),
+        }
+
     @api.get("/posts")
     async def list_posts(
         q: Optional[str] = None, user_id: Optional[str] = None,
@@ -1615,8 +1655,23 @@ postbluom.online"""
                 {"user_name": {"$regex": q, "$options": "i"}},
                 {"location": {"$regex": q, "$options": "i"}},
             ]
-        posts = await db.posts.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
-        unviewed_ids = [p["id"] for p in posts if u["id"] not in p.get("views", [])]
+        # Reels get merged into the home feed and profile grid (but not search)
+        # so a shared reel shows up for followers/following, and stays on the
+        # poster's own profile — reusing the same user_id filter built above.
+        include_reels = (feed or bool(user_id)) and not q and "user_id" in query
+        fetch_n = skip + limit
+        posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+        if include_reels:
+            reel_query = {"user_id": query["user_id"]}
+            reels_task = db.reels.find(reel_query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+        else:
+            async def _no_reels(): return []
+            reels_task = _no_reels()
+        posts_raw, reels_raw = await asyncio.gather(posts_task, reels_task)
+        merged = posts_raw + [_reel_to_feed_item(r) for r in reels_raw]
+        merged.sort(key=lambda d: d.get("created_at") or "", reverse=True)
+        posts = merged[skip:skip + limit]
+        unviewed_ids = [p["id"] for p in posts if not p.get("is_reel") and u["id"] not in p.get("views", [])]
         if unviewed_ids:
             # Fire-and-forget: don't block the response for view tracking
             async def _mark_viewed():
