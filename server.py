@@ -2823,6 +2823,176 @@ postbluom.online"""
         await db.world_reports.delete_one({"id": report_id})
         return {"ok": True}
 
+    # ── Reels ─────────────────────────────────────────────────────
+
+    @api.post("/reels/upload")
+    async def upload_reel_video(
+        file: UploadFile = File(...),
+        u=Depends(current_user),
+    ):
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Video hosting is not configured on the server")
+        if not file.content_type or not file.content_type.startswith("video/"):
+            raise HTTPException(400, "Please upload a valid video file")
+        raw = await file.read()
+        if len(raw) > MAX_UPLOAD_VIDEO_BYTES:
+            raise HTTPException(400, "Video is too large. Max 100 MB.")
+        try:
+            result = cloudinary.uploader.upload(
+                raw,
+                resource_type="video",
+                folder="post-app/reels",
+                public_id=f"reel_{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception as e:
+            logging.exception("Cloudinary reel upload failed")
+            msg = str(e)
+            if "Invalid Signature" in msg or "String to sign" in msg:
+                raise HTTPException(500, "Video hosting is misconfigured (invalid Cloudinary credentials).")
+            raise HTTPException(502, "Video upload failed. Please try again.")
+        return {
+            "video_url": result.get("secure_url"),
+            "duration": result.get("duration"),
+        }
+
+    @api.post("/reels")
+    async def create_reel(body: dict, u=Depends(current_user)):
+        video_url   = (body.get("video_url") or "").strip()
+        caption     = (body.get("caption") or "").strip()
+        audio_label = (body.get("audio_label") or "Original Audio").strip()
+        duration    = int(body.get("duration") or 0)
+        if not video_url:
+            raise HTTPException(400, "video_url is required")
+        if duration < 1 or duration > MAX_POST_VIDEO_SECONDS:
+            raise HTTPException(400, f"Reel must be 1\u2013{MAX_POST_VIDEO_SECONDS} seconds")
+        doc = {
+            "id":                str(uuid.uuid4()),
+            "user_id":           u["id"],
+            "user_name":         u["name"],
+            "user_handle":       u["handle"],
+            "avatar_bg":         u["avatar_bg"],
+            "avatar_letter":     u["avatar_letter"],
+            "avatar_photo":      u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "video_url":         video_url,
+            "caption":           caption,
+            "audio_label":       audio_label,
+            "duration":          duration,
+            "likes":             [],
+            "saves":             [],
+            "comments":          [],
+            "comment_count":     0,
+            "view_count":        0,
+            "created_at":        now().isoformat(),
+        }
+        await db.reels.insert_one(doc.copy())
+        doc.pop("_id", None)
+        doc["is_liked"]     = False
+        doc["like_count"]   = 0
+        doc["is_saved"]     = False
+        doc["is_following"] = False
+        return doc
+
+    @api.get("/reels")
+    async def list_reels(skip: int = 0, limit: int = 10, u=Depends(current_user)):
+        blocked  = u.get("blocked", [])
+        muted    = u.get("muted", [])
+        excluded = list(set(blocked + muted))
+        query: dict = {}
+        if excluded:
+            query["user_id"] = {"$nin": excluded}
+        reels_list = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        following_ids = set(u.get("following", []))
+        for r in reels_list:
+            likes = r.get("likes", [])
+            saves = r.get("saves", [])
+            r["is_liked"]     = u["id"] in likes
+            r["like_count"]   = len(likes)
+            r["is_saved"]     = u["id"] in saves
+            r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
+            r.pop("likes", None)
+            r.pop("saves", None)
+            r.pop("comments", None)
+        return {"reels": reels_list, "has_more": len(reels_list) == limit, "skip": skip, "limit": limit}
+
+    @api.post("/reels/{reel_id}/like")
+    async def like_reel(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"likes": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        if u["id"] in reel.get("likes", []):
+            await db.reels.update_one({"id": reel_id}, {"$pull": {"likes": u["id"]}})
+            return {"liked": False}
+        await db.reels.update_one({"id": reel_id}, {"$addToSet": {"likes": u["id"]}})
+        return {"liked": True}
+
+    @api.post("/reels/{reel_id}/save")
+    async def save_reel(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"saves": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        if u["id"] in reel.get("saves", []):
+            await db.reels.update_one({"id": reel_id}, {"$pull": {"saves": u["id"]}})
+            return {"saved": False}
+        await db.reels.update_one({"id": reel_id}, {"$addToSet": {"saves": u["id"]}})
+        return {"saved": True}
+
+    @api.get("/reels/{reel_id}/comments")
+    async def get_reel_comments(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        return {"comments": reel.get("comments", [])}
+
+    @api.post("/reels/{reel_id}/comments")
+    async def add_reel_comment(reel_id: str, body: dict, u=Depends(current_user)):
+        text = (body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(400, "Empty comment")
+        comment = {
+            "id":            str(uuid.uuid4()),
+            "user_id":       u["id"],
+            "user_name":     u["name"],
+            "user_handle":   u["handle"],
+            "avatar_bg":     u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo":  u.get("avatar_photo"),
+            "text":          text,
+            "created_at":    now().isoformat(),
+        }
+        await db.reels.update_one(
+            {"id": reel_id},
+            {"$push": {"comments": comment}, "$inc": {"comment_count": 1}}
+        )
+        return comment
+
+    @api.delete("/reels/{reel_id}/comments/{comment_id}")
+    async def delete_reel_comment(reel_id: str, comment_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        comment = next((c for c in reel.get("comments", []) if c["id"] == comment_id), None)
+        if not comment:
+            raise HTTPException(404, "Comment not found")
+        if comment["user_id"] != u["id"] and reel["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Not allowed")
+        await db.reels.update_one(
+            {"id": reel_id},
+            {"$pull": {"comments": {"id": comment_id}}, "$inc": {"comment_count": -1}}
+        )
+        return {"ok": True}
+
+    @api.delete("/reels/{reel_id}")
+    async def delete_reel(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        if reel["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Not your reel")
+        await db.reels.delete_one({"id": reel_id})
+        return {"ok": True}
+
     # Register all routes
     app.include_router(api)
 
