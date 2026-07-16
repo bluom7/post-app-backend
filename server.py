@@ -3257,6 +3257,23 @@ postbluom.online"""
     # ── Call Signaling (WebRTC polling) ───────────────────────────
     _call_state: dict = {}
 
+    @api.get("/calls/ice-servers")
+    async def get_ice_servers(u=Depends(current_user)):
+        import urllib.request, json as _json
+        api_key = os.environ.get("METERED_API_KEY", "")
+        if not api_key:
+            # fallback to Google STUN only
+            return {"iceServers": [{"urls": "stun:stun.l.google.com:19302"}]}
+        try:
+            url = f"https://post.metered.live/api/v1/turn/credentials?apiKey={api_key}"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = _json.loads(resp.read().decode())
+            return {"iceServers": data}
+        except Exception:
+            return {"iceServers": [{"urls": "stun:stun.l.google.com:19302"}]}
+
+
+
     @api.post("/calls/initiate")
     async def initiate_call(body: dict, u=Depends(current_user)):
         to_user_id = body.get("to_user_id")
