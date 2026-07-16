@@ -3092,6 +3092,234 @@ postbluom.online"""
         await db.reels.delete_one({"id": reel_id})
         return {"ok": True}
 
+
+    # ── Group Chat ─────────────────────────────────────────────────
+    class GroupIn(BaseModel):
+        name: str
+        member_ids: List[str] = []
+        avatar_color: Optional[str] = None
+
+    class GroupMessageIn(BaseModel):
+        text: str = ""
+        photo_url: Optional[str] = None
+        shared_post_id: Optional[str] = None
+        shared_reel_id: Optional[str] = None
+        reply_to_id: Optional[str] = None
+
+    @api.post("/groups")
+    async def create_group(p: GroupIn, u=Depends(current_user)):
+        name = p.name.strip()
+        if not name:
+            raise HTTPException(400, "Group name required")
+        members = list(set([u["id"]] + p.member_ids))
+        doc = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "avatar_color": p.avatar_color or "#FFD600",
+            "avatar_letter": name[0].upper(),
+            "creator_id": u["id"],
+            "admins": [u["id"]],
+            "members": members,
+            "created_at": now().isoformat(),
+            "last_message": None,
+            "last_message_at": now().isoformat(),
+        }
+        await db.groups.insert_one(doc.copy())
+        doc.pop("_id", None)
+        return doc
+
+    @api.get("/groups")
+    async def list_groups(u=Depends(current_user)):
+        grps = await db.groups.find({"members": u["id"]}, {"_id": 0}).sort("last_message_at", -1).to_list(100)
+        result = []
+        for g in grps:
+            unread = await db.group_messages.count_documents({
+                "group_id": g["id"], "seen_by": {"$ne": u["id"]}, "from_id": {"$ne": u["id"]}
+            })
+            g["unread"] = unread
+            result.append(g)
+        return {"groups": result}
+
+    @api.get("/groups/{group_id}")
+    async def get_group(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        member_docs = await db.users.find(
+            {"id": {"$in": g["members"]}},
+            {"_id": 0, "id": 1, "name": 1, "handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1, "is_online": 1}
+        ).to_list(200)
+        g["member_details"] = member_docs
+        return g
+
+    @api.patch("/groups/{group_id}")
+    async def update_group(group_id: str, body: dict, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("admins", []): raise HTTPException(403, "Only admins can edit group")
+        upd = {}
+        if "name" in body and body["name"].strip():
+            upd["name"] = body["name"].strip()
+            upd["avatar_letter"] = body["name"].strip()[0].upper()
+        if "avatar_color" in body: upd["avatar_color"] = body["avatar_color"]
+        if "avatar_photo" in body: upd["avatar_photo"] = body["avatar_photo"]
+        if upd: await db.groups.update_one({"id": group_id}, {"$set": upd})
+        return {"ok": True}
+
+    @api.post("/groups/{group_id}/members")
+    async def add_group_member(group_id: str, body: dict, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("admins", []): raise HTTPException(403, "Only admins can add members")
+        new_uid = body.get("user_id")
+        if not new_uid: raise HTTPException(400, "user_id required")
+        await db.groups.update_one({"id": group_id}, {"$addToSet": {"members": new_uid}})
+        return {"ok": True}
+
+    @api.delete("/groups/{group_id}/members/{member_id}")
+    async def remove_group_member(group_id: str, member_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1, "creator_id": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("admins", []) and member_id != u["id"]:
+            raise HTTPException(403, "Not allowed")
+        await db.groups.update_one({"id": group_id}, {"$pull": {"members": member_id, "admins": member_id}})
+        return {"ok": True}
+
+    @api.delete("/groups/{group_id}")
+    async def delete_group(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "creator_id": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if g["creator_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Only creator can delete group")
+        await db.groups.delete_one({"id": group_id})
+        await db.group_messages.delete_many({"group_id": group_id})
+        return {"ok": True}
+
+    @api.get("/groups/{group_id}/messages")
+    async def get_group_messages(group_id: str, skip: int = 0, limit: int = 40, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        msgs = await db.group_messages.find(
+            {"group_id": group_id, "deleted_for": {"$ne": u["id"]}}, {"_id": 0}
+        ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        msgs.reverse()
+        await db.group_messages.update_many(
+            {"group_id": group_id, "from_id": {"$ne": u["id"]}, "seen_by": {"$ne": u["id"]}},
+            {"$addToSet": {"seen_by": u["id"]}}
+        )
+        return {"messages": msgs, "has_more": len(msgs) == limit}
+
+    @api.post("/groups/{group_id}/messages")
+    async def send_group_message(group_id: str, p: GroupMessageIn, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "name": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        if not p.text.strip() and not p.photo_url and not p.shared_post_id and not p.shared_reel_id:
+            raise HTTPException(400, "Message cannot be empty")
+        reply_to_preview = None
+        if p.reply_to_id:
+            ref = await db.group_messages.find_one({"id": p.reply_to_id}, {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "photo_url": 1})
+            if ref:
+                reply_to_preview = {"id": p.reply_to_id, "from_name": ref.get("from_name",""), "from_id": ref.get("from_id",""), "text": (ref.get("text") or "")[:120], "has_photo": bool(ref.get("photo_url"))}
+        shared_post = None
+        if p.shared_post_id:
+            sp = await db.posts.find_one({"id": p.shared_post_id}, {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1, "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1})
+            if sp:
+                shared_post = {"id": sp["id"], "content": (sp.get("content") or "")[:200], "photo_url": sp.get("photo_url") or ((sp.get("photo_urls") or [None])[0]), "user_name": sp.get("user_name",""), "user_handle": sp.get("user_handle",""), "avatar_bg": sp.get("avatar_bg",""), "avatar_letter": sp.get("avatar_letter",""), "avatar_photo": sp.get("avatar_photo"), "type": "post"}
+        doc = {
+            "id": str(uuid.uuid4()), "group_id": group_id,
+            "from_id": u["id"], "from_name": u["name"], "from_handle": u["handle"],
+            "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"),
+            "text": p.text.strip(), "photo_url": p.photo_url,
+            "reply_to_preview": reply_to_preview, "shared_post": shared_post,
+            "seen_by": [u["id"]], "reactions": {}, "deleted_for": [], "created_at": now().isoformat(),
+        }
+        await db.group_messages.insert_one(doc.copy())
+        doc.pop("_id", None)
+        last_text = p.text.strip() or ("📷 Photo" if p.photo_url else ("📎 Post" if p.shared_post_id else ""))
+        await db.groups.update_one({"id": group_id}, {"$set": {"last_message": last_text, "last_message_at": now().isoformat(), "last_from_name": u["name"]}})
+        for mid in [m for m in g.get("members", []) if m != u["id"]]:
+            await db.notifications.insert_one({"id": str(uuid.uuid4()), "user_id": mid, "type": "group_message", "from_id": u["id"], "from_name": u["name"], "group_id": group_id, "group_name": g.get("name","Group"), "message": last_text[:80], "read": False, "created_at": now().isoformat()})
+        return doc
+
+    @api.delete("/groups/{group_id}/messages/{msg_id}")
+    async def delete_group_message(group_id: str, msg_id: str, body: dict = None, u=Depends(current_user)):
+        body = body or {}
+        msg = await db.group_messages.find_one({"id": msg_id, "group_id": group_id})
+        if not msg: raise HTTPException(404, "Message not found")
+        if body.get("delete_for") == "everyone" and msg["from_id"] == u["id"]:
+            await db.group_messages.update_one({"id": msg_id}, {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None}})
+        else:
+            await db.group_messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
+        return {"ok": True}
+
+    # ── Call Signaling (WebRTC polling) ───────────────────────────
+    _call_state: dict = {}
+
+    @api.post("/calls/initiate")
+    async def initiate_call(body: dict, u=Depends(current_user)):
+        to_user_id = body.get("to_user_id")
+        call_type = body.get("call_type", "voice")
+        group_id = body.get("group_id")
+        if not to_user_id and not group_id: raise HTTPException(400, "to_user_id or group_id required")
+        call_id = str(uuid.uuid4())
+        _call_state[call_id] = {"id": call_id, "from_id": u["id"], "from_name": u["name"], "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"), "to_user_id": to_user_id, "group_id": group_id, "call_type": call_type, "status": "ringing", "signals": [], "created_at": now().isoformat(), "ended_at": None}
+        return {"call_id": call_id, "status": "ringing"}
+
+    @api.get("/calls/{call_id}")
+    async def get_call_state(call_id: str, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        return call
+
+    @api.post("/calls/{call_id}/signal")
+    async def add_call_signal(call_id: str, body: dict, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        call["signals"].append({"from_id": u["id"], "type": body.get("type"), "data": body.get("data"), "ts": now().isoformat()})
+        if len(call["signals"]) > 200: call["signals"] = call["signals"][-200:]
+        return {"ok": True}
+
+    @api.get("/calls/{call_id}/signals")
+    async def get_call_signals(call_id: str, since: int = 0, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        my_signals = [s for s in call["signals"][since:] if s["from_id"] != u["id"]]
+        return {"signals": my_signals, "total": len(call["signals"])}
+
+    @api.post("/calls/{call_id}/answer")
+    async def answer_call(call_id: str, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        call["status"] = "active"
+        return {"ok": True}
+
+    @api.post("/calls/{call_id}/end")
+    async def end_call(call_id: str, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        call["status"] = "ended"
+        call["ended_at"] = now().isoformat()
+        return {"ok": True}
+
+    @api.post("/calls/{call_id}/decline")
+    async def decline_call(call_id: str, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        call["status"] = "declined"
+        return {"ok": True}
+
+    @api.get("/calls/incoming/check")
+    async def check_incoming_call(u=Depends(current_user)):
+        for call_id, call in list(_call_state.items()):
+            if call["to_user_id"] == u["id"] and call["status"] == "ringing":
+                age = (now() - datetime.fromisoformat(call["created_at"])).total_seconds()
+                if age > 60: call["status"] = "ended"
+                else: return {"call": call}
+        return {"call": None}
+
+
     # Register all routes
     app.include_router(api)
 
