@@ -4,7 +4,7 @@ import traceback as _tb
 print('==> [DIAG] server.py starting load...', file=_sys.stderr, flush=True)
 
 try:
-    from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Query, Request, Header
+    from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Query, Request, Header, WebSocket, WebSocketDisconnect
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.middleware.gzip import GZipMiddleware
@@ -616,7 +616,8 @@ postbluom.online"""
 
     class MessageIn(BaseModel):
         to_user_id: str; text: str = ""
-        photo_url: Optional[str] = None; mood_color: Optional[str] = None
+        photo_url: Optional[str] = None; gif_url: Optional[str] = None
+        mood_color: Optional[str] = None
         reply_to_id: Optional[str] = None
         shared_post_id: Optional[str] = None
         shared_reel_id: Optional[str] = None
@@ -1959,26 +1960,148 @@ postbluom.online"""
         for r in pending_out: r["to_user"]   = out_users.get(r["to_id"], {})
         return {"friends": friends, "pending_incoming": pending_in, "pending_outgoing": pending_out}
 
+    # ── WebSocket connection manager ────────────────────────────────
+    _ws_connections: dict = {}   # user_id → WebSocket
+
+    async def _ws_push(user_id: str, payload: dict) -> bool:
+        """Push a JSON payload to a connected user's WebSocket. Returns True if sent."""
+        ws = _ws_connections.get(user_id)
+        if not ws:
+            return False
+        try:
+            await ws.send_text(_json.dumps(payload))
+            return True
+        except Exception:
+            _ws_connections.pop(user_id, None)
+            return False
+
+    @app.websocket("/ws/{user_id}")
+    async def ws_endpoint(websocket: WebSocket, user_id: str):
+        """Persistent WebSocket per user for real-time messaging."""
+        # ── Authenticate via ?token= query param ─────────────────
+        token_val = websocket.query_params.get("token", "")
+        try:
+            payload = jwt.decode(token_val, JWT_SECRET, algorithms=["HS256"])
+            if payload.get("sub") != user_id:
+                await websocket.close(code=4001)
+                return
+        except Exception:
+            await websocket.close(code=4001)
+            return
+
+        await websocket.accept()
+        _ws_connections[user_id] = websocket
+        await db.users.update_one(
+            {"id": user_id},
+            {"$set": {"is_online": True, "last_seen": now().isoformat()}}
+        )
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    data = _json.loads(raw)
+                except Exception:
+                    continue   # ignore malformed frames
+
+                msg_type = data.get("type", "")
+
+                # ── delivered ACK: receiver got message via WS ────
+                if msg_type == "delivered":
+                    msg_id = data.get("msg_id", "")
+                    if not msg_id:
+                        continue
+                    msg = await db.messages.find_one(
+                        {"id": msg_id},
+                        {"_id": 0, "from_id": 1, "to_id": 1, "status": 1}
+                    )
+                    # Only upgrade if we are the intended receiver and status is still "sent"
+                    if msg and msg.get("to_id") == user_id and msg.get("status") == "sent":
+                        await db.messages.update_one(
+                            {"id": msg_id},
+                            {"$set": {"status": "delivered", "delivered_at": now().isoformat()}}
+                        )
+                        # Notify sender: their ✓ upgrades to ✓✓ grey
+                        await _ws_push(msg["from_id"], {
+                            "type": "status_update",
+                            "msg_id": msg_id,
+                            "status": "delivered",
+                        })
+
+                # ── seen ACK: receiver opened the chat ────────────
+                elif msg_type == "seen":
+                    partner_id = data.get("partner_id", "")
+                    if not partner_id:
+                        continue
+                    unseen = await db.messages.find(
+                        {
+                            "from_id": partner_id,
+                            "to_id": user_id,
+                            "status": {"$ne": "seen"},
+                            "deleted_for_everyone": {"$ne": True},
+                        },
+                        {"_id": 0, "id": 1}
+                    ).to_list(500)
+                    ids = [m["id"] for m in unseen]
+                    if ids:
+                        await db.messages.update_many(
+                            {"id": {"$in": ids}},
+                            {"$set": {"status": "seen", "seen_at": now().isoformat()}}
+                        )
+                        # Notify sender: their ✓✓ turns blue
+                        await _ws_push(partner_id, {
+                            "type": "bulk_seen",
+                            "msg_ids": ids,
+                            "by_user_id": user_id,
+                        })
+
+                # ── typing indicator ──────────────────────────────
+                elif msg_type == "typing":
+                    to_uid = data.get("to_user_id", "")
+                    is_t   = bool(data.get("is_typing", True))
+                    if to_uid:
+                        await _ws_push(to_uid, {
+                            "type": "typing",
+                            "from_user_id": user_id,
+                            "is_typing": is_t,
+                        })
+
+                # ── ping / keepalive — no-op ──────────────────────
+                elif msg_type == "ping":
+                    pass
+
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            _ws_connections.pop(user_id, None)
+            await db.users.update_one(
+                {"id": user_id},
+                {"$set": {"is_online": False, "last_seen": now().isoformat()}}
+            )
+
     # ── Messages ──────────────────────────────────────────────────
-    _typing_state: dict = {}
 
     @api.post("/messages")
     async def send_message(p: MessageIn, u=Depends(current_user)):
-        if not p.text.strip() and not p.photo_url and not p.shared_post_id and not p.shared_reel_id:
+        """Save message to DB, then push to receiver via WebSocket if online."""
+        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id:
             raise HTTPException(400, "Message cannot be empty")
         recipient = await db.users.find_one({"id": p.to_user_id})
-        if not recipient: raise HTTPException(404, "Recipient not found")
+        if not recipient:
+            raise HTTPException(404, "Recipient not found")
         if u["id"] in recipient.get("blocked_users", []) or p.to_user_id in u.get("blocked_users", []):
             raise HTTPException(403, "Cannot message this user")
         if recipient.get("is_badge_verified"):
             raise HTTPException(403, "Cannot message verified public figures")
+
+        # Cross-continent rule: must follow each other or be connected friends
         same_continent = (
             (u.get("continent") or "").strip() == (recipient.get("continent") or "").strip()
             and bool(u.get("continent"))
         )
         if not same_continent:
-            # Allow messaging if sender follows recipient OR recipient follows sender
-            sender_follows = p.to_user_id in (u.get("following") or [])
+            sender_follows    = p.to_user_id in (u.get("following") or [])
             recipient_follows = u["id"] in (recipient.get("followers") or [])
             if not (sender_follows or recipient_follows):
                 fr = await db.friend_requests.find_one({
@@ -1990,67 +2113,92 @@ postbluom.online"""
                 })
                 if not fr:
                     raise HTTPException(403, "Connect with this user first to message across countries")
-        is_silent    = False
-        recv_tz_offset = recipient.get("timezone_offset")
-        if recv_tz_offset is not None:
-            try:
-                recv_hour = (now() + timedelta(hours=float(recv_tz_offset))).hour
-                is_silent = (recv_hour >= 23 or recv_hour < 6)
-            except Exception:
-                pass
+
+        # ── Build reply-to preview ────────────────────────────────
         reply_to_preview = None
         if p.reply_to_id:
-            ref = await db.messages.find_one({"id": p.reply_to_id}, {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "photo_url": 1})
+            ref = await db.messages.find_one(
+                {"id": p.reply_to_id},
+                {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "photo_url": 1}
+            )
             if ref:
                 reply_to_preview = {
-                    "id": p.reply_to_id,
+                    "id":       p.reply_to_id,
                     "from_name": ref.get("from_name", ""),
-                    "from_id": ref.get("from_id", ""),
-                    "text": (ref.get("text") or "")[:120],
+                    "from_id":  ref.get("from_id", ""),
+                    "text":     (ref.get("text") or "")[:120],
                     "has_photo": bool(ref.get("photo_url")),
                 }
+
+        # ── Build shared-post preview ─────────────────────────────
         shared_post = None
         if p.shared_post_id:
-            sp = await db.posts.find_one({"id": p.shared_post_id}, {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1, "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1})
+            sp = await db.posts.find_one(
+                {"id": p.shared_post_id},
+                {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1,
+                 "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1}
+            )
             if sp:
                 shared_post = {
-                    "id": sp["id"],
-                    "content": (sp.get("content") or "")[:200],
-                    "photo_url": sp.get("photo_url") or ((sp.get("photo_urls") or [None])[0]),
-                    "user_name": sp.get("user_name", ""),
-                    "user_handle": sp.get("user_handle", ""),
-                    "avatar_bg": sp.get("avatar_bg", ""),
+                    "id":           sp["id"],
+                    "content":      (sp.get("content") or "")[:200],
+                    "photo_url":    sp.get("photo_url") or ((sp.get("photo_urls") or [None])[0]),
+                    "user_name":    sp.get("user_name", ""),
+                    "user_handle":  sp.get("user_handle", ""),
+                    "avatar_bg":    sp.get("avatar_bg", ""),
                     "avatar_letter": sp.get("avatar_letter", ""),
                     "avatar_photo": sp.get("avatar_photo"),
                     "type": "post",
                 }
+
+        # ── Build shared-reel preview ─────────────────────────────
         shared_reel = None
         if p.shared_reel_id:
-            sr = await db.reels.find_one({"id": p.shared_reel_id}, {"_id": 0, "id": 1, "caption": 1, "video_url": 1, "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1})
+            sr = await db.reels.find_one(
+                {"id": p.shared_reel_id},
+                {"_id": 0, "id": 1, "caption": 1, "video_url": 1,
+                 "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1}
+            )
             if sr:
                 shared_reel = {
-                    "id": sr["id"],
-                    "caption": (sr.get("caption") or "")[:200],
-                    "video_url": sr.get("video_url"),
-                    "user_name": sr.get("user_name", ""),
-                    "user_handle": sr.get("user_handle", ""),
-                    "avatar_bg": sr.get("avatar_bg", ""),
+                    "id":           sr["id"],
+                    "caption":      (sr.get("caption") or "")[:200],
+                    "video_url":    sr.get("video_url"),
+                    "user_name":    sr.get("user_name", ""),
+                    "user_handle":  sr.get("user_handle", ""),
+                    "avatar_bg":    sr.get("avatar_bg", ""),
                     "avatar_letter": sr.get("avatar_letter", ""),
                     "avatar_photo": sr.get("avatar_photo"),
                     "type": "reel",
                 }
+
+        # ── Assemble message document ─────────────────────────────
         m = {
-            "id": str(uuid.uuid4()), "from_id": u["id"], "from_name": u["name"],
-            "to_id": p.to_user_id, "text": p.text, "photo_url": p.photo_url,
-            "mood_color": p.mood_color, "created_at": now().isoformat(),
-            "status": "sent", "deleted_for": [], "deleted_for_everyone": False, "is_silent": is_silent,
-            "reply_to_id": p.reply_to_id or None,
+            "id":               str(uuid.uuid4()),
+            "from_id":          u["id"],
+            "from_name":        u["name"],
+            "to_id":            p.to_user_id,
+            "text":             p.text,
+            "photo_url":        p.photo_url,
+            "gif_url":          p.gif_url,
+            "mood_color":       p.mood_color,
+            "created_at":       now().isoformat(),
+            "status":           "sent",           # ✓ — server received
+            "deleted_for":      [],
+            "deleted_for_everyone": False,
+            "reply_to_id":      p.reply_to_id or None,
             "reply_to_preview": reply_to_preview,
-            "shared_post": shared_post,
-            "shared_reel": shared_reel,
+            "shared_post":      shared_post,
+            "shared_reel":      shared_reel,
         }
         await db.messages.insert_one(m.copy())
         m.pop("_id", None)
+
+        # ── Push to receiver via WebSocket ────────────────────────
+        # Receiver client will reply with a "delivered" ACK that upgrades
+        # the status to "delivered" (✓✓ grey) and notifies the sender.
+        await _ws_push(p.to_user_id, {"type": "new_message", "message": m})
+
         return m
 
     @api.get("/messages/conversations")
@@ -2068,7 +2216,7 @@ postbluom.online"""
                 "text": 1, "photo_url": 1, "created_at": 1, "status": 1, "from_id": 1, "mood_color": 1,
             }},
             {"$group": {
-                "_id": "$other_id",
+                "_id":         "$other_id",
                 "last_text":   {"$first": "$text"},
                 "last_photo":  {"$first": "$photo_url"},
                 "last_time":   {"$first": "$created_at"},
@@ -2077,37 +2225,36 @@ postbluom.online"""
                 "last_mood":   {"$first": "$mood_color"},
             }},
         ]
-        convs     = await db.messages.aggregate(pipeline).to_list(200)
-        user_ids  = [c["_id"] for c in convs]
+        convs      = await db.messages.aggregate(pipeline).to_list(200)
+        user_ids   = [c["_id"] for c in convs]
         pub = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
                "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1,
                "is_online": 1, "last_seen": 1}
         users_list = await db.users.find({"id": {"$in": user_ids}}, pub).to_list(200)
         users_map  = {uu["id"]: uu for uu in users_list}
-        async def _unread(cid):
+
+        async def _unread(cid: str) -> int:
             return await db.messages.count_documents({
                 "from_id": cid, "to_id": u["id"],
-                "status": {"$ne": "seen"}, "deleted_for_everyone": {"$ne": True},
+                "status": {"$ne": "seen"},
+                "deleted_for_everyone": {"$ne": True},
                 "deleted_for": {"$nin": [u["id"]]},
             })
+
         unread_counts = await asyncio.gather(*[_unread(c["_id"]) for c in convs])
         for c, uc in zip(convs, unread_counts):
-            c["user"]   = users_map.get(c["_id"], {})
-            c["unread"] = uc
+            c["user"]              = users_map.get(c["_id"], {})
+            c["unread"]            = uc
+            c["is_partner_online"] = c["_id"] in _ws_connections
         convs.sort(key=lambda x: x.get("last_time", ""), reverse=True)
         return {"conversations": convs}
-
-    @api.get("/messages/typing")
-    async def get_typing(with_user: str, u=Depends(current_user)):
-        expires = _typing_state.get(with_user, {}).get(u["id"])
-        if expires and now() < expires:
-            return {"is_typing": True}
-        return {"is_typing": False}
 
     @api.get("/messages/unread-count")
     async def get_msg_unread_count(u=Depends(current_user)):
         count = await db.messages.count_documents({
-            "to_id": u["id"], "status": {"$ne": "seen"}, "deleted_for_everyone": {"$ne": True},
+            "to_id": u["id"],
+            "status": {"$ne": "seen"},
+            "deleted_for_everyone": {"$ne": True},
         })
         return {"unread_count": count}
 
@@ -2117,46 +2264,28 @@ postbluom.online"""
         u=Depends(current_user),
     ):
         if with_user:
-            q = {"$or": [{"from_id": u["id"], "to_id": with_user}, {"from_id": with_user, "to_id": u["id"]}]}
+            q = {"$or": [
+                {"from_id": u["id"], "to_id": with_user},
+                {"from_id": with_user, "to_id": u["id"]},
+            ]}
         else:
             q = {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]}
-        msgs  = await db.messages.find(q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
-        msgs  = list(reversed(msgs))
+        msgs  = await db.messages.find(q, {"_id": 0}).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
         total = await db.messages.count_documents(q)
-        if with_user:
-            await db.messages.update_many(
-                {"from_id": with_user, "to_id": u["id"], "status": "sent"},
-                {"$set": {"status": "delivered"}},
-            )
-        msgs = [m for m in msgs if u["id"] not in m.get("deleted_for", []) and not m.get("deleted_for_everyone")]
+        msgs  = [m for m in msgs if u["id"] not in m.get("deleted_for", []) and not m.get("deleted_for_everyone")]
         return {"messages": msgs, "total": total, "skip": skip, "limit": limit}
-
-    @api.post("/messages/{msg_id}/seen")
-    async def mark_message_seen(msg_id: str, u=Depends(current_user)):
-        await db.messages.update_one(
-            {"id": msg_id, "to_id": u["id"]},
-            {"$set": {"status": "seen", "seen_at": now().isoformat()}},
-        )
-        return {"ok": True}
-
-    @api.post("/messages/conversations/{partner_id}/seen")
-    async def mark_conversation_seen(partner_id: str, u=Depends(current_user)):
-        """Bulk-mark all unread messages from partner_id to current user as seen."""
-        await db.messages.update_many(
-            {"from_id": partner_id, "to_id": u["id"], "status": {"$ne": "seen"}, "deleted_for_everyone": {"$ne": True}},
-            {"$set": {"status": "seen", "seen_at": now().isoformat()}}
-        )
-        return {"ok": True}
 
     @api.delete("/messages/{msg_id}")
     async def delete_message(msg_id: str, delete_for: str = "self", u=Depends(current_user)):
         msg = await db.messages.find_one({"id": msg_id})
-        if not msg: raise HTTPException(404, "Message not found")
+        if not msg:
+            raise HTTPException(404, "Message not found")
         if delete_for == "everyone":
-            if msg["from_id"] != u["id"]: raise HTTPException(403, "Only sender can delete for everyone")
+            if msg["from_id"] != u["id"]:
+                raise HTTPException(403, "Only sender can delete for everyone")
             await db.messages.update_one(
                 {"id": msg_id},
-                {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None}},
+                {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None}}
             )
         else:
             await db.messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
@@ -2164,24 +2293,35 @@ postbluom.online"""
 
     @api.delete("/messages/conversations/{partner_id}")
     async def delete_conversation(partner_id: str, u=Depends(current_user)):
-        """Soft-delete entire conversation for current user only."""
+        """Soft-delete entire conversation for the current user only."""
         await db.messages.update_many(
             {"$or": [
                 {"from_id": u["id"], "to_id": partner_id},
-                {"from_id": partner_id, "to_id": u["id"]}
+                {"from_id": partner_id, "to_id": u["id"]},
             ]},
             {"$addToSet": {"deleted_for": u["id"]}}
         )
         return {"ok": True}
 
-    @api.post("/messages/typing")
-    async def set_typing(p: TypingIn, u=Depends(current_user)):
-        if u["id"] not in _typing_state:
-            _typing_state[u["id"]] = {}
-        if p.is_typing:
-            _typing_state[u["id"]][p.to_user_id] = now() + timedelta(seconds=3)
-        else:
-            _typing_state[u["id"]].pop(p.to_user_id, None)
+    @api.post("/messages/conversations/{partner_id}/seen")
+    async def mark_conversation_seen(partner_id: str, u=Depends(current_user)):
+        """REST fallback: bulk-mark messages seen (used when WS is unavailable)."""
+        unseen = await db.messages.find(
+            {
+                "from_id": partner_id,
+                "to_id": u["id"],
+                "status": {"$ne": "seen"},
+                "deleted_for_everyone": {"$ne": True},
+            },
+            {"_id": 0, "id": 1}
+        ).to_list(500)
+        ids = [m["id"] for m in unseen]
+        if ids:
+            await db.messages.update_many(
+                {"id": {"$in": ids}},
+                {"$set": {"status": "seen", "seen_at": now().isoformat()}}
+            )
+            await _ws_push(partner_id, {"type": "bulk_seen", "msg_ids": ids, "by_user_id": u["id"]})
         return {"ok": True}
 
     @api.patch("/users/me/timezone")
