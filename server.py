@@ -1395,6 +1395,29 @@ postbluom.online"""
         if video_duration is not None and video_duration > MAX_POST_VIDEO_SECONDS + 0.5:
             raise HTTPException(400, f"Videos must be {MAX_POST_VIDEO_SECONDS} seconds or less")
 
+    @api.post("/upload/photo")
+    async def upload_photo(file: UploadFile = File(...), u=Depends(current_user)):
+        """Upload any image to Cloudinary and return its URL."""
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Image hosting is not configured on the server")
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(400, "Please upload a valid image file")
+        raw = await file.read()
+        if len(raw) > 10 * 1024 * 1024:
+            raise HTTPException(400, "Image is too large. Max 10MB.")
+        try:
+            result = cloudinary.uploader.upload(
+                raw,
+                resource_type="image",
+                folder="post-app/photos",
+                public_id=f"{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception:
+            logging.exception("Cloudinary photo upload failed")
+            raise HTTPException(502, "Image upload failed. Please try again.")
+        return {"url": result.get("secure_url")}
+
     @api.post("/upload/video")
     async def upload_video(
         file: UploadFile = File(...),
