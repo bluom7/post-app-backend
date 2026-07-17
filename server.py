@@ -3242,6 +3242,7 @@ postbluom.online"""
         name: str
         member_ids: List[str] = []
         avatar_color: Optional[str] = None
+        avatar_photo: Optional[str] = None
 
     class GroupMessageIn(BaseModel):
         text: str = ""
@@ -3261,6 +3262,7 @@ postbluom.online"""
             "name": name,
             "avatar_color": p.avatar_color or "#FFD600",
             "avatar_letter": name[0].upper(),
+            "avatar_photo": p.avatar_photo or None,
             "creator_id": u["id"],
             "admins": [u["id"]],
             "members": members,
