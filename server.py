@@ -3400,6 +3400,67 @@ postbluom.online"""
             await db.group_messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
         return {"ok": True}
 
+    # ── Group – leave / clear chat / invite link ──────────────────
+
+    @api.post("/groups/{group_id}/leave")
+    async def leave_group(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "creator_id": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(400, "Not a member")
+        await db.groups.update_one({"id": group_id}, {"$pull": {"members": u["id"], "admins": u["id"]}})
+        # system message: user left
+        await db.group_messages.insert_one({
+            "id": str(uuid.uuid4()), "group_id": group_id,
+            "from_id": u["id"], "from_name": u["name"],
+            "text": f"{u['name']} left the group",
+            "is_system": True, "created_at": now().isoformat(),
+            "seen_by": [], "reactions": {}, "deleted_for": [],
+        })
+        return {"ok": True}
+
+    @api.delete("/groups/{group_id}/messages/clear")
+    async def clear_group_chat(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        # soft-delete for this user only
+        await db.group_messages.update_many(
+            {"group_id": group_id},
+            {"$addToSet": {"deleted_for": u["id"]}}
+        )
+        return {"ok": True}
+
+    @api.get("/groups/{group_id}/invite-link")
+    async def get_group_invite_link(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "invite_code": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        invite_code = g.get("invite_code")
+        if not invite_code:
+            invite_code = str(uuid.uuid4())[:8].upper()
+            await db.groups.update_one({"id": group_id}, {"$set": {"invite_code": invite_code}})
+        frontend_url = os.environ.get("FRONTEND_URL", "https://post-app-frontend.onrender.com")
+        return {"invite_code": invite_code, "invite_link": f"{frontend_url}?join={invite_code}"}
+
+    @api.post("/groups/join")
+    async def join_group_via_invite(body: dict, u=Depends(current_user)):
+        invite_code = (body.get("invite_code") or "").strip().upper()
+        if not invite_code: raise HTTPException(400, "invite_code required")
+        g = await db.groups.find_one({"invite_code": invite_code}, {"_id": 0})
+        if not g: raise HTTPException(404, "Invalid invite link")
+        if u["id"] in g.get("members", []):
+            return {"group": g, "already_member": True}
+        await db.groups.update_one({"id": g["id"]}, {"$addToSet": {"members": u["id"]}})
+        await db.group_messages.insert_one({
+            "id": str(uuid.uuid4()), "group_id": g["id"],
+            "from_id": u["id"], "from_name": u["name"],
+            "text": f"{u['name']} joined via invite link",
+            "is_system": True, "created_at": now().isoformat(),
+            "seen_by": [], "reactions": {}, "deleted_for": [],
+        })
+        g["members"] = g.get("members", []) + [u["id"]]
+        return {"group": g, "already_member": False}
+
     # ── Call Signaling (WebRTC polling) ───────────────────────────
     _call_state: dict = {}
 
