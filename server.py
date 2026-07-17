@@ -1902,6 +1902,55 @@ postbluom.online"""
             result.append(p)
         return {"posts": result}
 
+    @api.get("/users/me/liked-posts")
+    async def get_liked_posts(u=Depends(current_user)):
+        """Posts that the current user has liked."""
+        user_id = u["id"]
+        # likes stored as [{user_id, color}] objects in posts collection
+        posts_cursor = db.posts.find(
+            {"likes": {"$elemMatch": {"user_id": user_id}}}
+        ).sort("created_at", -1).limit(100)
+        result = []
+        async for p in posts_cursor:
+            p.pop("_id", None)
+            result.append(p)
+        return {"posts": result}
+
+    @api.get("/users/me/commented-posts")
+    async def get_commented_posts(u=Depends(current_user)):
+        """Posts on which the current user has left at least one comment."""
+        user_id = u["id"]
+        posts_cursor = db.posts.find(
+            {"comments": {"$elemMatch": {"user_id": user_id}}}
+        ).sort("created_at", -1).limit(100)
+        result = []
+        async for p in posts_cursor:
+            p.pop("_id", None)
+            result.append(p)
+        return {"posts": result}
+
+    @api.get("/users/me/tagged-posts")
+    async def get_tagged_posts(u=Depends(current_user)):
+        """Posts where the current user tagged someone OR was tagged by someone."""
+        user_id = u["id"]
+        handle   = u.get("handle") or ("@" + u.get("username", ""))
+        username = u.get("username", "")
+        # tagged_users is a list of @handle strings like ["@john", "@jane"]
+        posts_cursor = db.posts.find({
+            "$or": [
+                # Someone tagged this user in their post
+                {"tagged_users": handle},
+                {"tagged_users": "@" + username},
+                # This user created a post where they tagged someone else
+                {"user_id": user_id, "tagged_users": {"$exists": True, "$not": {"$size": 0}}},
+            ]
+        }).sort("created_at", -1).limit(100)
+        result = []
+        async for p in posts_cursor:
+            p.pop("_id", None)
+            result.append(p)
+        return {"posts": result}
+
     # ── Friends ───────────────────────────────────────────────────
     @api.post("/friends/request")
     async def friend_request(p: FriendIn, u=Depends(current_user)):
