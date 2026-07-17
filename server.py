@@ -3341,6 +3341,36 @@ postbluom.online"""
         return {"call": None}
 
 
+    # ── GIF proxy (Giphy) ─────────────────────────────────────────────────────
+    @api.get("/gifs")
+    async def gif_proxy(q: str = "", limit: int = 30):
+        GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "")
+        if not GIPHY_KEY:
+            raise HTTPException(500, "GIPHY_API_KEY not configured")
+        if q.strip():
+            url = (
+                "https://api.giphy.com/v1/gifs/search"
+                f"?api_key={GIPHY_KEY}&q={urllib.parse.quote(q)}&limit={limit}&rating=pg"
+            )
+        else:
+            url = (
+                "https://api.giphy.com/v1/gifs/trending"
+                f"?api_key={GIPHY_KEY}&limit={limit}&rating=pg"
+            )
+        req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read())
+        gifs = [
+            {
+                "id": g["id"],
+                "title": g.get("title", ""),
+                "preview": g["images"]["fixed_width_small"]["url"],
+                "full": g["images"]["fixed_width"]["url"],
+            }
+            for g in data.get("data", [])
+        ]
+        return {"gifs": gifs}
+
     # Register all routes
     app.include_router(api)
 
