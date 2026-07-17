@@ -3389,18 +3389,9 @@ postbluom.online"""
             await db.notifications.insert_one({"id": str(uuid.uuid4()), "user_id": mid, "type": "group_message", "from_id": u["id"], "from_name": u["name"], "group_id": group_id, "group_name": g.get("name","Group"), "message": last_text[:80], "read": False, "created_at": now().isoformat()})
         return doc
 
-    @api.delete("/groups/{group_id}/messages/{msg_id}")
-    async def delete_group_message(group_id: str, msg_id: str, body: dict = None, u=Depends(current_user)):
-        body = body or {}
-        msg = await db.group_messages.find_one({"id": msg_id, "group_id": group_id})
-        if not msg: raise HTTPException(404, "Message not found")
-        if body.get("delete_for") == "everyone" and msg["from_id"] == u["id"]:
-            await db.group_messages.update_one({"id": msg_id}, {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None}})
-        else:
-            await db.group_messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
-        return {"ok": True}
-
     # ── Group – leave / clear chat / invite link ──────────────────
+    # NOTE: literal-path routes (/leave, /clear, /invite-link) must be defined
+    # BEFORE any parametric routes (/{msg_id}) so FastAPI matches them correctly.
 
     @api.post("/groups/{group_id}/leave")
     async def leave_group(group_id: str, u=Depends(current_user)):
@@ -3408,7 +3399,6 @@ postbluom.online"""
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(400, "Not a member")
         await db.groups.update_one({"id": group_id}, {"$pull": {"members": u["id"], "admins": u["id"]}})
-        # system message: user left
         await db.group_messages.insert_one({
             "id": str(uuid.uuid4()), "group_id": group_id,
             "from_id": u["id"], "from_name": u["name"],
@@ -3418,12 +3408,12 @@ postbluom.online"""
         })
         return {"ok": True}
 
-    @api.delete("/groups/{group_id}/messages/clear")
+    @api.post("/groups/{group_id}/clear-chat")
     async def clear_group_chat(group_id: str, u=Depends(current_user)):
+        """Clear chat for current user only (soft delete)."""
         g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
-        # soft-delete for this user only
         await db.group_messages.update_many(
             {"group_id": group_id},
             {"$addToSet": {"deleted_for": u["id"]}}
@@ -3460,6 +3450,17 @@ postbluom.online"""
         })
         g["members"] = g.get("members", []) + [u["id"]]
         return {"group": g, "already_member": False}
+
+    @api.delete("/groups/{group_id}/messages/{msg_id}")
+    async def delete_group_message(group_id: str, msg_id: str, body: dict = None, u=Depends(current_user)):
+        body = body or {}
+        msg = await db.group_messages.find_one({"id": msg_id, "group_id": group_id})
+        if not msg: raise HTTPException(404, "Message not found")
+        if body.get("delete_for") == "everyone" and msg["from_id"] == u["id"]:
+            await db.group_messages.update_one({"id": msg_id}, {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None}})
+        else:
+            await db.group_messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
+        return {"ok": True}
 
     # ── Call Signaling (WebRTC polling) ───────────────────────────
     _call_state: dict = {}
