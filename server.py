@@ -617,6 +617,7 @@ postbluom.online"""
     class MessageIn(BaseModel):
         to_user_id: str; text: str = ""
         photo_url: Optional[str] = None; gif_url: Optional[str] = None
+        audio_url: Optional[str] = None
         mood_color: Optional[str] = None
         reply_to_id: Optional[str] = None
         shared_post_id: Optional[str] = None
@@ -1418,6 +1419,27 @@ postbluom.online"""
             raise HTTPException(502, "Image upload failed. Please try again.")
         return {"url": result.get("secure_url")}
 
+    @api.post("/upload/audio")
+    async def upload_audio(file: UploadFile = File(...), u=Depends(current_user)):
+        """Upload a voice message audio file to Cloudinary and return its URL."""
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Audio hosting is not configured on the server")
+        raw = await file.read()
+        if len(raw) > 10 * 1024 * 1024:
+            raise HTTPException(400, "Audio too large. Max 10MB.")
+        try:
+            result = cloudinary.uploader.upload(
+                raw,
+                resource_type="video",   # Cloudinary uses "video" resource type for audio
+                folder="post-app/audio",
+                public_id=f"{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception:
+            logging.exception("Cloudinary audio upload failed")
+            raise HTTPException(502, "Audio upload failed. Please try again.")
+        return {"url": result.get("secure_url")}
+
     @api.post("/upload/video")
     async def upload_video(
         file: UploadFile = File(...),
@@ -2108,7 +2130,7 @@ postbluom.online"""
     @api.post("/messages")
     async def send_message(p: MessageIn, u=Depends(current_user)):
         """Save message to DB, then push to receiver via WebSocket if online."""
-        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id:
+        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.audio_url and not p.shared_post_id and not p.shared_reel_id:
             raise HTTPException(400, "Message cannot be empty")
         recipient = await db.users.find_one({"id": p.to_user_id})
         if not recipient:
@@ -2203,6 +2225,7 @@ postbluom.online"""
             "text":             p.text,
             "photo_url":        p.photo_url,
             "gif_url":          p.gif_url,
+            "audio_url":        p.audio_url,
             "mood_color":       p.mood_color,
             "created_at":       now().isoformat(),
             "status":           "sent",           # ✓ — server received
