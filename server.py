@@ -617,7 +617,6 @@ postbluom.online"""
     class MessageIn(BaseModel):
         to_user_id: str; text: str = ""
         photo_url: Optional[str] = None; gif_url: Optional[str] = None
-        audio_url: Optional[str] = None
         mood_color: Optional[str] = None
         reply_to_id: Optional[str] = None
         shared_post_id: Optional[str] = None
@@ -1419,30 +1418,6 @@ postbluom.online"""
             raise HTTPException(502, "Image upload failed. Please try again.")
         return {"url": result.get("secure_url")}
 
-    @api.post("/upload/audio")
-    async def upload_audio(file: UploadFile = File(...), u=Depends(current_user)):
-        """Upload a voice message audio file to Cloudinary and return its URL."""
-        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
-            raise HTTPException(500, "Audio hosting is not configured on the server")
-        raw = await file.read()
-        if len(raw) > 10 * 1024 * 1024:
-            raise HTTPException(400, "Audio too large. Max 10MB.")
-        try:
-            result = cloudinary.uploader.upload(
-                raw,
-                resource_type="auto",    # auto-detects audio/video correctly
-                folder="post-app/audio",
-                public_id=f"{u['id']}_{uuid.uuid4().hex}",
-                overwrite=False,
-            )
-        except Exception:
-            logging.exception("Cloudinary audio upload failed")
-            raise HTTPException(502, "Audio upload failed. Please try again.")
-        url = result.get("secure_url") or result.get("url") or ""
-        if not url:
-            raise HTTPException(502, "Audio upload succeeded but no URL returned.")
-        return {"url": url}
-
     @api.post("/upload/video")
     async def upload_video(
         file: UploadFile = File(...),
@@ -2133,14 +2108,15 @@ postbluom.online"""
     @api.post("/messages")
     async def send_message(p: MessageIn, u=Depends(current_user)):
         """Save message to DB, then push to receiver via WebSocket if online."""
-        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.audio_url and not p.shared_post_id and not p.shared_reel_id:
+        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id:
             raise HTTPException(400, "Message cannot be empty")
         recipient = await db.users.find_one({"id": p.to_user_id})
         if not recipient:
             raise HTTPException(404, "Recipient not found")
         if u["id"] in recipient.get("blocked_users", []) or p.to_user_id in u.get("blocked_users", []):
             raise HTTPException(403, "Cannot message this user")
-
+        if recipient.get("is_badge_verified"):
+            raise HTTPException(403, "Cannot message verified public figures")
 
         # Cross-continent rule: must follow each other or be connected friends
         same_continent = (
@@ -2228,7 +2204,6 @@ postbluom.online"""
             "text":             p.text,
             "photo_url":        p.photo_url,
             "gif_url":          p.gif_url,
-            "audio_url":        p.audio_url,
             "mood_color":       p.mood_color,
             "created_at":       now().isoformat(),
             "status":           "sent",           # ✓ — server received
@@ -3295,7 +3270,6 @@ postbluom.online"""
     class GroupMessageIn(BaseModel):
         text: str = ""
         photo_url: Optional[str] = None
-        audio_url: Optional[str] = None          # voice message
         shared_post_id: Optional[str] = None
         shared_reel_id: Optional[str] = None
         reply_to_id: Optional[str] = None
@@ -3346,6 +3320,33 @@ postbluom.online"""
         ).to_list(200)
         g["member_details"] = member_docs
         return g
+
+    @api.post("/groups/{group_id}/avatar")
+    async def upload_group_avatar(group_id: str, file: UploadFile = File(...), u=Depends(current_user)):
+        """Upload group avatar image to Cloudinary and save URL."""
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("admins", []): raise HTTPException(403, "Only admins can change avatar")
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Image hosting not configured")
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(400, "Please upload a valid image file")
+        raw = await file.read()
+        if len(raw) > 10 * 1024 * 1024:
+            raise HTTPException(400, "Image too large. Max 10MB.")
+        try:
+            result = cloudinary.uploader.upload(
+                raw, resource_type="image",
+                folder="post-app/group-avatars",
+                public_id=f"group_{group_id}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception:
+            logging.exception("Group avatar upload failed")
+            raise HTTPException(502, "Image upload failed. Please try again.")
+        photo_url = result.get("secure_url")
+        await db.groups.update_one({"id": group_id}, {"$set": {"avatar_photo": photo_url}})
+        return {"ok": True, "avatar_photo": photo_url}
 
     @api.patch("/groups/{group_id}")
     async def update_group(group_id: str, body: dict, u=Depends(current_user)):
@@ -3410,7 +3411,7 @@ postbluom.online"""
         g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "name": 1})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
-        if not p.text.strip() and not p.photo_url and not p.audio_url and not p.shared_post_id and not p.shared_reel_id:
+        if not p.text.strip() and not p.photo_url and not p.shared_post_id and not p.shared_reel_id:
             raise HTTPException(400, "Message cannot be empty")
         reply_to_preview = None
         if p.reply_to_id:
@@ -3426,13 +3427,13 @@ postbluom.online"""
             "id": str(uuid.uuid4()), "group_id": group_id,
             "from_id": u["id"], "from_name": u["name"], "from_handle": u["handle"],
             "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"),
-            "text": p.text.strip(), "photo_url": p.photo_url, "audio_url": p.audio_url,
+            "text": p.text.strip(), "photo_url": p.photo_url,
             "reply_to_preview": reply_to_preview, "shared_post": shared_post,
             "seen_by": [u["id"]], "reactions": {}, "deleted_for": [], "created_at": now().isoformat(),
         }
         await db.group_messages.insert_one(doc.copy())
         doc.pop("_id", None)
-        last_text = p.text.strip() or ("📷 Photo" if p.photo_url else ("🎤 Voice" if p.audio_url else ("📎 Post" if p.shared_post_id else "")))
+        last_text = p.text.strip() or ("📷 Photo" if p.photo_url else ("📎 Post" if p.shared_post_id else ""))
         await db.groups.update_one({"id": group_id}, {"$set": {"last_message": last_text, "last_message_at": now().isoformat(), "last_from_name": u["name"]}})
         for mid in [m for m in g.get("members", []) if m != u["id"]]:
             await db.notifications.insert_one({"id": str(uuid.uuid4()), "user_id": mid, "type": "group_message", "from_id": u["id"], "from_name": u["name"], "group_id": group_id, "group_name": g.get("name","Group"), "message": last_text[:80], "read": False, "created_at": now().isoformat()})
