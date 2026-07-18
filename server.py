@@ -2115,8 +2115,7 @@ postbluom.online"""
             raise HTTPException(404, "Recipient not found")
         if u["id"] in recipient.get("blocked_users", []) or p.to_user_id in u.get("blocked_users", []):
             raise HTTPException(403, "Cannot message this user")
-        if recipient.get("is_badge_verified"):
-            raise HTTPException(403, "Cannot message verified public figures")
+
 
         # Cross-continent rule: must follow each other or be connected friends
         same_continent = (
