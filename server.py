@@ -1430,7 +1430,7 @@ postbluom.online"""
         try:
             result = cloudinary.uploader.upload(
                 raw,
-                resource_type="video",   # Cloudinary uses "video" resource type for audio
+                resource_type="auto",    # auto-detects audio/video correctly
                 folder="post-app/audio",
                 public_id=f"{u['id']}_{uuid.uuid4().hex}",
                 overwrite=False,
@@ -1438,7 +1438,10 @@ postbluom.online"""
         except Exception:
             logging.exception("Cloudinary audio upload failed")
             raise HTTPException(502, "Audio upload failed. Please try again.")
-        return {"url": result.get("secure_url")}
+        url = result.get("secure_url") or result.get("url") or ""
+        if not url:
+            raise HTTPException(502, "Audio upload succeeded but no URL returned.")
+        return {"url": url}
 
     @api.post("/upload/video")
     async def upload_video(
