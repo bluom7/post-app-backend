@@ -621,6 +621,8 @@ postbluom.online"""
         reply_to_id: Optional[str] = None
         shared_post_id: Optional[str] = None
         shared_reel_id: Optional[str] = None
+        audio_url: Optional[str] = None
+        audio_duration: Optional[int] = None
 
     class TypingIn(BaseModel):
         to_user_id: str; is_typing: bool = True
@@ -1418,6 +1420,30 @@ postbluom.online"""
             raise HTTPException(502, "Image upload failed. Please try again.")
         return {"url": result.get("secure_url")}
 
+    @api.post("/upload/audio")
+    async def upload_audio(file: UploadFile = File(...), u=Depends(current_user)):
+        """Upload a voice/audio recording to Cloudinary and return its URL."""
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Audio hosting is not configured on the server")
+        ct = (file.content_type or "").split(";")[0].strip()
+        if ct and not ct.startswith("audio/") and ct not in ("application/octet-stream",):
+            raise HTTPException(400, "Please upload a valid audio file")
+        raw = await file.read()
+        if len(raw) > 25 * 1024 * 1024:
+            raise HTTPException(400, "Audio is too large. Max 25MB.")
+        try:
+            result = cloudinary.uploader.upload(
+                raw,
+                resource_type="video",   # Cloudinary uses "video" resource_type for audio files
+                folder="post-app/audio",
+                public_id=f"{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception:
+            logging.exception("Cloudinary audio upload failed")
+            raise HTTPException(502, "Audio upload failed. Please try again.")
+        return {"url": result.get("secure_url"), "duration": int(result.get("duration") or 0)}
+
     @api.post("/upload/video")
     async def upload_video(
         file: UploadFile = File(...),
@@ -2108,7 +2134,7 @@ postbluom.online"""
     @api.post("/messages")
     async def send_message(p: MessageIn, u=Depends(current_user)):
         """Save message to DB, then push to receiver via WebSocket if online."""
-        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id:
+        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id and not p.audio_url:
             raise HTTPException(400, "Message cannot be empty")
         recipient = await db.users.find_one({"id": p.to_user_id})
         if not recipient:
@@ -2213,6 +2239,8 @@ postbluom.online"""
             "reply_to_preview": reply_to_preview,
             "shared_post":      shared_post,
             "shared_reel":      shared_reel,
+            "audio_url":        p.audio_url or None,
+            "audio_duration":   p.audio_duration or None,
         }
         await db.messages.insert_one(m.copy())
         m.pop("_id", None)
@@ -2311,7 +2339,7 @@ postbluom.online"""
                 raise HTTPException(403, "Only sender can delete for everyone")
             await db.messages.update_one(
                 {"id": msg_id},
-                {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None}}
+                {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None, "audio_url": None}}
             )
         else:
             await db.messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
@@ -3276,6 +3304,8 @@ postbluom.online"""
         shared_post_id: Optional[str] = None
         shared_reel_id: Optional[str] = None
         reply_to_id: Optional[str] = None
+        audio_url: Optional[str] = None
+        audio_duration: Optional[int] = None
 
     @api.post("/groups")
     async def create_group(p: GroupIn, u=Depends(current_user)):
@@ -3414,7 +3444,7 @@ postbluom.online"""
         g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "name": 1})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
-        if not p.text.strip() and not p.photo_url and not p.shared_post_id and not p.shared_reel_id:
+        if not p.text.strip() and not p.photo_url and not p.shared_post_id and not p.shared_reel_id and not p.audio_url:
             raise HTTPException(400, "Message cannot be empty")
         reply_to_preview = None
         if p.reply_to_id:
@@ -3431,12 +3461,13 @@ postbluom.online"""
             "from_id": u["id"], "from_name": u["name"], "from_handle": u["handle"],
             "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"),
             "text": p.text.strip(), "photo_url": p.photo_url,
+            "audio_url": p.audio_url or None, "audio_duration": p.audio_duration or None,
             "reply_to_preview": reply_to_preview, "shared_post": shared_post,
             "seen_by": [u["id"]], "reactions": {}, "deleted_for": [], "created_at": now().isoformat(),
         }
         await db.group_messages.insert_one(doc.copy())
         doc.pop("_id", None)
-        last_text = p.text.strip() or ("📷 Photo" if p.photo_url else ("📎 Post" if p.shared_post_id else ""))
+        last_text = p.text.strip() or ("🎤 Voice" if p.audio_url else ("📷 Photo" if p.photo_url else ("📎 Post" if p.shared_post_id else "")))
         await db.groups.update_one({"id": group_id}, {"$set": {"last_message": last_text, "last_message_at": now().isoformat(), "last_from_name": u["name"]}})
         for mid in [m for m in g.get("members", []) if m != u["id"]]:
             await db.notifications.insert_one({"id": str(uuid.uuid4()), "user_id": mid, "type": "group_message", "from_id": u["id"], "from_name": u["name"], "group_id": group_id, "group_name": g.get("name","Group"), "message": last_text[:80], "read": False, "created_at": now().isoformat()})
@@ -3510,7 +3541,7 @@ postbluom.online"""
         msg = await db.group_messages.find_one({"id": msg_id, "group_id": group_id})
         if not msg: raise HTTPException(404, "Message not found")
         if body.get("delete_for") == "everyone" and msg["from_id"] == u["id"]:
-            await db.group_messages.update_one({"id": msg_id}, {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None}})
+            await db.group_messages.update_one({"id": msg_id}, {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None, "audio_url": None}})
         else:
             await db.group_messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
         return {"ok": True}
