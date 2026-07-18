@@ -2293,9 +2293,12 @@ postbluom.online"""
             ]}
         else:
             q = {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]}
-        msgs  = await db.messages.find(q, {"_id": 0}).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
-        total = await db.messages.count_documents(q)
-        msgs  = [m for m in msgs if u["id"] not in m.get("deleted_for", []) and not m.get("deleted_for_everyone")]
+        # Filter deleted messages at MongoDB level so skip/limit work on already-filtered results.
+        # This is the critical fix: previously, skip/limit ran first then Python filtered,
+        # meaning cleared messages could re-appear when the conversation was re-opened.
+        fq = {**q, "deleted_for": {"$ne": u["id"]}, "deleted_for_everyone": {"$ne": True}}
+        msgs  = await db.messages.find(fq, {"_id": 0}).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
+        total = await db.messages.count_documents(fq)
         return {"messages": msgs, "total": total, "skip": skip, "limit": limit}
 
     @api.delete("/messages/{msg_id}")
