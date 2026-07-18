@@ -3292,6 +3292,7 @@ postbluom.online"""
     class GroupMessageIn(BaseModel):
         text: str = ""
         photo_url: Optional[str] = None
+        audio_url: Optional[str] = None          # voice message
         shared_post_id: Optional[str] = None
         shared_reel_id: Optional[str] = None
         reply_to_id: Optional[str] = None
@@ -3406,7 +3407,7 @@ postbluom.online"""
         g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "name": 1})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
-        if not p.text.strip() and not p.photo_url and not p.shared_post_id and not p.shared_reel_id:
+        if not p.text.strip() and not p.photo_url and not p.audio_url and not p.shared_post_id and not p.shared_reel_id:
             raise HTTPException(400, "Message cannot be empty")
         reply_to_preview = None
         if p.reply_to_id:
@@ -3422,13 +3423,13 @@ postbluom.online"""
             "id": str(uuid.uuid4()), "group_id": group_id,
             "from_id": u["id"], "from_name": u["name"], "from_handle": u["handle"],
             "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"),
-            "text": p.text.strip(), "photo_url": p.photo_url,
+            "text": p.text.strip(), "photo_url": p.photo_url, "audio_url": p.audio_url,
             "reply_to_preview": reply_to_preview, "shared_post": shared_post,
             "seen_by": [u["id"]], "reactions": {}, "deleted_for": [], "created_at": now().isoformat(),
         }
         await db.group_messages.insert_one(doc.copy())
         doc.pop("_id", None)
-        last_text = p.text.strip() or ("📷 Photo" if p.photo_url else ("📎 Post" if p.shared_post_id else ""))
+        last_text = p.text.strip() or ("📷 Photo" if p.photo_url else ("🎤 Voice" if p.audio_url else ("📎 Post" if p.shared_post_id else "")))
         await db.groups.update_one({"id": group_id}, {"$set": {"last_message": last_text, "last_message_at": now().isoformat(), "last_from_name": u["name"]}})
         for mid in [m for m in g.get("members", []) if m != u["id"]]:
             await db.notifications.insert_one({"id": str(uuid.uuid4()), "user_id": mid, "type": "group_message", "from_id": u["id"], "from_name": u["name"], "group_id": group_id, "group_name": g.get("name","Group"), "message": last_text[:80], "read": False, "created_at": now().isoformat()})
