@@ -610,6 +610,8 @@ postbluom.online"""
         alt_text: Optional[str] = None                # accessibility alt text for media
         gif_url: Optional[str] = None                  # Giphy GIF URL
         sticker_overlays: Optional[List[dict]] = None  # [{id, url, x, y}] Giphy stickers placed on media
+        video_width: Optional[int] = None              # natural px width of video (captured at pick time from browser)
+        video_height: Optional[int] = None             # natural px height of video
 
     class CommentIn(BaseModel):
         text: str
@@ -1508,6 +1510,8 @@ postbluom.online"""
             "url": result.get("secure_url"),
             "duration": result.get("duration"),
             "bytes": result.get("bytes"),
+            "video_width": result.get("width"),    # natural video width (px) from Cloudinary
+            "video_height": result.get("height"),  # natural video height (px) from Cloudinary
         }
 
     # ── One-time migration: move old base64 videos to Cloudinary ────
@@ -1599,7 +1603,12 @@ postbluom.online"""
             "comments_enabled": False if p.audience == "only_me" else (p.comments_enabled if p.comments_enabled is not None else True),
             "photo_width": p.photo_width or None,
             "photo_height": p.photo_height or None,
-            "aspect_ratio": p.aspect_ratio or (round(p.photo_width/p.photo_height,4) if p.photo_width and p.photo_height else None),
+            "video_width": p.video_width or None,
+            "video_height": p.video_height or None,
+            "aspect_ratio": p.aspect_ratio or (
+                round(p.video_width / p.video_height, 4) if (has_video and p.video_width and p.video_height) else
+                round(p.photo_width / p.photo_height, 4) if (p.photo_width and p.photo_height) else None
+            ),
             "is_badge_verified": bool(u.get("is_badge_verified")),
             "verified_category": u.get("verified_category") or None,
             "music_title": p.music_title or None,
