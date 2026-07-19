@@ -608,6 +608,8 @@ postbluom.online"""
         music_preview_url: Optional[str] = None       # 30-sec preview URL from iTunes
         music_duration_ms: Optional[int] = None       # track duration in ms
         alt_text: Optional[str] = None                # accessibility alt text for media
+        gif_url: Optional[str] = None                  # Giphy GIF URL
+        sticker_overlays: Optional[List[dict]] = None  # [{id, url, x, y}] Giphy stickers placed on media
 
     class CommentIn(BaseModel):
         text: str
@@ -1606,6 +1608,8 @@ postbluom.online"""
             "music_preview_url": p.music_preview_url or None,
             "music_duration_ms": p.music_duration_ms or None,
             "alt_text": (p.alt_text or "")[:1000] or None,
+            "gif_url": (p.gif_url or "").strip() or None,
+            "sticker_overlays": [{"id": s["id"], "url": s["url"], "x": float(s.get("x", 50)), "y": float(s.get("y", 50))} for s in (p.sticker_overlays or []) if s.get("url")][:10],
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
         }
@@ -3671,6 +3675,37 @@ postbluom.online"""
             for g in data.get("data", [])
         ]
         return {"gifs": gifs}
+
+    # ── Stickers proxy (Giphy) ────────────────────────────────────────────────
+    @api.get("/stickers")
+    async def sticker_proxy(q: str = "", limit: int = 30):
+        GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "")
+        if not GIPHY_KEY:
+            raise HTTPException(500, "GIPHY_API_KEY not configured")
+        if q.strip():
+            url = (
+                "https://api.giphy.com/v1/stickers/search"
+                f"?api_key={GIPHY_KEY}&q={urllib.parse.quote(q)}&limit={limit}&rating=pg"
+            )
+        else:
+            url = (
+                "https://api.giphy.com/v1/stickers/trending"
+                f"?api_key={GIPHY_KEY}&limit={limit}&rating=pg"
+            )
+        req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read())
+        stickers = [
+            {
+                "id": g["id"],
+                "title": g.get("title", ""),
+                "preview": g["images"].get("fixed_width_small", {}).get("url") or g["images"]["fixed_width"]["url"],
+                "full": g["images"]["fixed_width"]["url"],
+            }
+            for g in data.get("data", [])
+            if g.get("images", {}).get("fixed_width")
+        ]
+        return {"stickers": stickers}
 
     # Register all routes
     app.include_router(api)
