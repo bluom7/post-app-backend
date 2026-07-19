@@ -607,6 +607,7 @@ postbluom.online"""
         music_artwork: Optional[str] = None           # 100x100 artwork URL
         music_preview_url: Optional[str] = None       # 30-sec preview URL from iTunes
         music_duration_ms: Optional[int] = None       # track duration in ms
+        alt_text: Optional[str] = None                # accessibility alt text for media
 
     class CommentIn(BaseModel):
         text: str
@@ -1604,6 +1605,7 @@ postbluom.online"""
             "music_artwork": p.music_artwork or None,
             "music_preview_url": p.music_preview_url or None,
             "music_duration_ms": p.music_duration_ms or None,
+            "alt_text": (p.alt_text or "")[:1000] or None,
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
         }
