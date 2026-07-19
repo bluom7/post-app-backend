@@ -3157,10 +3157,16 @@ postbluom.online"""
 
     @api.post("/reels")
     async def create_reel(body: dict, u=Depends(current_user)):
-        video_url   = (body.get("video_url") or "").strip()
-        caption     = (body.get("caption") or "").strip()
-        audio_label = (body.get("audio_label") or "Original Audio").strip()
-        duration    = int(body.get("duration") or 0)
+        video_url      = (body.get("video_url") or "").strip()
+        caption        = (body.get("caption") or "").strip()
+        audio_label    = (body.get("audio_label") or "Original Audio").strip()
+        duration       = int(body.get("duration") or 0)
+        location       = (body.get("location") or "").strip() or None
+        tagged_users   = [h.lstrip("@") for h in (body.get("tagged_users") or []) if h][:20]
+        audience       = (body.get("audience") or "public").strip()
+        audience_users = [h.lstrip("@") for h in (body.get("audience_users") or []) if h][:100]
+        if audience not in ("public", "friends", "only_show", "only_me"):
+            audience = "public"
         if not video_url:
             raise HTTPException(400, "video_url is required")
         if duration < 1 or duration > MAX_POST_VIDEO_SECONDS:
@@ -3178,6 +3184,10 @@ postbluom.online"""
             "caption":           caption,
             "audio_label":       audio_label,
             "duration":          duration,
+            "location":          location,
+            "tagged_users":      tagged_users,
+            "audience":          audience,
+            "audience_users":    audience_users if audience == "only_show" else [],
             "likes":             [],
             "saves":             [],
             "comments":          [],
