@@ -3662,30 +3662,25 @@ postbluom.online"""
     # ── GIF proxy (Giphy) ─────────────────────────────────────────────────────
     @api.get("/gifs")
     async def gif_proxy(q: str = "", limit: int = 30):
-        import urllib.error as _uerr
+        import httpx
         GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
         if not GIPHY_KEY:
-            return {"gifs": [], "error": "GIPHY_API_KEY not configured"}
+            return {"gifs": [], "error": "GIPHY_API_KEY not configured on server"}
+        params = {"api_key": GIPHY_KEY, "limit": limit, "rating": "pg"}
         if q.strip():
-            url = (
-                "https://api.giphy.com/v1/gifs/search"
-                f"?api_key={GIPHY_KEY}&q={urllib.parse.quote(q)}&limit={limit}&rating=pg"
-            )
+            endpoint = "https://api.giphy.com/v1/gifs/search"
+            params["q"] = q.strip()
         else:
-            url = (
-                "https://api.giphy.com/v1/gifs/trending"
-                f"?api_key={GIPHY_KEY}&limit={limit}&rating=pg"
-            )
+            endpoint = "https://api.giphy.com/v1/gifs/trending"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read())
-        except _uerr.HTTPError as e:
-            body = ""
-            try: body = e.read().decode("utf-8", errors="replace")[:300]
-            except Exception: pass
-            logging.error(f"Giphy /gifs HTTP {e.code}: {body}")
-            return {"gifs": [], "error": f"Giphy error {e.code}: {body}"}
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(endpoint, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300]
+            logging.error(f"Giphy /gifs HTTP {e.response.status_code}: {body}")
+            return {"gifs": [], "error": f"Giphy error {e.response.status_code}: {body}"}
         except Exception as e:
             logging.error(f"Giphy /gifs fetch failed: {e}")
             return {"gifs": [], "error": str(e)}
@@ -3704,30 +3699,25 @@ postbluom.online"""
     # ── Stickers proxy (Giphy) ────────────────────────────────────────────────
     @api.get("/stickers")
     async def sticker_proxy(q: str = "", limit: int = 30):
-        import urllib.error as _uerr
+        import httpx
         GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
         if not GIPHY_KEY:
-            return {"stickers": [], "error": "GIPHY_API_KEY not configured"}
+            return {"stickers": [], "error": "GIPHY_API_KEY not configured on server"}
+        params = {"api_key": GIPHY_KEY, "limit": limit, "rating": "pg"}
         if q.strip():
-            url = (
-                "https://api.giphy.com/v1/stickers/search"
-                f"?api_key={GIPHY_KEY}&q={urllib.parse.quote(q)}&limit={limit}&rating=pg"
-            )
+            endpoint = "https://api.giphy.com/v1/stickers/search"
+            params["q"] = q.strip()
         else:
-            url = (
-                "https://api.giphy.com/v1/stickers/trending"
-                f"?api_key={GIPHY_KEY}&limit={limit}&rating=pg"
-            )
+            endpoint = "https://api.giphy.com/v1/stickers/trending"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read())
-        except _uerr.HTTPError as e:
-            body = ""
-            try: body = e.read().decode("utf-8", errors="replace")[:300]
-            except Exception: pass
-            logging.error(f"Giphy /stickers HTTP {e.code}: {body}")
-            return {"stickers": [], "error": f"Giphy error {e.code}: {body}"}
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(endpoint, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300]
+            logging.error(f"Giphy /stickers HTTP {e.response.status_code}: {body}")
+            return {"stickers": [], "error": f"Giphy error {e.response.status_code}: {body}"}
         except Exception as e:
             logging.error(f"Giphy /stickers fetch failed: {e}")
             return {"stickers": [], "error": str(e)}
