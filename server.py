@@ -3662,9 +3662,10 @@ postbluom.online"""
     # ── GIF proxy (Giphy) ─────────────────────────────────────────────────────
     @api.get("/gifs")
     async def gif_proxy(q: str = "", limit: int = 30):
-        GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "")
+        import urllib.error as _uerr
+        GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
         if not GIPHY_KEY:
-            raise HTTPException(500, "GIPHY_API_KEY not configured")
+            return {"gifs": [], "error": "GIPHY_API_KEY not configured"}
         if q.strip():
             url = (
                 "https://api.giphy.com/v1/gifs/search"
@@ -3675,26 +3676,38 @@ postbluom.online"""
                 "https://api.giphy.com/v1/gifs/trending"
                 f"?api_key={GIPHY_KEY}&limit={limit}&rating=pg"
             )
-        req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = _json.loads(resp.read())
-        gifs = [
-            {
-                "id": g["id"],
-                "title": g.get("title", ""),
-                "preview": g["images"]["fixed_width_small"]["url"],
-                "full": g["images"]["fixed_width"]["url"],
-            }
-            for g in data.get("data", [])
-        ]
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+        except _uerr.HTTPError as e:
+            body = ""
+            try: body = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception: pass
+            logging.error(f"Giphy /gifs HTTP {e.code}: {body}")
+            return {"gifs": [], "error": f"Giphy error {e.code}: {body}"}
+        except Exception as e:
+            logging.error(f"Giphy /gifs fetch failed: {e}")
+            return {"gifs": [], "error": str(e)}
+        gifs = []
+        for g in data.get("data", []):
+            try:
+                imgs = g.get("images", {})
+                preview = (imgs.get("fixed_width_small") or imgs.get("fixed_width") or {}).get("url", "")
+                full = (imgs.get("fixed_width") or {}).get("url", "")
+                if full:
+                    gifs.append({"id": g["id"], "title": g.get("title", ""), "preview": preview or full, "full": full})
+            except Exception:
+                pass
         return {"gifs": gifs}
 
     # ── Stickers proxy (Giphy) ────────────────────────────────────────────────
     @api.get("/stickers")
     async def sticker_proxy(q: str = "", limit: int = 30):
-        GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "")
+        import urllib.error as _uerr
+        GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
         if not GIPHY_KEY:
-            raise HTTPException(500, "GIPHY_API_KEY not configured")
+            return {"stickers": [], "error": "GIPHY_API_KEY not configured"}
         if q.strip():
             url = (
                 "https://api.giphy.com/v1/stickers/search"
@@ -3705,19 +3718,29 @@ postbluom.online"""
                 "https://api.giphy.com/v1/stickers/trending"
                 f"?api_key={GIPHY_KEY}&limit={limit}&rating=pg"
             )
-        req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = _json.loads(resp.read())
-        stickers = [
-            {
-                "id": g["id"],
-                "title": g.get("title", ""),
-                "preview": g["images"].get("fixed_width_small", {}).get("url") or g["images"]["fixed_width"]["url"],
-                "full": g["images"]["fixed_width"]["url"],
-            }
-            for g in data.get("data", [])
-            if g.get("images", {}).get("fixed_width")
-        ]
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+        except _uerr.HTTPError as e:
+            body = ""
+            try: body = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception: pass
+            logging.error(f"Giphy /stickers HTTP {e.code}: {body}")
+            return {"stickers": [], "error": f"Giphy error {e.code}: {body}"}
+        except Exception as e:
+            logging.error(f"Giphy /stickers fetch failed: {e}")
+            return {"stickers": [], "error": str(e)}
+        stickers = []
+        for g in data.get("data", []):
+            try:
+                imgs = g.get("images", {})
+                preview = (imgs.get("fixed_width_small") or imgs.get("fixed_width") or {}).get("url", "")
+                full = (imgs.get("fixed_width") or {}).get("url", "")
+                if full:
+                    stickers.append({"id": g["id"], "title": g.get("title", ""), "preview": preview or full, "full": full})
+            except Exception:
+                pass
         return {"stickers": stickers}
 
     # Register all routes
