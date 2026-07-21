@@ -3183,6 +3183,7 @@ postbluom.online"""
         tagged_users   = [h.lstrip("@") for h in (body.get("tagged_users") or []) if h][:20]
         audience       = (body.get("audience") or "public").strip()
         audience_users = [h.lstrip("@") for h in (body.get("audience_users") or []) if h][:100]
+        sticker_overlays = [{"id": s["id"], "url": s["url"], "xPct": float(s.get("xPct", 50)), "yPct": float(s.get("yPct", 50))} for s in (body.get("sticker_overlays") or []) if s.get("url")][:10]
         if audience not in ("public", "friends", "only_show", "only_me"):
             audience = "public"
         is_photo_reel  = bool(photo_url) and not video_url
@@ -3214,6 +3215,7 @@ postbluom.online"""
             "comment_count":     0,
             "view_count":        0,
             "created_at":        now().isoformat(),
+            "sticker_overlays":  sticker_overlays,
         }
         await db.reels.insert_one(doc.copy())
         doc.pop("_id", None)
