@@ -3175,6 +3175,7 @@ postbluom.online"""
     @api.post("/reels")
     async def create_reel(body: dict, u=Depends(current_user)):
         video_url      = (body.get("video_url") or "").strip()
+        photo_url      = (body.get("photo_url") or "").strip()
         caption        = (body.get("caption") or "").strip()
         audio_label    = (body.get("audio_label") or "Original Audio").strip()
         duration       = int(body.get("duration") or 0)
@@ -3184,10 +3185,11 @@ postbluom.online"""
         audience_users = [h.lstrip("@") for h in (body.get("audience_users") or []) if h][:100]
         if audience not in ("public", "friends", "only_show", "only_me"):
             audience = "public"
-        if not video_url:
-            raise HTTPException(400, "video_url is required")
-        if duration < 1 or duration > MAX_POST_VIDEO_SECONDS:
-            raise HTTPException(400, f"Reel must be 1\u2013{MAX_POST_VIDEO_SECONDS} seconds")
+        is_photo_reel  = bool(photo_url) and not video_url
+        if not video_url and not photo_url:
+            raise HTTPException(400, "video_url or photo_url is required")
+        if not is_photo_reel and (duration < 1 or duration > MAX_POST_VIDEO_SECONDS):
+            raise HTTPException(400, f"Reel must be 1–{MAX_POST_VIDEO_SECONDS} seconds")
         doc = {
             "id":                str(uuid.uuid4()),
             "user_id":           u["id"],
@@ -3197,10 +3199,11 @@ postbluom.online"""
             "avatar_letter":     u["avatar_letter"],
             "avatar_photo":      u.get("avatar_photo"),
             "is_badge_verified": bool(u.get("is_badge_verified")),
-            "video_url":         video_url,
+            "video_url":         video_url if not is_photo_reel else None,
+            "photo_url":         photo_url if is_photo_reel else None,
             "caption":           caption,
             "audio_label":       audio_label,
-            "duration":          duration,
+            "duration":          duration if not is_photo_reel else 0,
             "location":          location,
             "tagged_users":      tagged_users,
             "audience":          audience,
