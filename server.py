@@ -3184,6 +3184,9 @@ postbluom.online"""
         audience       = (body.get("audience") or "public").strip()
         audience_users = [h.lstrip("@") for h in (body.get("audience_users") or []) if h][:100]
         sticker_overlays = [{"id": s["id"], "url": s["url"], "xPct": float(s.get("xPct", 50)), "yPct": float(s.get("yPct", 50))} for s in (body.get("sticker_overlays") or []) if s.get("url")][:10]
+        text_overlays    = [{"id": t.get("id",""), "text": str(t.get("text",""))[:500], "xPct": float(t.get("xPct",50)), "yPct": float(t.get("yPct",50)), "color": str(t.get("color","#ffffff"))[:30], "size": int(t.get("size",22)), "font": str(t.get("font","Classic"))[:30]} for t in (body.get("text_overlays") or []) if t.get("text")][:20]
+        emoji_overlays   = [{"id": e.get("id",""), "emoji": str(e.get("emoji",""))[:8], "xPct": float(e.get("xPct",50)), "yPct": float(e.get("yPct",50)), "size": int(e.get("size",64))} for e in (body.get("emoji_overlays") or []) if e.get("emoji")][:20]
+        video_effect     = (body.get("video_effect") or "none").strip()[:20]
         if audience not in ("public", "friends", "only_show", "only_me"):
             audience = "public"
         is_photo_reel  = bool(photo_url) and not video_url
@@ -3216,6 +3219,9 @@ postbluom.online"""
             "view_count":        0,
             "created_at":        now().isoformat(),
             "sticker_overlays":  sticker_overlays,
+            "text_overlays":     text_overlays,
+            "emoji_overlays":    emoji_overlays,
+            "video_effect":      video_effect,
         }
         await db.reels.insert_one(doc.copy())
         doc.pop("_id", None)
