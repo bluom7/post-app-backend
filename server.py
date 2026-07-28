@@ -1667,7 +1667,12 @@ postbluom.online"""
             "edited_at": None,
             "is_pinned": False,
             "is_reel": True,
-            "audio_label": r.get("audio_label"),
+            "audio_label":      r.get("audio_label"),
+            "music_url":        r.get("music_url"),
+            "music_start_time": r.get("music_start_time") or 0,
+            "music_title":      r.get("music_title"),
+            "music_artist":     r.get("music_artist"),
+            "music_artwork":    r.get("music_artwork"),
         }
 
     @api.get("/posts")
@@ -3187,6 +3192,11 @@ postbluom.online"""
         text_overlays    = [{"id": t.get("id",""), "text": str(t.get("text",""))[:500], "xPct": float(t.get("xPct",50)), "yPct": float(t.get("yPct",50)), "color": str(t.get("color","#ffffff"))[:30], "size": int(t.get("size",22)), "font": str(t.get("font","Classic"))[:30], "bgColor": str(t.get("bgColor","transparent"))[:30]} for t in (body.get("text_overlays") or []) if t.get("text")][:20]
         emoji_overlays   = [{"id": e.get("id",""), "emoji": str(e.get("emoji",""))[:8], "xPct": float(e.get("xPct",50)), "yPct": float(e.get("yPct",50)), "size": int(e.get("size",64))} for e in (body.get("emoji_overlays") or []) if e.get("emoji")][:20]
         video_effect     = (body.get("video_effect") or "none").strip()[:20]
+        music_url        = (body.get("music_url") or "").strip() or None
+        music_start_time = float(body.get("music_start_time") or 0)
+        music_title      = (body.get("music_title") or "").strip() or None
+        music_artist     = (body.get("music_artist") or "").strip() or None
+        music_artwork    = (body.get("music_artwork") or "").strip() or None
         if audience not in ("public", "friends", "only_show", "only_me"):
             audience = "public"
         is_photo_reel  = bool(photo_url) and not video_url
@@ -3222,6 +3232,11 @@ postbluom.online"""
             "text_overlays":     text_overlays,
             "emoji_overlays":    emoji_overlays,
             "video_effect":      video_effect,
+            "music_url":         music_url,
+            "music_start_time":  music_start_time,
+            "music_title":       music_title,
+            "music_artist":      music_artist,
+            "music_artwork":     music_artwork,
         }
         await db.reels.insert_one(doc.copy())
         doc.pop("_id", None)
