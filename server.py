@@ -1651,11 +1651,16 @@ postbluom.online"""
             "content": r.get("caption") or "",
             "accent": None,
             "location": None,
-            "photo_url": None,
-            "photo_urls": None,
+            # photo reels: pass photo_url so the home-feed card can render it.
+            # video reels: keep photo_url null (video_url is the media).
+            "photo_url":  (r.get("photo_url") if not r.get("video_url") else None),
+            "photo_urls": ([r["photo_url"]] if r.get("photo_url") and not r.get("video_url") else None),
             "video_url": r.get("video_url"),
             "video_duration": r.get("duration"),
-            "photo_width": None, "photo_height": None, "aspect_ratio": 9/16,
+            "photo_width": None, "photo_height": None,
+            # aspect_ratio: only meaningful for video reels (default 9/16).
+            # For photo reels leave None — frontend uses natural img dimensions.
+            "aspect_ratio": (9/16 if r.get("video_url") else None),
             "audience": "public",
             "comments_enabled": True,
             "likes": [{"user_id": uid, "color": "#FF3B30"} for uid in likes_ids],
@@ -1673,6 +1678,12 @@ postbluom.online"""
             "music_title":      r.get("music_title"),
             "music_artist":     r.get("music_artist"),
             "music_artwork":    r.get("music_artwork"),
+            # Editing overlays — must be forwarded so the home-feed card renders
+            # stickers, text, emoji and filter identically to the full-screen viewer.
+            "sticker_overlays": r.get("sticker_overlays") or [],
+            "text_overlays":    r.get("text_overlays")    or [],
+            "emoji_overlays":   r.get("emoji_overlays")   or [],
+            "video_effect":     r.get("video_effect"),
         }
 
     @api.get("/posts")
