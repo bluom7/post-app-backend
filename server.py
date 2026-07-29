@@ -3356,6 +3356,17 @@ postbluom.online"""
         await db.reels.delete_one({"id": reel_id})
         return {"ok": True}
 
+    @api.post("/reels/{reel_id}/report")
+    async def report_reel(reel_id: str, body: dict, u=Depends(current_user)):
+        reason = (body.get("reason") or "").strip()
+        if not reason: raise HTTPException(400, "Reason required")
+        reel = await db.reels.find_one({"id": reel_id})
+        if not reel: raise HTTPException(404, "Reel not found")
+        already = await db.reports.find_one({"reel_id": reel_id, "reported_by": u["id"]})
+        if already: return {"ok": True, "already": True}
+        await db.reports.insert_one({"id": str(uuid.uuid4()), "reel_id": reel_id, "reported_by": u["id"], "reported_user_id": reel.get("user_id"), "reason": reason, "created_at": now().isoformat(), "status": "pending", "type": "reel"})
+        return {"ok": True}
+
 
     # ── Group Chat ─────────────────────────────────────────────────
     class GroupIn(BaseModel):
