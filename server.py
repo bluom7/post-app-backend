@@ -3314,7 +3314,7 @@ postbluom.online"""
                     age_hours = 0
             except Exception:
                 age_hours = 0
-            views    = len(r.get("views", [])) if isinstance(r.get("views"), list) else int(r.get("view_count") or 0)
+            _va=r.get("views",[]); views=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
             likes    = len(r.get("likes", []))
             comments = int(r.get("comment_count") or 0)
             return views * 1 + likes * 3 + comments * 5 - age_hours * 0.5
@@ -3328,7 +3328,7 @@ postbluom.online"""
             r["like_count"]   = len(likes)
             r["is_saved"]     = u["id"] in saves
             r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
-            r["view_count"]   = len(r.get("views", [])) if isinstance(r.get("views"), list) else int(r.get("view_count") or 0)
+            _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
             r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
         return {"reels": page, "has_more": (skip + limit) < len(reels_raw), "skip": skip, "limit": limit}
 
@@ -3337,7 +3337,7 @@ postbluom.online"""
         reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        await db.reels.update_one({"id": reel_id}, {"$inc": {"view_count": 1}})
+        await db.reels.update_one({"id": reel_id}, {"$addToSet": {"views": u["id"]}, "$inc": {"view_count": 1}})
         return {"ok": True}
 
     @api.get("/search")
@@ -3376,7 +3376,7 @@ postbluom.online"""
                 r["like_count"]   = len(likes)
                 r["is_saved"]     = u["id"] in saves
                 r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
-                r["view_count"]   = len(r.get("views", [])) if isinstance(r.get("views"), list) else int(r.get("view_count") or 0)
+                _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
                 r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
             results["reels"] = reels_found
 
