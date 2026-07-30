@@ -26,7 +26,7 @@ try:
 
     load_dotenv()
 
-    MONGO_URL      = os.environ["MONGO_URL"]
+    MONGO_URL      = os.environ["MONGO_URL"].strip()
     DB_NAME        = os.environ.get("DB_NAME", "postapp")
     JWT_SECRET     = os.environ.get("JWT_SECRET", "change-me-in-production")
 
