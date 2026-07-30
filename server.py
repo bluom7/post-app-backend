@@ -3279,6 +3279,141 @@ postbluom.online"""
             r.pop("comments", None)
         return {"reels": reels_list, "has_more": len(reels_list) == limit, "skip": skip, "limit": limit}
 
+
+    @api.get("/reels/discover")
+    async def discover_reels(
+        skip: int = 0,
+        limit: int = 21,
+        category: Optional[str] = None,
+        u=Depends(current_user),
+    ):
+        """Paginated discovery grid sorted by trending score (views*1 + likes*3 + comments*5 - age_decay)."""
+        import math as _math
+        blocked = u.get("blocked", [])
+        muted   = u.get("muted", [])
+        excluded = list(set(blocked + muted))
+        query = {}
+        if excluded:
+            query["user_id"] = {"$nin": excluded}
+        if category and category.lower() != "all":
+            query["category"] = {"$regex": category, "$options": "i"}
+        pool_limit = min(limit * 6, 300)
+        reels_raw = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(0).limit(pool_limit).to_list(pool_limit)
+        def _score(r):
+            try:
+                created = r.get("created_at", "")
+                if created:
+                    from datetime import datetime, timezone as _tz
+                    if isinstance(created, str):
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    else:
+                        dt = created
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=__import__("datetime").timezone.utc)
+                    age_hours = max(0, (datetime.now(__import__("datetime").timezone.utc) - dt).total_seconds() / 3600)
+                else:
+                    age_hours = 0
+            except Exception:
+                age_hours = 0
+            views    = len(r.get("views", [])) if isinstance(r.get("views"), list) else int(r.get("view_count") or 0)
+            likes    = len(r.get("likes", []))
+            comments = int(r.get("comment_count") or 0)
+            return views * 1 + likes * 3 + comments * 5 - age_hours * 0.5
+        reels_raw.sort(key=_score, reverse=True)
+        page = reels_raw[skip: skip + limit]
+        following_ids = set(u.get("following", []))
+        for r in page:
+            likes = r.get("likes", [])
+            saves = r.get("saves", [])
+            r["is_liked"]     = u["id"] in likes
+            r["like_count"]   = len(likes)
+            r["is_saved"]     = u["id"] in saves
+            r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
+            r["view_count"]   = len(r.get("views", [])) if isinstance(r.get("views"), list) else int(r.get("view_count") or 0)
+            r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
+        return {"reels": page, "has_more": (skip + limit) < len(reels_raw), "skip": skip, "limit": limit}
+
+    @api.post("/reels/{reel_id}/view")
+    async def view_reel(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        await db.reels.update_one(
+            {"id": reel_id},
+            [{"$set": {"view_count": {"$add": [{"$ifNull": ["$view_count", 0]}, 1]}}}]
+        )
+        return {"ok": True}
+
+    @api.get("/search")
+    async def unified_search(
+        q: str = "",
+        type: str = "all",
+        skip: int = 0,
+        limit: int = 20,
+        u=Depends(current_user),
+    ):
+        """Unified search: reels (by caption/hashtag/audio), users, hashtags."""
+        q = q.strip()
+        if not q:
+            return {"reels": [], "users": [], "hashtags": []}
+        blocked  = u.get("blocked", [])
+        muted    = u.get("muted", [])
+        excluded = list(set(blocked + muted))
+        search_type = type.lower()
+        results = {"reels": [], "users": [], "hashtags": []}
+
+        if search_type in ("all", "reels"):
+            reel_q = {"$or": [
+                {"caption": {"$regex": q, "$options": "i"}},
+                {"hashtags": {"$regex": q, "$options": "i"}},
+                {"audio_label": {"$regex": q, "$options": "i"}},
+                {"category": {"$regex": q, "$options": "i"}},
+            ]}
+            if excluded:
+                reel_q["user_id"] = {"$nin": excluded}
+            reels_found = await db.reels.find(reel_q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+            following_ids = set(u.get("following", []))
+            for r in reels_found:
+                likes = r.get("likes", [])
+                saves = r.get("saves", [])
+                r["is_liked"]     = u["id"] in likes
+                r["like_count"]   = len(likes)
+                r["is_saved"]     = u["id"] in saves
+                r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
+                r["view_count"]   = len(r.get("views", [])) if isinstance(r.get("views"), list) else int(r.get("view_count") or 0)
+                r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
+            results["reels"] = reels_found
+
+        if search_type in ("all", "users"):
+            user_q = {
+                "$or": [
+                    {"handle": {"$regex": q, "$options": "i"}},
+                    {"name": {"$regex": q, "$options": "i"}},
+                ],
+                "is_deleted": {"$ne": True},
+            }
+            if excluded:
+                user_q["id"] = {"$nin": excluded}
+            users_found = await db.users.find(user_q, {"_id": 0, "password": 0, "email": 0, "phone": 0}).limit(limit).to_list(limit)
+            following_ids = set(u.get("following", []))
+            for usr in users_found:
+                usr["is_following"] = usr["id"] in following_ids
+            results["users"] = users_found
+
+        if search_type in ("all", "hashtags"):
+            pipeline = [
+                {"$match": {"hashtags": {"$exists": True, "$not": {"$size": 0}}}},
+                {"$unwind": "$hashtags"},
+                {"$match": {"hashtags": {"$regex": q, "$options": "i"}}},
+                {"$group": {"_id": "$hashtags", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+                {"$limit": 20},
+                {"$project": {"_id": 0, "tag": "$_id", "count": 1}},
+            ]
+            results["hashtags"] = await db.reels.aggregate(pipeline).to_list(20)
+
+        return results
+
     @api.post("/reels/{reel_id}/like")
     async def like_reel(reel_id: str, u=Depends(current_user)):
         reel = await db.reels.find_one({"id": reel_id}, {"likes": 1, "_id": 0})
