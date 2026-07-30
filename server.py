@@ -3288,7 +3288,6 @@ postbluom.online"""
         u=Depends(current_user),
     ):
         """Paginated discovery grid sorted by trending score (views*1 + likes*3 + comments*5 - age_decay)."""
-        import math as _math
         blocked = u.get("blocked", [])
         muted   = u.get("muted", [])
         excluded = list(set(blocked + muted))
@@ -3309,8 +3308,8 @@ postbluom.online"""
                     else:
                         dt = created
                     if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=__import__("datetime").timezone.utc)
-                    age_hours = max(0, (datetime.now(__import__("datetime").timezone.utc) - dt).total_seconds() / 3600)
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    age_hours = max(0, (datetime.now(_tz.utc) - dt).total_seconds() / 3600)
                 else:
                     age_hours = 0
             except Exception:
@@ -3338,10 +3337,7 @@ postbluom.online"""
         reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        await db.reels.update_one(
-            {"id": reel_id},
-            [{"$set": {"view_count": {"$add": [{"$ifNull": ["$view_count", 0]}, 1]}}}]
-        )
+        await db.reels.update_one({"id": reel_id}, {"$inc": {"view_count": 1}})
         return {"ok": True}
 
     @api.get("/search")
@@ -3402,7 +3398,7 @@ postbluom.online"""
 
         if search_type in ("all", "hashtags"):
             pipeline = [
-                {"$match": {"hashtags": {"$exists": True, "$not": {"$size": 0}}}},
+                {"$match": {"hashtags.0": {"$exists": True}}},
                 {"$unwind": "$hashtags"},
                 {"$match": {"hashtags": {"$regex": q, "$options": "i"}}},
                 {"$group": {"_id": "$hashtags", "count": {"$sum": 1}}},
