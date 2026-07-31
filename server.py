@@ -3916,6 +3916,59 @@ postbluom.online"""
                 pass
         return {"stickers": stickers}
 
+    # ── Music search proxy (JioSaavn — full song streams) ───────────────────
+    @api.get("/music/search")
+    async def music_search(q: str = "", limit: int = 20):
+        import httpx
+        if not q.strip():
+            return {"songs": []}
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                resp = await client.get(
+                    "https://saavn.dev/api/search/songs",
+                    params={"query": q.strip(), "page": 1, "limit": limit}
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            logging.error(f"JioSaavn music search failed: {e}")
+            return {"songs": [], "error": str(e)}
+
+        songs = []
+        for s in ((data.get("data") or {}).get("results") or []):
+            try:
+                dl_urls = s.get("downloadUrl") or []
+                stream_url = ""
+                for q_pref in ["160kbps", "320kbps", "96kbps"]:
+                    match = next((u["url"] for u in dl_urls if u.get("quality") == q_pref), None)
+                    if match:
+                        stream_url = match
+                        break
+                if not stream_url and dl_urls:
+                    stream_url = dl_urls[-1].get("url", "")
+                if not stream_url:
+                    continue
+                images = s.get("image") or []
+                artwork = ""
+                for img in reversed(images):
+                    artwork = img.get("url", "")
+                    if artwork:
+                        break
+                artists_data = s.get("artists") or {}
+                primary = artists_data.get("primary") or artists_data.get("primaryArtists") or []
+                artist = ", ".join(a.get("name", "") for a in primary if a.get("name")) if primary else (s.get("label") or "")
+                songs.append({
+                    "id": str(s.get("id", "")),
+                    "name": s.get("name", ""),
+                    "artist": artist,
+                    "artwork": artwork,
+                    "streamUrl": stream_url,
+                    "duration": int(s.get("duration") or 30),
+                })
+            except Exception:
+                pass
+        return {"songs": songs}
+
     # Register all routes
     app.include_router(api)
 
