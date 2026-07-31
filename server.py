@@ -10,7 +10,7 @@ try:
     from fastapi.middleware.gzip import GZipMiddleware
     from motor.motor_asyncio import AsyncIOMotorClient
     from dotenv import load_dotenv
-    import os, uuid, random, logging, bcrypt, jwt, re, io
+    import os, uuid, random, secrets, logging, bcrypt, jwt, re, io
     from pydantic import BaseModel, EmailStr, field_validator
     from typing import Optional, List
     from datetime import datetime, timezone, timedelta
@@ -669,7 +669,7 @@ postbluom.online"""
             await ensure_username_unique(p.username, exclude_uid=existing["id"] if existing else None)
         except ValueError as e:
             raise HTTPException(400, str(e))
-        code   = f"{random.randint(0,9999):04d}"
+        code   = f"{secrets.randbelow(1000000):06d}"
         uid    = existing["id"] if existing else str(uuid.uuid4())
         colors = ["#FFD600", "#00C853", "#FF1744", "#29B6F6"]
         doc = {
@@ -734,7 +734,7 @@ postbluom.online"""
     async def resend_otp(body: dict):
         u = await db.users.find_one({"email": body.get("email")})
         if not u: raise HTTPException(400, "User not found")
-        code = f"{random.randint(0,9999):04d}"
+        code = f"{secrets.randbelow(1000000):06d}"
         await db.users.update_one(
             {"id": u["id"]},
             {"$set": {"otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10)}},
@@ -770,7 +770,7 @@ postbluom.online"""
                     "demo_otp": _existing.get("_plain"),
                     "method": "email" if is_email else "sms",
                 }
-        code = f"{random.randint(0,9999):04d}"
+        code = f"{secrets.randbelow(1000000):06d}"
         await db.reset_otps.update_one(
             {"identifier": identifier},
             {"$set": {
@@ -828,7 +828,7 @@ postbluom.online"""
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
                 return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
-        code = f"{random.randint(0,9999):04d}"
+        code = f"{secrets.randbelow(1000000):06d}"
         await db.email_otps.update_one(
             {"email": p.email},
             {"$set": {
@@ -892,7 +892,7 @@ postbluom.online"""
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
                 return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
-        code = f"{random.randint(0,9999):04d}"
+        code = f"{secrets.randbelow(1000000):06d}"
         await db.phone_otps.update_one(
             {"phone": p.phone},
             {"$set": {
@@ -993,7 +993,7 @@ postbluom.online"""
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
                 return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
-        code = f"{random.randint(0,9999):04d}"
+        code = f"{secrets.randbelow(1000000):06d}"
         await db.phone_otps.update_one(
             {"phone": p.phone},
             {"$set": {
@@ -1035,7 +1035,7 @@ postbluom.online"""
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
                 return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
-        code = f"{random.randint(0,9999):04d}"
+        code = f"{secrets.randbelow(1000000):06d}"
         await db.email_otps.update_one(
             {"email": p.email},
             {"$set": {
@@ -1151,7 +1151,7 @@ postbluom.online"""
                             array_filters=[{"c.user_id": uid}],
                         )
                     if msg_upd:
-                        await db.messages.update_many({"from_user_id": uid}, {"$set": msg_upd})
+                        await db.messages.update_many({"from_id": uid}, {"$set": msg_upd})
                 except Exception:
                     pass
             asyncio.create_task(_bg())
@@ -1824,10 +1824,14 @@ postbluom.online"""
     async def like_post(pid: str, p: LikeIn, u=Depends(current_user)):
         post = await db.posts.find_one({"id": pid})
         if not post: raise HTTPException(404, "Not found")
-        likes = [l for l in post.get("likes", []) if l["user_id"] != u["id"]]
+        # Atomic: first remove any existing like from this user, then add new one if color given.
+        # Avoids race condition where two simultaneous requests overwrite each other's likes.
+        await db.posts.update_one({"id": pid}, {"$pull": {"likes": {"user_id": u["id"]}}})
         if p.color:
-            likes.append({"user_id": u["id"], "color": p.color, "liked_at": now().isoformat()})
-        await db.posts.update_one({"id": pid}, {"$set": {"likes": likes}})
+            new_like = {"user_id": u["id"], "color": p.color, "liked_at": now().isoformat()}
+            await db.posts.update_one({"id": pid}, {"$push": {"likes": new_like}})
+        updated = await db.posts.find_one({"id": pid}, {"_id": 0, "likes": 1})
+        likes = updated.get("likes", []) if updated else []
         if p.color and post["user_id"] != u["id"]:
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": post["user_id"],
