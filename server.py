@@ -3446,7 +3446,8 @@ postbluom.online"""
     @api.post("/reels/{reel_id}/comments")
     async def add_reel_comment(reel_id: str, body: dict, u=Depends(current_user)):
         text = (body.get("text") or "").strip()
-        if not text:
+        gif_url = (body.get("gif_url") or "").strip() or None
+        if not text and not gif_url:
             raise HTTPException(400, "Empty comment")
         comment = {
             "id":            str(uuid.uuid4()),
@@ -3457,6 +3458,7 @@ postbluom.online"""
             "avatar_letter": u["avatar_letter"],
             "avatar_photo":  u.get("avatar_photo"),
             "text":          text,
+            "gif_url":       gif_url,
             "created_at":    now().isoformat(),
         }
         await db.reels.update_one(
