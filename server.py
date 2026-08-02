@@ -3483,6 +3483,72 @@ postbluom.online"""
         )
         return {"ok": True}
 
+
+    @api.post("/reels/{reel_id}/comments/{comment_id}/like")
+    async def like_reel_comment(reel_id: str, comment_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        comment = next((c for c in reel.get("comments", []) if c["id"] == comment_id), None)
+        if not comment:
+            raise HTTPException(404, "Comment not found")
+        likes = comment.get("likes", [])
+        if u["id"] in likes:
+            await db.reels.update_one(
+                {"id": reel_id, "comments.id": comment_id},
+                {"$pull": {"comments.$.likes": u["id"]}}
+            )
+            return {"liked": False, "like_count": max(0, len(likes) - 1)}
+        else:
+            await db.reels.update_one(
+                {"id": reel_id, "comments.id": comment_id},
+                {"$addToSet": {"comments.$.likes": u["id"]}}
+            )
+            return {"liked": True, "like_count": len(likes) + 1}
+
+    @api.post("/reels/{reel_id}/comments/{comment_id}/replies")
+    async def add_reel_comment_reply(reel_id: str, comment_id: str, body: dict, u=Depends(current_user)):
+        text = (body.get("text") or "").strip()
+        gif_url = (body.get("gif_url") or "").strip() or None
+        if not text and not gif_url:
+            raise HTTPException(400, "Empty reply")
+        reply = {
+            "id":            str(uuid.uuid4()),
+            "user_id":       u["id"],
+            "user_name":     u["name"],
+            "user_handle":   u["handle"],
+            "avatar_bg":     u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo":  u.get("avatar_photo"),
+            "text":          text,
+            "gif_url":       gif_url,
+            "created_at":    now().isoformat(),
+        }
+        await db.reels.update_one(
+            {"id": reel_id, "comments.id": comment_id},
+            {"$push": {"comments.$.replies": reply}}
+        )
+        return reply
+
+    @api.delete("/reels/{reel_id}/comments/{comment_id}/replies/{reply_id}")
+    async def delete_reel_comment_reply(reel_id: str, comment_id: str, reply_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        comment = next((c for c in reel.get("comments", []) if c["id"] == comment_id), None)
+        if not comment:
+            raise HTTPException(404, "Comment not found")
+        reply = next((r for r in comment.get("replies", []) if r["id"] == reply_id), None)
+        if not reply:
+            raise HTTPException(404, "Reply not found")
+        if reply["user_id"] != u["id"] and reel["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Not allowed")
+        await db.reels.update_one(
+            {"id": reel_id, "comments.id": comment_id},
+            {"$pull": {"comments.$.replies": {"id": reply_id}}}
+        )
+        return {"ok": True}
+
     @api.delete("/reels/{reel_id}")
     async def delete_reel(reel_id: str, u=Depends(current_user)):
         reel = await db.reels.find_one({"id": reel_id}, {"user_id": 1, "_id": 0})
