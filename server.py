@@ -616,7 +616,8 @@ postbluom.online"""
         video_effect: Optional[str] = None                # VIDEO_EFFECTS id: none|vivid|warm|cool|bw|fade|vintage
 
     class CommentIn(BaseModel):
-        text: str
+        text: str = ""
+        gif_url: Optional[str] = None
 
     class LikeIn(BaseModel):
         color: Optional[str] = None
@@ -1841,17 +1842,29 @@ postbluom.online"""
             asyncio.create_task(send_push(post["user_id"], "New like ♥️", u["name"] + " liked your post"))
         return {"likes": likes, "total": len(likes)}
 
+    @api.get("/posts/{pid}/comments")
+    async def get_post_comments(pid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid}, {"comments": 1, "_id": 0})
+        if not post: raise HTTPException(404, "Post not found")
+        return {"comments": post.get("comments", [])}
+
     @api.post("/posts/{pid}/comments")
     async def add_comment(pid: str, p: CommentIn, u=Depends(current_user)):
         post = await db.posts.find_one({"id": pid})
         if not post: raise HTTPException(404, "Post not found")
         if not post.get("comments_enabled", True):
             raise HTTPException(403, "Comments are turned off for this post")
+        text = (p.text or "").strip()
+        gif_url = (p.gif_url or "").strip() or None
+        if not text and not gif_url:
+            raise HTTPException(400, "Comment text or GIF required")
         c = {
             "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
-            "avatar_letter": u["avatar_letter"], "text": p.text,
+            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
+            "text": text, "gif_url": gif_url,
             "created_at": now().isoformat(),
+            "likes": [], "replies": [],
         }
         await db.posts.update_one({"id": pid}, {"$push": {"comments": c}})
         if post["user_id"] != u["id"]:
@@ -1862,6 +1875,54 @@ postbluom.online"""
             })
             asyncio.create_task(send_push(post["user_id"], "New comment 💬", u["name"] + " commented on your post"))
         return c
+
+    @api.post("/posts/{pid}/comments/{cid}/like")
+    async def like_post_comment(pid: str, cid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid}, {"comments": 1, "_id": 0})
+        if not post: raise HTTPException(404, "Post not found")
+        comment = next((c for c in post.get("comments", []) if c["id"] == cid), None)
+        if not comment: raise HTTPException(404, "Comment not found")
+        likes = comment.get("likes", [])
+        if u["id"] in likes:
+            await db.posts.update_one(
+                {"id": pid, "comments.id": cid},
+                {"$pull": {"comments.$.likes": u["id"]}}
+            )
+            return {"liked": False, "like_count": max(0, len(likes) - 1)}
+        else:
+            await db.posts.update_one(
+                {"id": pid, "comments.id": cid},
+                {"$addToSet": {"comments.$.likes": u["id"]}}
+            )
+            return {"liked": True, "like_count": len(likes) + 1}
+
+    @api.post("/posts/{pid}/comments/{cid}/replies")
+    async def add_post_comment_reply(pid: str, cid: str, body: dict, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid}, {"comments": 1, "_id": 0})
+        if not post: raise HTTPException(404, "Post not found")
+        comment = next((c for c in post.get("comments", []) if c["id"] == cid), None)
+        if not comment: raise HTTPException(404, "Comment not found")
+        text = (body.get("text") or "").strip()
+        gif_url = (body.get("gif_url") or "").strip() or None
+        if not text and not gif_url:
+            raise HTTPException(400, "Reply text or GIF required")
+        reply = {
+            "id":            str(uuid.uuid4()),
+            "user_id":       u["id"],
+            "user_name":     u["name"],
+            "user_handle":   u["handle"],
+            "avatar_bg":     u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo":  u.get("avatar_photo"),
+            "text":          text,
+            "gif_url":       gif_url,
+            "created_at":    now().isoformat(),
+        }
+        await db.posts.update_one(
+            {"id": pid, "comments.id": cid},
+            {"$push": {"comments.$.replies": reply}}
+        )
+        return reply
 
     @api.delete("/posts/{pid}/comments/{cid}")
     async def delete_comment(pid: str, cid: str, u=Depends(current_user)):
