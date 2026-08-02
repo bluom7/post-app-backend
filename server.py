@@ -1,1 +1,1 @@
-<full server.py content with inserted import to register help routes>
+<the updated server.py content with help center endpoints inserted before app.include_router(api)>
