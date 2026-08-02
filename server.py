@@ -1704,7 +1704,7 @@ postbluom.online"""
             if target_user and target_user.get("is_private") and user_id != u["id"]:
                 if u["id"] not in target_user.get("followers", []):
                     return {"posts": [], "total": 0, "skip": skip, "limit": limit, "private_locked": True}
-            query["user_id"] = user_id
+            query = {"$or": [{"user_id": user_id}, {"shared_with_user_id": user_id}]}
         elif feed:
             followers_ids = u.get("followers", [])
             # Users we already have read access to (following + self)
@@ -1730,7 +1730,8 @@ postbluom.online"""
             visible_follower_ids = [v["id"] for v in visible_follower_docs]
             verified_ids = [v["id"] for v in verified_docs]
             feed_ids = list(set(following_ids + visible_follower_ids + verified_ids + [u["id"]]))
-            query["user_id"] = {"$in": feed_ids}
+            # Also include posts shared directly with this user
+            query = {"$or": [{"user_id": {"$in": feed_ids}}, {"shared_with_user_id": u["id"]}]}
         else:
             if q:
                 query["$or"] = [
@@ -1997,6 +1998,55 @@ postbluom.online"""
         })
         asyncio.create_task(send_push(target["id"], "Mention", u["name"] + " mentioned you in a post"))
         return {"ok": True}
+
+    @api.post("/posts/{pid}/repost-to-friend")
+    async def repost_to_friend(pid: str, body: dict, u=Depends(current_user)):
+        friend_id = (body.get("friend_id") or "").strip()
+        if not friend_id: raise HTTPException(400, "friend_id required")
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        friend = await db.users.find_one({"id": friend_id})
+        if not friend: raise HTTPException(404, "Friend not found")
+        # Create a repost in current user's feed, tagged as shared with friend
+        already = await db.posts.find_one({"repost_of": pid, "user_id": u["id"], "shared_with_user_id": friend_id})
+        if already:
+            # Undo: remove the tag-repost
+            await db.posts.delete_one({"id": already["id"]})
+            await db.posts.update_one({"id": pid}, {"$pull": {"reposts": u["id"]}})
+            return {"ok": True, "reposted": False}
+        doc = {
+            "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
+            "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
+            "content": post.get("content", ""), "accent": post.get("accent", "#FFD600"),
+            "location": "", "photo_url": post.get("photo_url"), "photo_urls": post.get("photo_urls", []),
+            "video_url": post.get("video_url"), "video_duration": post.get("video_duration"),
+            "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
+            "repost_of": pid, "repost_user_name": post.get("user_name"),
+            "repost_user_handle": post.get("user_handle"),
+            "shared_with_user_id": friend_id, "shared_with_user_name": friend.get("name"),
+            "shared_with_user_handle": friend.get("handle"),
+            "created_at": now().isoformat(), "is_pinned": False,
+        }
+        await db.posts.insert_one(doc.copy())
+        await db.posts.update_one({"id": pid}, {"$addToSet": {"reposts": u["id"]}})
+        # Notify the friend that this post was shared with them
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": friend_id,
+            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+            "type": "mention", "post_id": pid, "created_at": now().isoformat(), "read": False,
+            "extra_text": u["name"] + " shared a post with you",
+        })
+        asyncio.create_task(send_push(friend_id, "Shared Post", u["name"] + " shared a post with you"))
+        # Also notify original poster if different from current user
+        if post["user_id"] != u["id"] and post["user_id"] != friend_id:
+            await db.notifications.insert_one({
+                "id": str(uuid.uuid4()), "user_id": post["user_id"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+                "type": "repost", "post_id": pid, "created_at": now().isoformat(), "read": False,
+            })
+        doc.pop("_id", None)
+        return {"ok": True, "reposted": True, "post": doc}
 
 
     @api.post("/posts/{pid}/report")
