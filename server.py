@@ -254,11 +254,11 @@ try:
         """Case-insensitive email lookup for MongoDB."""
         return {"email": {"$regex": f"^{re.escape(email.strip())}$", "$options": "i"}}
 
-    def make_token(uid):
-        return jwt.encode(
-            {"sub": uid, "exp": now() + timedelta(days=30)},
-            JWT_SECRET, algorithm="HS256",
-        )
+    def make_token(uid, session_id=None):
+        payload = {"sub": uid, "exp": now() + timedelta(days=30)}
+        if session_id:
+            payload["sid"] = session_id
+        return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
     USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
 
@@ -286,11 +286,19 @@ try:
         try:
             payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
             uid = payload["sub"]
+            sid = payload.get("sid")
         except Exception:
             raise HTTPException(401, "Invalid token")
         u = await db.users.find_one({"id": uid}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
         if not u:
             raise HTTPException(401, "User not found")
+        if sid:
+            u["_current_session_id"] = sid
+            # Update last_active for this session (fire and forget)
+            asyncio.create_task(db.sessions.update_one(
+                {"id": sid, "user_id": uid},
+                {"$set": {"last_active": now().isoformat()}}
+            ))
         return u
 
     async def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
@@ -557,6 +565,8 @@ postbluom.online"""
         account_type: Optional[str] = None
         is_badge_verified: Optional[bool] = None
         user_status: Optional[str] = None
+        two_fa_enabled: Optional[bool] = None
+        login_alerts_enabled: Optional[bool] = None
 
         @field_validator("username")
         @classmethod
@@ -709,7 +719,7 @@ postbluom.online"""
         return {"token": make_token(u["id"]), "user_id": u["id"]}
 
     @api.post("/auth/login")
-    async def login(p: LoginIn):
+    async def login(p: LoginIn, request: Request):
         u = await db.users.find_one(_email_q(p.email))          # case-insensitive lookup
         if not u: raise HTTPException(404, "User not found")
         if not u.get("is_verified"):                             # fast check BEFORE slow hash
@@ -719,8 +729,23 @@ postbluom.online"""
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
+        session_id = str(uuid.uuid4())
+        token = make_token(u["id"], session_id)
+        # Store session record
+        try:
+            ua_str = request.headers.get("User-Agent", "") if hasattr(request, "headers") else ""
+            device_name = _parse_device_name(ua_str)
+            ip_addr = request.client.host if hasattr(request, "client") and request.client else "Unknown"
+        except Exception:
+            device_name, ip_addr = "Unknown device", "Unknown"
+        asyncio.create_task(db.sessions.insert_one({
+            "id": session_id, "user_id": u["id"],
+            "device_name": device_name, "ip": ip_addr,
+            "created_at": now().isoformat(), "last_active": now().isoformat(),
+            "is_mobile": "Mobile" in device_name or "Android" in device_name or "iPhone" in device_name
+        }))
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
-        resp = {"token": make_token(u["id"]), "user_id": u["id"], "user": user_profile}
+        resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
             deleted_at = _aware(u["deleted_at"])
             if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
@@ -951,7 +976,7 @@ postbluom.online"""
         return {"token": make_token(uid), "user_id": uid, "requires_email": True}
 
     @api.post("/auth/phone-login")
-    async def phone_login(p: PhoneLoginIn):
+    async def phone_login(p: PhoneLoginIn, request: Request):
         # Flexible lookup: match +91XXXXXXXXXX or bare 10-digit, whichever is stored
         _ph = p.phone
         _ph_variants = [_ph]
@@ -966,8 +991,22 @@ postbluom.online"""
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
+        session_id = str(uuid.uuid4())
+        token = make_token(u["id"], session_id)
+        try:
+            ua_str = request.headers.get("User-Agent", "") if hasattr(request, "headers") else ""
+            device_name = _parse_device_name(ua_str)
+            ip_addr = request.client.host if hasattr(request, "client") and request.client else "Unknown"
+        except Exception:
+            device_name, ip_addr = "Unknown device", "Unknown"
+        asyncio.create_task(db.sessions.insert_one({
+            "id": session_id, "user_id": u["id"],
+            "device_name": device_name, "ip": ip_addr,
+            "created_at": now().isoformat(), "last_active": now().isoformat(),
+            "is_mobile": "Mobile" in device_name or "Android" in device_name or "iPhone" in device_name
+        }))
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
-        resp = {"token": make_token(u["id"]), "user_id": u["id"], "user": user_profile}
+        resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
             deleted_at = _aware(u["deleted_at"])
             if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
@@ -3983,6 +4022,70 @@ postbluom.online"""
             except Exception:
                 pass
         return {"stickers": stickers}
+
+    # ── Security helpers ──────────────────────────────────────────────────────
+    def _parse_device_name(ua: str) -> str:
+        """Extract human-readable device name from User-Agent."""
+        ua_lower = ua.lower()
+        if "iphone" in ua_lower: return "iPhone"
+        if "ipad" in ua_lower: return "iPad"
+        if "android" in ua_lower:
+            return "Android Mobile" if "mobile" in ua_lower else "Android Tablet"
+        if "windows" in ua_lower: return "Windows PC"
+        if "macintosh" in ua_lower or "mac os" in ua_lower: return "Mac"
+        if "linux" in ua_lower: return "Linux"
+        if ua.strip(): return ua[:40]
+        return "Unknown device"
+
+    # ── Security & Sessions endpoints ─────────────────────────────────────────
+    @api.get("/security/sessions")
+    async def get_security_sessions(u=Depends(current_user)):
+        current_sid = u.get("_current_session_id")
+        sessions = await db.sessions.find(
+            {"user_id": u["id"]}, {"_id": 0}
+        ).sort("last_active", -1).to_list(50)
+        for s in sessions:
+            s["is_current"] = (s.get("id") == current_sid)
+        return {"sessions": sessions}
+
+    @api.delete("/security/sessions/{session_id}")
+    async def revoke_security_session(session_id: str, u=Depends(current_user)):
+        if session_id == "all":
+            current_sid = u.get("_current_session_id")
+            query = {"user_id": u["id"]}
+            if current_sid:
+                query["id"] = {"$ne": current_sid}
+            await db.sessions.delete_many(query)
+            return {"ok": True}
+        session = await db.sessions.find_one({"id": session_id, "user_id": u["id"]})
+        if not session:
+            raise HTTPException(404, "Session not found")
+        await db.sessions.delete_one({"id": session_id, "user_id": u["id"]})
+        return {"ok": True}
+
+    @api.get("/security/download-data")
+    async def download_user_data(u=Depends(current_user)):
+        """Return a JSON export of the user's data."""
+        profile = {k: v for k, v in u.items()
+                   if not k.startswith("_") and k not in ("password_hash", "otp_hash")}
+        posts = await db.posts.find(
+            {"user_id": u["id"]}, {"_id": 0}
+        ).sort("created_at", -1).to_list(1000)
+        friends_raw = await db.friendships.find(
+            {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]},
+            {"_id": 0}
+        ).to_list(5000)
+        friends = [{"user_id": f["to_id"] if f["from_id"] == u["id"] else f["from_id"],
+                    "status": f.get("status", "friends"), "since": f.get("created_at")}
+                   for f in friends_raw]
+        return {
+            "exported_at": now().isoformat(),
+            "profile": profile,
+            "posts_count": len(posts),
+            "posts": posts[:200],  # cap at 200 for response size
+            "friends_count": len(friends),
+            "friends": friends[:500],
+        }
 
     # Register all routes
     app.include_router(api)
