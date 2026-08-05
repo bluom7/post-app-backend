@@ -2001,6 +2001,25 @@ postbluom.online"""
         await db.general_reports.insert_one(doc)
         return {"ok": True, "message": "Report submitted. Our team will review it within 24 hours."}
 
+    @api.get("/users/me/reports")
+    async def get_my_reports(u=Depends(current_user)):
+        """Return all reports submitted by the current user (general + content reports)."""
+        gen_cursor = db.general_reports.find({"reported_by": u["id"]}, {"_id": 0}).sort("created_at", -1).limit(50)
+        general_reports = await gen_cursor.to_list(50)
+        content_cursor = db.reports.find({"reported_by": u["id"]}, {"_id": 0}).sort("created_at", -1).limit(50)
+        content_reports = await content_cursor.to_list(50)
+        all_reports = []
+        for r in general_reports:
+            r["report_kind"] = "general"
+            all_reports.append(r)
+        for r in content_reports:
+            r["report_kind"] = r.get("type", "content")
+            if not r.get("type"):
+                r["type"] = "post" if r.get("post_id") else "reel"
+            all_reports.append(r)
+        all_reports.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return {"reports": all_reports[:50]}
+
 
     @api.post("/users/me/badge-request")
     async def request_badge(body: dict, u=Depends(current_user)):
