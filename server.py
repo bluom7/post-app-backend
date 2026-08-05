@@ -294,11 +294,6 @@ try:
             raise HTTPException(401, "User not found")
         if sid:
             u["_current_session_id"] = sid
-            # Update last_active for this session (fire and forget)
-            asyncio.create_task(db.sessions.update_one(
-                {"id": sid, "user_id": uid},
-                {"$set": {"last_active": now().isoformat()}}
-            ))
         return u
 
     async def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
@@ -719,7 +714,7 @@ postbluom.online"""
         return {"token": make_token(u["id"]), "user_id": u["id"]}
 
     @api.post("/auth/login")
-    async def login(p: LoginIn, request: Request):
+    async def login(p: LoginIn):
         u = await db.users.find_one(_email_q(p.email))          # case-insensitive lookup
         if not u: raise HTTPException(404, "User not found")
         if not u.get("is_verified"):                             # fast check BEFORE slow hash
@@ -729,21 +724,7 @@ postbluom.online"""
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        session_id = str(uuid.uuid4())
-        token = make_token(u["id"], session_id)
-        # Store session record
-        try:
-            ua_str = request.headers.get("User-Agent", "") if hasattr(request, "headers") else ""
-            device_name = _parse_device_name(ua_str)
-            ip_addr = request.client.host if hasattr(request, "client") and request.client else "Unknown"
-        except Exception:
-            device_name, ip_addr = "Unknown device", "Unknown"
-        asyncio.create_task(db.sessions.insert_one({
-            "id": session_id, "user_id": u["id"],
-            "device_name": device_name, "ip": ip_addr,
-            "created_at": now().isoformat(), "last_active": now().isoformat(),
-            "is_mobile": "Mobile" in device_name or "Android" in device_name or "iPhone" in device_name
-        }))
+        token = make_token(u["id"])
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
         resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
@@ -976,7 +957,7 @@ postbluom.online"""
         return {"token": make_token(uid), "user_id": uid, "requires_email": True}
 
     @api.post("/auth/phone-login")
-    async def phone_login(p: PhoneLoginIn, request: Request):
+    async def phone_login(p: PhoneLoginIn):
         # Flexible lookup: match +91XXXXXXXXXX or bare 10-digit, whichever is stored
         _ph = p.phone
         _ph_variants = [_ph]
@@ -991,20 +972,7 @@ postbluom.online"""
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        session_id = str(uuid.uuid4())
-        token = make_token(u["id"], session_id)
-        try:
-            ua_str = request.headers.get("User-Agent", "") if hasattr(request, "headers") else ""
-            device_name = _parse_device_name(ua_str)
-            ip_addr = request.client.host if hasattr(request, "client") and request.client else "Unknown"
-        except Exception:
-            device_name, ip_addr = "Unknown device", "Unknown"
-        asyncio.create_task(db.sessions.insert_one({
-            "id": session_id, "user_id": u["id"],
-            "device_name": device_name, "ip": ip_addr,
-            "created_at": now().isoformat(), "last_active": now().isoformat(),
-            "is_mobile": "Mobile" in device_name or "Android" in device_name or "iPhone" in device_name
-        }))
+        token = make_token(u["id"])
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
         resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
