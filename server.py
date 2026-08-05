@@ -1190,7 +1190,7 @@ postbluom.online"""
         messages_sent = await db.messages.find({"from_id": u["id"]}, {"_id": 0}).to_list(1000)
         return {"profile": user_data, "posts": posts, "messages_sent": messages_sent, "exported_at": now().isoformat()}
 
-        @api.patch("/profile/online")
+    @api.patch("/profile/online")
     async def update_online_status(body: dict, u=Depends(current_user)):
         is_online = body.get("is_online", True)
         await db.users.update_one(
