@@ -562,6 +562,11 @@ postbluom.online"""
         user_status: Optional[str] = None
         two_fa_enabled: Optional[bool] = None
         login_alerts_enabled: Optional[bool] = None
+        who_can_message: Optional[str] = None
+        who_can_follow: Optional[str] = None
+        post_visibility: Optional[str] = None
+        comment_control: Optional[str] = None
+        sensitive_content_filter: Optional[bool] = None
 
         @field_validator("username")
         @classmethod
@@ -1165,7 +1170,27 @@ postbluom.online"""
 
         return await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
 
-    @api.patch("/profile/online")
+
+    @api.get("/data/activity-log")
+    async def get_activity_log(u=Depends(current_user)):
+        posts = await db.posts.find({"user_id": u["id"]}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
+        liked_posts = await db.posts.find({"likes": u["id"]}, {"_id": 0, "id": 1, "content": 1, "created_at": 1}).sort("created_at", -1).limit(50).to_list(50)
+        comments = []
+        async for post in db.posts.find({"comments.user_id": u["id"]}, {"_id": 0, "id": 1, "comments": 1}):
+            for c in post.get("comments", []):
+                if c.get("user_id") == u["id"]:
+                    comments.append({"post_id": post["id"], "comment": c.get("text",""), "created_at": c.get("created_at","")})
+        comments = sorted(comments, key=lambda x: x.get("created_at",""), reverse=True)[:50]
+        return {"posts": posts, "liked_posts": liked_posts, "comments": comments}
+
+    @api.get("/data/export")
+    async def export_user_data(u=Depends(current_user)):
+        user_data = await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+        posts = await db.posts.find({"user_id": u["id"]}, {"_id": 0}).to_list(1000)
+        messages_sent = await db.messages.find({"from_id": u["id"]}, {"_id": 0}).to_list(1000)
+        return {"profile": user_data, "posts": posts, "messages_sent": messages_sent, "exported_at": now().isoformat()}
+
+        @api.patch("/profile/online")
     async def update_online_status(body: dict, u=Depends(current_user)):
         is_online = body.get("is_online", True)
         await db.users.update_one(
