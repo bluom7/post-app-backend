@@ -308,7 +308,7 @@ try:
             {"id": u["id"]},
             {"$set": {
                 "theme": "light",
-                "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False},
+                "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False, "mentions": False, "tags": False},
                 "prefs_migrated": True,
             }},
         )
@@ -595,6 +595,8 @@ postbluom.online"""
         comments: Optional[bool] = None
         friend_requests: Optional[bool] = None
         messages: Optional[bool] = None
+        mentions: Optional[bool] = None
+        tags: Optional[bool] = None
 
     class ChangePasswordIn(BaseModel):
         current_password: str; new_password: str
@@ -694,7 +696,7 @@ postbluom.online"""
             "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
             "chat_translation_enabled": True,
             "followers": [], "following": [], "blocked_users": [],
-            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False},
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False, "mentions": False, "tags": False},
         }
         if existing:
             await db.users.update_one({"id": uid}, {"$set": doc})
@@ -887,7 +889,7 @@ postbluom.online"""
             "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
             "chat_translation_enabled": True,
             "followers": [], "following": [], "blocked_users": [],
-            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False},
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False, "mentions": False, "tags": False},
         }
         await db.users.insert_one(doc)
         await db.email_otps.delete_one({"email": p.email})
@@ -955,7 +957,7 @@ postbluom.online"""
             "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
             "chat_translation_enabled": True,
             "followers": [], "following": [], "blocked_users": [],
-            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False},
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False, "mentions": False, "tags": False},
         }
         await db.users.insert_one(doc)
         await db.phone_otps.delete_one({"phone": p.phone})
@@ -1660,6 +1662,21 @@ postbluom.online"""
         }
         await db.posts.insert_one(doc.copy())
         doc.pop("_id", None)
+        # Send tag notifications to tagged users
+        for handle in (p.tagged_users or []):
+            try:
+                tagged_user = await db.users.find_one({"handle": handle.lstrip("@")})
+                if tagged_user and tagged_user["id"] != u["id"]:
+                    await db.notifications.insert_one({
+                        "id": str(uuid.uuid4()), "user_id": tagged_user["id"],
+                        "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+                        "type": "tag", "post_id": doc["id"], "created_at": now().isoformat(), "read": False,
+                    })
+                    tag_prefs = tagged_user.get("notifications_prefs", {})
+                    if tag_prefs.get("tags", True):
+                        asyncio.create_task(send_push(tagged_user["id"], "Tag 🏷️", u["name"] + " tagged you in a post"))
+            except Exception:
+                pass
         return doc
 
     def _reel_to_feed_item(r: dict) -> dict:
@@ -1966,7 +1983,9 @@ postbluom.online"""
             "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
             "type": "mention", "post_id": pid, "created_at": now().isoformat(), "read": False,
         })
-        asyncio.create_task(send_push(target["id"], "Mention", u["name"] + " mentioned you in a post"))
+        target_prefs = target.get("notifications_prefs", {})
+        if target_prefs.get("mentions", True):
+            asyncio.create_task(send_push(target["id"], "Mention 📢", u["name"] + " mentioned you in a post"))
         return {"ok": True}
 
 
@@ -2948,7 +2967,7 @@ postbluom.online"""
                 "is_verified": True, "is_seed": True, "avatar_bg": color,
                 "avatar_letter": name[0], "location": loc, "about": about, "continent": continent,
                 "created_at": now(), "followers": [], "following": [], "blocked_users": [],
-                "notifications_prefs": {"likes": True, "comments": True, "friend_requests": True, "messages": True},
+                "notifications_prefs": {"likes": True, "comments": True, "friend_requests": True, "messages": True, "mentions": True, "tags": True},
             })
         logging.info("✅ World users seeded")
 
