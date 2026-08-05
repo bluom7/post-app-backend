@@ -2809,7 +2809,24 @@ postbluom.online"""
                 await collection.create_index(keys, **options)
                 ok_count += 1
             except Exception as e:
-                logging.warning(f"Index creation warning ({collection.name}.{keys}): {e}")
+                # Code 86 = IndexKeySpecsConflict: existing index has different options.
+                # Drop the old index and recreate with new specs.
+                err_code = getattr(e, "code", None) or getattr(e, "details", {}).get("code")
+                if err_code == 86:
+                    try:
+                        index_name = options.get("name") or (
+                            "_".join(f"{k}_{v}" for k, v in ([keys] if isinstance(keys, tuple) else [(keys, 1)])) + "_1"
+                            if isinstance(keys, str) else
+                            "_".join(f"{k}_{v}" for k, v in keys)
+                        )
+                        await collection.drop_index(index_name)
+                        await collection.create_index(keys, **options)
+                        ok_count += 1
+                        logging.info(f"Rebuilt conflicting index ({collection.name}.{keys})")
+                    except Exception as e2:
+                        logging.warning(f"Index rebuild failed ({collection.name}.{keys}): {e2}")
+                else:
+                    logging.warning(f"Index creation warning ({collection.name}.{keys}): {e}")
         logging.info(f"✅ MongoDB indexes created ({ok_count}/{len(index_specs)})")
 
     # ── Startup: make official account an admin + verified ──────────
