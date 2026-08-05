@@ -1980,6 +1980,27 @@ postbluom.online"""
         if already: return {"ok": True, "already": True}
         await db.reports.insert_one({"id": str(uuid.uuid4()), "post_id": pid, "reported_by": u["id"], "reported_user_id": post.get("user_id"), "reason": reason, "created_at": now().isoformat(), "status": "pending"})
         return {"ok": True}
+    @api.post("/report/general")
+    async def report_general(body: dict, u=Depends(current_user)):
+        report_type = (body.get("type") or "").strip()
+        description = (body.get("description") or "").strip()
+        username = (body.get("username") or "").strip()
+        if not report_type: raise HTTPException(400, "Report type required")
+        if not description or len(description) < 5: raise HTTPException(400, "Description too short")
+        if len(description) > 2000: raise HTTPException(400, "Description too long")
+        doc = {
+            "id": str(uuid.uuid4()),
+            "reported_by": u["id"],
+            "reporter_handle": u.get("handle", ""),
+            "type": report_type,
+            "description": description,
+            "target_username": username or None,
+            "created_at": now().isoformat(),
+            "status": "pending"
+        }
+        await db.general_reports.insert_one(doc)
+        return {"ok": True, "message": "Report submitted. Our team will review it within 24 hours."}
+
 
     @api.post("/users/me/badge-request")
     async def request_badge(body: dict, u=Depends(current_user)):
