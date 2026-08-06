@@ -4134,103 +4134,129 @@ postbluom.online"""
 
     @api.get("/security/download-data")
     async def download_user_data(u=Depends(current_user)):
-        """Return a clean JSON export of the user's Post data (no raw images or sensitive fields)."""
-        # Profile — exclude sensitive and internal fields
+        """Return a clean JSON export of the user's Post app data (posts, reels, account info)."""
+        # ── Account info (no sensitive fields) ──────────────────────────────
         PROFILE_EXCLUDE = {"password_hash", "otp_hash", "otp_expiry", "otp_attempts",
-                           "session_token", "push_token", "device_tokens"}
+                           "session_token", "push_token", "device_tokens",
+                           "likes", "saves", "saved_posts", "blocked", "blocked_users",
+                           "muted", "following", "followers", "reposts"}
         profile = {k: v for k, v in u.items()
                    if not k.startswith("_") and k not in PROFILE_EXCLUDE}
 
-        # Posts — exclude large binary/media fields, keep only meaningful metadata
-        POST_EXCLUDE = {"image_data", "video_data", "thumbnail_data",
-                        "image_base64", "video_base64", "_id"}
+        # ── Posts — whitelist only meaningful fields; replace arrays with counts ──
         raw_posts = await db.posts.find(
             {"user_id": u["id"], "repost_of": {"$exists": False}},
-            {"_id": 0}
+            {"_id": 0, "id": 1, "content": 1, "accent": 1, "location": 1,
+             "photo_url": 1, "photo_urls": 1, "video_url": 1, "video_duration": 1,
+             "feeling": 1, "tagged_users": 1, "audience": 1,
+             "music_title": 1, "music_artist": 1, "alt_text": 1, "gif_url": 1,
+             "likes": 1, "comments": 1, "views": 1, "saves": 1, "reposts": 1,
+             "created_at": 1, "edited_at": 1, "is_pinned": 1}
         ).sort("created_at", -1).to_list(500)
+
         posts = []
         for p in raw_posts:
-            clean = {k: v for k, v in p.items() if k not in POST_EXCLUDE}
-            # Replace image presence with a simple flag
-            if p.get("image_data") or p.get("image_base64"):
-                clean["has_image"] = True
-            if p.get("video_data") or p.get("video_base64"):
-                clean["has_video"] = True
-            posts.append(clean)
+            likes_raw    = p.get("likes", [])
+            comments_raw = p.get("comments", [])
+            posts.append({
+                "id":             p.get("id"),
+                "content":        p.get("content", ""),
+                "accent":         p.get("accent"),
+                "location":       p.get("location", ""),
+                "feeling":        p.get("feeling"),
+                "audience":       p.get("audience", "public"),
+                "tagged_users":   p.get("tagged_users", []),
+                "has_photo":      bool(p.get("photo_url") or p.get("photo_urls")),
+                "photo_urls":     p.get("photo_urls") or ([p["photo_url"]] if p.get("photo_url") else []),
+                "has_video":      bool(p.get("video_url")),
+                "video_url":      p.get("video_url"),
+                "video_duration": p.get("video_duration"),
+                "music_title":    p.get("music_title"),
+                "music_artist":   p.get("music_artist"),
+                "alt_text":       p.get("alt_text"),
+                "gif_url":        p.get("gif_url"),
+                # Counts only — no raw user-ID arrays
+                "like_count":    len(likes_raw)          if isinstance(likes_raw, list)                else 0,
+                "comment_count": len(comments_raw)       if isinstance(comments_raw, list)             else 0,
+                "view_count":    len(p.get("views",  [])) if isinstance(p.get("views"),  list)         else 0,
+                "save_count":    len(p.get("saves",  [])) if isinstance(p.get("saves"),  list)         else 0,
+                "repost_count":  len(p.get("reposts",[])) if isinstance(p.get("reposts"), list)        else 0,
+                "created_at":    p.get("created_at"),
+                "edited_at":     p.get("edited_at"),
+                "is_pinned":     p.get("is_pinned", False),
+            })
 
-        # Reposts
+        # ── Reels ──────────────────────────────────────────────────────────────
+        raw_reels = await db.reels.find(
+            {"user_id": u["id"]},
+            {"_id": 0, "id": 1, "caption": 1, "hashtags": 1, "audio_label": 1,
+             "video_url": 1, "category": 1, "audience": 1,
+             "likes": 1, "comments": 1, "views": 1, "saves": 1, "created_at": 1}
+        ).sort("created_at", -1).to_list(200)
+
+        reels = []
+        for r in raw_reels:
+            reels.append({
+                "id":            r.get("id"),
+                "caption":       r.get("caption", ""),
+                "hashtags":      r.get("hashtags", []),
+                "audio_label":   r.get("audio_label"),
+                "video_url":     r.get("video_url"),
+                "category":      r.get("category"),
+                "audience":      r.get("audience", "public"),
+                "like_count":    len(r.get("likes",    [])) if isinstance(r.get("likes"),    list) else 0,
+                "comment_count": len(r.get("comments", [])) if isinstance(r.get("comments"), list) else 0,
+                "view_count":    len(r.get("views",    [])) if isinstance(r.get("views"),    list) else 0,
+                "save_count":    len(r.get("saves",    [])) if isinstance(r.get("saves"),    list) else 0,
+                "created_at":    r.get("created_at"),
+            })
+
+        # ── Reposts ────────────────────────────────────────────────────────────
         reposts_raw = await db.posts.find(
             {"user_id": u["id"], "repost_of": {"$exists": True}},
             {"_id": 0, "id": 1, "repost_of": 1, "repost_user_name": 1,
              "repost_user_handle": 1, "created_at": 1}
         ).sort("created_at", -1).to_list(200)
 
-        # Saved posts
-        saved_ids = u.get("saved_posts", [])
-        saved_posts_meta = []
-        if saved_ids:
-            saved_raw = await db.posts.find(
-                {"id": {"$in": saved_ids[-100:]}},
-                {"_id": 0, "id": 1, "user_name": 1, "user_handle": 1,
-                 "content": 1, "created_at": 1}
-            ).to_list(100)
-            saved_posts_meta = saved_raw
-
-        # Friends / followers
-        friends_raw = await db.friendships.find(
-            {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]},
-            {"_id": 0}
-        ).to_list(5000)
-        friends = [{"user_id": f["to_id"] if f["from_id"] == u["id"] else f["from_id"],
-                    "direction": "following" if f["from_id"] == u["id"] else "follower",
-                    "status": f.get("status", "friends"),
-                    "since": f.get("created_at")}
-                   for f in friends_raw]
-
-        # Notifications (last 100)
-        notifs_raw = await db.notifications.find(
-            {"user_id": u["id"]},
-            {"_id": 0, "user_id": 0}
-        ).sort("created_at", -1).to_list(100)
+        # ── Connections summary ────────────────────────────────────────────────
+        following_ids = u.get("following", [])
+        followers_ids = u.get("followers", [])
 
         return {
             "exported_at": now().isoformat(),
             "app": "POST by BluOm",
             "account": {
-                "id": u["id"],
-                "name": profile.get("name"),
-                "handle": profile.get("handle"),
-                "email": profile.get("email"),
-                "phone": profile.get("phone"),
-                "bio": profile.get("bio"),
-                "website": profile.get("website"),
-                "created_at": profile.get("created_at"),
-                "is_private": profile.get("is_private", False),
-                "is_verified": profile.get("is_verified", False),
-                "followers_count": profile.get("followers_count", 0),
-                "following_count": profile.get("following_count", 0),
+                "id":              u["id"],
+                "name":            profile.get("name"),
+                "handle":          profile.get("handle"),
+                "email":           profile.get("email"),
+                "phone":           profile.get("phone"),
+                "bio":             profile.get("bio"),
+                "website":         profile.get("website"),
+                "created_at":      profile.get("created_at"),
+                "is_private":      profile.get("is_private", False),
+                "is_verified":     profile.get("is_verified", False),
+                "followers_count": len(followers_ids) if isinstance(followers_ids, list) else profile.get("followers_count", 0),
+                "following_count": len(following_ids) if isinstance(following_ids, list) else profile.get("following_count", 0),
             },
             "posts": {
                 "count": len(posts),
                 "items": posts,
             },
+            "reels": {
+                "count": len(reels),
+                "items": reels,
+            },
             "reposts": {
                 "count": len(reposts_raw),
                 "items": reposts_raw,
             },
-            "saved_posts": {
-                "count": len(saved_ids),
-                "items": saved_posts_meta,
-            },
             "connections": {
-                "total": len(friends),
-                "items": friends,
-            },
-            "notifications": {
-                "count": len(notifs_raw),
-                "recent": notifs_raw,
+                "followers_count": len(followers_ids) if isinstance(followers_ids, list) else 0,
+                "following_count": len(following_ids) if isinstance(following_ids, list) else 0,
             },
         }
+
 
     # Register all routes
     app.include_router(api)
