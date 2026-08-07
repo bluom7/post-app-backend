@@ -3527,22 +3527,27 @@ postbluom.online"""
         reel = await db.reels.find_one({"id": reel_id}, {"likes": 1, "_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        if u["id"] in reel.get("likes", []):
+        likes = reel.get("likes", [])
+        was_liked = u["id"] in likes
+        if was_liked:
             await db.reels.update_one({"id": reel_id}, {"$pull": {"likes": u["id"]}})
-            return {"liked": False}
+            next_count = max(0, len(likes) - 1)
+            return {"liked": False, "like_count": next_count}
         await db.reels.update_one({"id": reel_id}, {"$addToSet": {"likes": u["id"]}})
-        return {"liked": True}
+        return {"liked": True, "like_count": len(likes) + 1}
 
     @api.post("/reels/{reel_id}/save")
     async def save_reel(reel_id: str, u=Depends(current_user)):
         reel = await db.reels.find_one({"id": reel_id}, {"saves": 1, "_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        if u["id"] in reel.get("saves", []):
+        saves = reel.get("saves", [])
+        was_saved = u["id"] in saves
+        if was_saved:
             await db.reels.update_one({"id": reel_id}, {"$pull": {"saves": u["id"]}})
-            return {"saved": False}
+            return {"saved": False, "save_count": max(0, len(saves) - 1)}
         await db.reels.update_one({"id": reel_id}, {"$addToSet": {"saves": u["id"]}})
-        return {"saved": True}
+        return {"saved": True, "save_count": len(saves) + 1}
 
     @api.get("/reels/{reel_id}/comments")
     async def get_reel_comments(reel_id: str, u=Depends(current_user)):
