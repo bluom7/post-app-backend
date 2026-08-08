@@ -1822,14 +1822,31 @@ postbluom.online"""
             mentioned_ids = list(set(await db.reel_mentions.distinct(
                 "reel_id", {"target_user_id": mention_target_id}
             )))
-            # A mentioned/reposted reel must bypass the original creator's
-            # follow filter. Keep the normal feed/profile reels in the first
-            # clause and always add the target user's reposted reel IDs.
-            reel_clauses = [{"user_id": query["user_id"]}]
-            if mentioned_ids:
-                reel_clauses.append({"id": {"$in": mentioned_ids}})
-            reel_query = {"$or": reel_clauses}
-            reels_task = db.reels.find(reel_query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+
+            async def _load_feed_reels():
+                # Fetch normal feed reels and mentioned/reposted reels separately.
+                # Applying limit() to one combined query can drop an old reel
+                # before the mention/repost is merged into the Home feed.
+                normal_task = db.reels.find(
+                    {"user_id": query["user_id"]}, {"_id": 0}
+                ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+                mentioned_task = (
+                    db.reels.find(
+                        {"id": {"$in": mentioned_ids}}, {"_id": 0}
+                    ).sort("created_at", -1).to_list(len(mentioned_ids))
+                    if mentioned_ids else _empty_list()
+                )
+                normal_reels, mentioned_reels = await asyncio.gather(normal_task, mentioned_task)
+                merged_by_id = {}
+                for item in normal_reels + mentioned_reels:
+                    merged_by_id[item["id"]] = item
+                return sorted(
+                    merged_by_id.values(),
+                    key=lambda item: item.get("created_at") or "",
+                    reverse=True,
+                )[:fetch_n]
+
+            reels_task = _load_feed_reels()
         else:
             async def _no_reels(): return []
             reels_task = _no_reels()
@@ -1841,7 +1858,7 @@ postbluom.online"""
                 doc["reel_id"]: doc
                 async for doc in db.reel_mentions.find(
                     {"target_user_id": mention_target_id},
-                    {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1},
+                    {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "created_at": 1},
                 )
             }
         merged_reels = []
@@ -1855,7 +1872,13 @@ postbluom.online"""
                 {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle")}
                 if mention else None
             )
-            merged_reels.append(_reel_to_feed_item(reel, bool(mention), mentioned_by))
+            feed_item = _reel_to_feed_item(reel, bool(mention), mentioned_by)
+            if mention and mention.get("created_at"):
+                # A repost is a new feed event. Sort it by repost time rather
+                # than the original reel upload time.
+                feed_item["original_created_at"] = feed_item.get("created_at")
+                feed_item["created_at"] = mention["created_at"]
+            merged_reels.append(feed_item)
         merged = posts_raw + merged_reels
         merged.sort(key=lambda d: d.get("created_at") or "", reverse=True)
         posts = merged[skip:skip + limit]
