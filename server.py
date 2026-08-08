@@ -2090,7 +2090,8 @@ postbluom.online"""
         target_prefs = target.get("notifications_prefs", {})
         if target_prefs.get("mentions", True):
             asyncio.create_task(send_push(target_user_id, "Mention", u.get("name", "Someone") + " mentioned you in a reel"))
-        return {"ok": True, "target_user_id": target_user_id, "reel_id": reel_id}
+        mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+        return {"ok": True, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
 
     @api.delete("/reels/{reel_id}/mention/{target_user_id}")
     async def unmention_reel(reel_id: str, target_user_id: str, u=Depends(current_user)):
@@ -3497,6 +3498,11 @@ postbluom.online"""
         if excluded:
             query["user_id"] = {"$nin": excluded}
         reels_list = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        mention_rows = await db.reel_mentions.aggregate([
+            {"$match": {"reel_id": {"$in": [r["id"] for r in reels_list]}}},
+            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+        ]).to_list(None) if reels_list else []
+        mention_counts = {row["_id"]: row["count"] for row in mention_rows}
         following_ids = set(u.get("following", []))
         for r in reels_list:
             likes = r.get("likes", [])
@@ -3504,6 +3510,7 @@ postbluom.online"""
             r["is_liked"]     = u["id"] in likes
             r["like_count"]   = len(likes)
             r["is_saved"]     = u["id"] in saves
+            r["mention_count"] = mention_counts.get(r["id"], 0)
             r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
             r.pop("likes", None)
             r.pop("saves", None)
