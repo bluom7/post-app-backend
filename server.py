@@ -2039,16 +2039,12 @@ postbluom.online"""
         reel = await db.reels.find_one({"id": reel_id}, {"_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        target_user_id = (body.get("target_user_id") or "").strip()
-        username = (body.get("username") or "").strip().lstrip("@").lower()
-        if not target_user_id and username:
-            target = await db.users.find_one(
-                {"$or": [{"username": username}, {"handle": "@" + username}, {"handle": username}]},
-                {"_id": 0},
-            )
-            target_user_id = target.get("id") if target else ""
+        raw_target_user_id = body.get("target_user_id")
+        if not isinstance(raw_target_user_id, str):
+            raise HTTPException(400, "Select exactly one user")
+        target_user_id = raw_target_user_id.strip()
         if not target_user_id:
-            raise HTTPException(400, "target_user_id or username required")
+            raise HTTPException(400, "target_user_id required")
         target = await db.users.find_one({"id": target_user_id}, {"_id": 0})
         if not target:
             raise HTTPException(404, "User not found")
