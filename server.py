@@ -1679,7 +1679,7 @@ postbluom.online"""
                 pass
         return doc
 
-    def _reel_to_feed_item(r: dict) -> dict:
+    def _reel_to_feed_item(r: dict, mentioned: bool = False, mentioned_by: Optional[dict] = None) -> dict:
         """Shapes a raw `reels` doc so it can sit alongside `posts` docs in the
         home feed / profile grid — same field names the frontend post card and
         PostMedia component already know how to render (video_url, content,
@@ -1709,7 +1709,14 @@ postbluom.online"""
             "photo_width": None, "photo_height": None,
             # aspect_ratio: only meaningful for video reels (default 9/16).
             # For photo reels leave None — frontend uses natural img dimensions.
-            "aspect_ratio": (9/16 if r.get("video_url") else None),
+            "aspect_ratio": (
+                r.get("aspect_ratio")
+                or (
+                    r.get("media_width") / r.get("media_height")
+                    if r.get("video_url") and r.get("media_width") and r.get("media_height")
+                    else (9 / 16 if r.get("video_url") else None)
+                )
+            ),
             "audience": "public",
             "comments_enabled": True,
             "likes": [{"user_id": uid, "color": "#FF3B30"} for uid in likes_ids],
@@ -1721,6 +1728,11 @@ postbluom.online"""
             "edited_at": None,
             "is_pinned": False,
             "is_reel": True,
+            # A mention is a reference to the original reel, never a copied
+            # upload.  The frontend can therefore render the same URL and
+            # preserve its natural media dimensions.
+            "is_mentioned": mentioned,
+            "mentioned_by": mentioned_by,
             "audio_label":      r.get("audio_label"),
             "music_url":        r.get("music_url"),
             "music_start_time": r.get("music_start_time") or 0,
@@ -1806,13 +1818,41 @@ postbluom.online"""
         fetch_n = skip + limit
         posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         if include_reels:
-            reel_query = {"user_id": query["user_id"]}
+            mention_target_id = user_id if user_id else u["id"]
+            mentioned_ids = await db.reel_mentions.distinct("reel_id", {"target_user_id": mention_target_id})
+            own_reel_filter = {"user_id": query["user_id"]}
+            reel_query = (
+                {"$or": [own_reel_filter, {"id": {"$in": mentioned_ids}}]}
+                if mentioned_ids else own_reel_filter
+            )
             reels_task = db.reels.find(reel_query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         else:
             async def _no_reels(): return []
             reels_task = _no_reels()
         posts_raw, reels_raw = await asyncio.gather(posts_task, reels_task)
-        merged = posts_raw + [_reel_to_feed_item(r) for r in reels_raw]
+        mention_target_id = user_id if user_id else u["id"]
+        mention_docs = {}
+        if include_reels:
+            mention_docs = {
+                doc["reel_id"]: doc
+                async for doc in db.reel_mentions.find(
+                    {"target_user_id": mention_target_id},
+                    {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1},
+                )
+            }
+        merged_reels = []
+        seen_reel_ids = set()
+        for reel in reels_raw:
+            if reel["id"] in seen_reel_ids:
+                continue
+            seen_reel_ids.add(reel["id"])
+            mention = mention_docs.get(reel["id"])
+            mentioned_by = (
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle")}
+                if mention else None
+            )
+            merged_reels.append(_reel_to_feed_item(reel, bool(mention), mentioned_by))
+        merged = posts_raw + merged_reels
         merged.sort(key=lambda d: d.get("created_at") or "", reverse=True)
         posts = merged[skip:skip + limit]
         unviewed_ids = [p["id"] for p in posts if not p.get("is_reel") and u["id"] not in p.get("views", [])]
@@ -1986,6 +2026,83 @@ postbluom.online"""
         target_prefs = target.get("notifications_prefs", {})
         if target_prefs.get("mentions", True):
             asyncio.create_task(send_push(target["id"], "Mention 📢", u["name"] + " mentioned you in a post"))
+        return {"ok": True}
+
+    @api.post("/reels/{reel_id}/mention")
+    async def mention_in_reel(reel_id: str, body: dict, u=Depends(current_user)):
+        """Save the original reel into another user's home/profile media feed.
+
+        This is a reference, not a media copy: the target feed reads the
+        source reel so the original photo/video URL and natural aspect ratio
+        remain unchanged.
+        """
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        target_user_id = (body.get("target_user_id") or "").strip()
+        username = (body.get("username") or "").strip().lstrip("@").lower()
+        if not target_user_id and username:
+            target = await db.users.find_one(
+                {"$or": [{"username": username}, {"handle": "@" + username}, {"handle": username}]},
+                {"_id": 0},
+            )
+            target_user_id = target.get("id") if target else ""
+        if not target_user_id:
+            raise HTTPException(400, "target_user_id or username required")
+        target = await db.users.find_one({"id": target_user_id}, {"_id": 0})
+        if not target:
+            raise HTTPException(404, "User not found")
+        if target_user_id == u["id"]:
+            raise HTTPException(400, "You can't mention yourself")
+        blocked_by_target = target_user_id in (u.get("blocked_users") or []) or u["id"] in (target.get("blocked_users") or [])
+        if blocked_by_target:
+            raise HTTPException(403, "Action not allowed")
+
+        mention = {
+            "id": str(uuid.uuid4()),
+            "reel_id": reel_id,
+            "target_user_id": target_user_id,
+            "source_user_id": u["id"],
+            "source_user_name": u.get("name"),
+            "source_user_handle": u.get("handle"),
+            "created_at": now().isoformat(),
+        }
+        await db.reel_mentions.update_one(
+            {"reel_id": reel_id, "target_user_id": target_user_id},
+            {"$setOnInsert": mention},
+            upsert=True,
+        )
+        await db.notifications.update_one(
+            {"user_id": target_user_id, "type": "reel_mention", "reel_id": reel_id, "from_user_id": u["id"]},
+            {"$set": {
+                "id": str(uuid.uuid4()),
+                "user_id": target_user_id,
+                "from_user_id": u["id"],
+                "from_user_name": u.get("name"),
+                "from_user_avatar": u.get("avatar_photo"),
+                "type": "reel_mention",
+                "reel_id": reel_id,
+                "created_at": now().isoformat(),
+                "read": False,
+            }},
+            upsert=True,
+        )
+        target_prefs = target.get("notifications_prefs", {})
+        if target_prefs.get("mentions", True):
+            asyncio.create_task(send_push(target_user_id, "Mention", u.get("name", "Someone") + " mentioned you in a reel"))
+        return {"ok": True, "target_user_id": target_user_id, "reel_id": reel_id}
+
+    @api.delete("/reels/{reel_id}/mention/{target_user_id}")
+    async def unmention_reel(reel_id: str, target_user_id: str, u=Depends(current_user)):
+        if target_user_id == u["id"]:
+            raise HTTPException(400, "Invalid target")
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        if reel["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Only the reel owner can remove a mention")
+        await db.reel_mentions.delete_one({"reel_id": reel_id, "target_user_id": target_user_id})
+        await db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id, "user_id": target_user_id})
         return {"ok": True}
 
 
@@ -2886,6 +3003,8 @@ postbluom.online"""
             (db.world_reports, "id", {"unique": True, "sparse": True, "background": True}),
             (db.world_active, "user_id", {"unique": True, "background": True}),
             (db.world_active, "last_ping", {"background": True}),
+            (db.reel_mentions, [("reel_id", 1), ("target_user_id", 1)], {"unique": True, "background": True}),
+            (db.reel_mentions, [("target_user_id", 1), ("created_at", -1)], {"background": True}),
         ]
         ok_count = 0
         for collection, keys, options in index_specs:
@@ -3670,6 +3789,8 @@ postbluom.online"""
         if reel["user_id"] != u["id"] and not u.get("is_admin"):
             raise HTTPException(403, "Not your reel")
         await db.reels.delete_one({"id": reel_id})
+        await db.reel_mentions.delete_many({"reel_id": reel_id})
+        await db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id})
         return {"ok": True}
 
     @api.post("/reels/{reel_id}/report")
