@@ -1819,12 +1819,16 @@ postbluom.online"""
         posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         if include_reels:
             mention_target_id = user_id if user_id else u["id"]
-            mentioned_ids = await db.reel_mentions.distinct("reel_id", {"target_user_id": mention_target_id})
-            own_reel_filter = {"user_id": query["user_id"]}
-            reel_query = (
-                {"$or": [own_reel_filter, {"id": {"$in": mentioned_ids}}]}
-                if mentioned_ids else own_reel_filter
-            )
+            mentioned_ids = list(set(await db.reel_mentions.distinct(
+                "reel_id", {"target_user_id": mention_target_id}
+            )))
+            # A mentioned/reposted reel must bypass the original creator's
+            # follow filter. Keep the normal feed/profile reels in the first
+            # clause and always add the target user's reposted reel IDs.
+            reel_clauses = [{"user_id": query["user_id"]}]
+            if mentioned_ids:
+                reel_clauses.append({"id": {"$in": mentioned_ids}})
+            reel_query = {"$or": reel_clauses}
             reels_task = db.reels.find(reel_query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         else:
             async def _no_reels(): return []
