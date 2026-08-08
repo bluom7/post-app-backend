@@ -2048,8 +2048,6 @@ postbluom.online"""
         target = await db.users.find_one({"id": target_user_id}, {"_id": 0})
         if not target:
             raise HTTPException(404, "User not found")
-        if target_user_id == u["id"]:
-            raise HTTPException(400, "You can't mention yourself")
         blocked_by_target = target_user_id in (u.get("blocked_users") or []) or u["id"] in (target.get("blocked_users") or [])
         if blocked_by_target:
             raise HTTPException(403, "Action not allowed")
@@ -2083,9 +2081,13 @@ postbluom.online"""
             }},
             upsert=True,
         )
-        target_prefs = target.get("notifications_prefs", {})
-        if target_prefs.get("mentions", True):
-            asyncio.create_task(send_push(target_user_id, "Mention", u.get("name", "Someone") + " mentioned you in a reel"))
+        # Direct feed reposts target the signed-in user and do not need a
+        # notification or push to the same account. Keep notifications for
+        # mentions sent to another user.
+        if target_user_id != u["id"]:
+            target_prefs = target.get("notifications_prefs", {})
+            if target_prefs.get("mentions", True):
+                asyncio.create_task(send_push(target_user_id, "Mention", u.get("name", "Someone") + " mentioned you in a reel"))
         mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
         return {"ok": True, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
 
