@@ -2088,11 +2088,30 @@ postbluom.online"""
             "source_user_handle": u.get("handle"),
             "created_at": now().isoformat(),
         }
-        await db.reel_mentions.update_one(
+        existing_mention = await db.reel_mentions.find_one(
             {"reel_id": reel_id, "target_user_id": target_user_id},
-            {"$setOnInsert": mention},
-            upsert=True,
+            {"_id": 0, "source_user_id": 1},
         )
+        if existing_mention:
+            # Mentioning the same user again is a true toggle: only the user
+            # who created this mention may remove it. A mention created by
+            # somebody else must stay untouched.
+            if existing_mention.get("source_user_id") == u["id"]:
+                await db.reel_mentions.delete_one(
+                    {"reel_id": reel_id, "target_user_id": target_user_id, "source_user_id": u["id"]}
+                )
+                await db.notifications.delete_many({
+                    "type": "reel_mention",
+                    "reel_id": reel_id,
+                    "user_id": target_user_id,
+                    "from_user_id": u["id"],
+                })
+                mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+                return {"ok": True, "mentioned": False, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
+            mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+            return {"ok": True, "mentioned": True, "already": True, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
+
+        await db.reel_mentions.insert_one(mention)
         await db.notifications.update_one(
             {"user_id": target_user_id, "type": "reel_mention", "reel_id": reel_id, "from_user_id": u["id"]},
             {"$set": {
