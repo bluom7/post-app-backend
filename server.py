@@ -1738,6 +1738,7 @@ postbluom.online"""
             "audio_label":      r.get("audio_label"),
             "music_url":        r.get("music_url"),
             "music_start_time": r.get("music_start_time") or 0,
+            "music_clip_duration": r.get("music_clip_duration") or 15,
             "music_title":      r.get("music_title"),
             "music_artist":     r.get("music_artist"),
             "music_artwork":    r.get("music_artwork"),
@@ -3483,6 +3484,7 @@ postbluom.online"""
         video_effect     = (body.get("video_effect") or "none").strip()[:20]
         music_url        = (body.get("music_url") or "").strip() or None
         music_start_time = float(body.get("music_start_time") or 0)
+        music_clip_duration = max(1, min(30, int(body.get("music_clip_duration") or 15)))
         music_title      = (body.get("music_title") or "").strip() or None
         music_artist     = (body.get("music_artist") or "").strip() or None
         music_artwork    = (body.get("music_artwork") or "").strip() or None
@@ -3523,6 +3525,7 @@ postbluom.online"""
             "video_effect":      video_effect,
             "music_url":         music_url,
             "music_start_time":  music_start_time,
+            "music_clip_duration": music_clip_duration,
             "music_title":       music_title,
             "music_artist":      music_artist,
             "music_artwork":     music_artwork,
