@@ -1657,7 +1657,7 @@ postbluom.online"""
             "gif_url": (p.gif_url or "").strip() or None,
             "sticker_overlays": [{"id": s["id"], "url": s["url"], "x": float(s.get("x", 50)), "y": float(s.get("y", 50))} for s in (p.sticker_overlays or []) if s.get("url")][:10],
             "emoji_overlays": [{"id": e.get("id", ""), "emoji": str(e.get("emoji", ""))[:8], "x": float(e.get("x", 50)), "y": float(e.get("y", 50)), "size": max(24, min(int(e.get("size", 72)), 160))} for e in (p.emoji_overlays or []) if e.get("emoji")][:20],
-            "video_text_overlays": [{"id": t.get("id",""), "text": (t.get("text") or "")[:200], "x": float(t.get("x", 50)), "y": float(t.get("y", 50)), "color": (t.get("color") or "#ffffff")[:20], "size": int(t.get("size") or 22)} for t in (p.video_text_overlays or []) if t.get("text")][:10],
+            "video_text_overlays": [{"id": t.get("id",""), "text": (t.get("text") or "")[:200], "x": float(t.get("x", 50)), "y": float(t.get("y", 50)), "color": (t.get("color") or "#ffffff")[:20], "bgColor": (t.get("bgColor") or "transparent")[:20], "bgScale": float(t.get("bgScale") or 1), "size": int(t.get("size") or 22)} for t in (p.video_text_overlays or []) if t.get("text")][:10],
             "video_effect": (p.video_effect or "none")[:20] if p.video_effect else None,
             "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
             "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
@@ -2424,7 +2424,7 @@ postbluom.online"""
                 {"$set": {"is_online": False, "last_seen": now().isoformat()}}
             )
 
-    # ── Messages ──────────────────────────────────────────────────
+    # ── Messages ──────────────���───────────────────────────────────
 
     @api.post("/messages")
     async def send_message(p: MessageIn, u=Depends(current_user)):
