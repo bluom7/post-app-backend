@@ -618,7 +618,9 @@ postbluom.online"""
         music_artist: Optional[str] = None            # artist name
         music_artwork: Optional[str] = None           # 100x100 artwork URL
         music_preview_url: Optional[str] = None       # 30-sec preview URL from iTunes
-        music_duration_ms: Optional[int] = None       # track duration in ms
+        music_duration_ms: Optional[int] = None       # full track duration in ms
+        music_start_ms: Optional[int] = None          # selected preview start in ms
+        music_clip_duration_ms: Optional[int] = None # selected clip duration in ms (1-30000)
         alt_text: Optional[str] = None                # accessibility alt text for media
         gif_url: Optional[str] = None                  # Giphy GIF URL
         sticker_overlays: Optional[List[dict]] = None  # [{id, url, x, y}] Giphy stickers placed on media
@@ -1653,6 +1655,8 @@ postbluom.online"""
             "music_artwork": p.music_artwork or None,
             "music_preview_url": p.music_preview_url or None,
             "music_duration_ms": p.music_duration_ms or None,
+            "music_start_ms": max(0, int(p.music_start_ms or 0)),
+            "music_clip_duration_ms": max(1000, min(30000, int(p.music_clip_duration_ms or 30000))) if p.music_preview_url else None,
             "alt_text": (p.alt_text or "")[:1000] or None,
             "gif_url": (p.gif_url or "").strip() or None,
             "sticker_overlays": [{"id": s["id"], "url": s["url"], "x": float(s.get("x", 50)), "y": float(s.get("y", 50))} for s in (p.sticker_overlays or []) if s.get("url")][:10],
@@ -4331,7 +4335,9 @@ postbluom.online"""
             {"_id": 0, "id": 1, "content": 1, "accent": 1, "location": 1,
              "photo_url": 1, "photo_urls": 1, "video_url": 1, "video_duration": 1,
              "feeling": 1, "tagged_users": 1, "audience": 1,
-             "music_title": 1, "music_artist": 1, "alt_text": 1, "gif_url": 1,
+             "music_title": 1, "music_artist": 1, "music_preview_url": 1, "music_artwork": 1,
+             "music_duration_ms": 1, "music_start_ms": 1, "music_clip_duration_ms": 1,
+             "alt_text": 1, "gif_url": 1,
              "likes": 1, "comments": 1, "views": 1, "saves": 1, "reposts": 1,
              "created_at": 1, "edited_at": 1, "is_pinned": 1}
         ).sort("created_at", -1).to_list(500)
@@ -4355,6 +4361,11 @@ postbluom.online"""
                 "video_duration": p.get("video_duration"),
                 "music_title":    p.get("music_title"),
                 "music_artist":   p.get("music_artist"),
+                "music_preview_url": p.get("music_preview_url"),
+                "music_artwork":  p.get("music_artwork"),
+                "music_duration_ms": p.get("music_duration_ms"),
+                "music_start_ms": p.get("music_start_ms") or 0,
+                "music_clip_duration_ms": p.get("music_clip_duration_ms") or 30000,
                 "alt_text":       p.get("alt_text"),
                 "gif_url":        p.get("gif_url"),
                 # Counts only — no raw user-ID arrays
