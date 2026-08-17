@@ -1693,6 +1693,11 @@ postbluom.online"""
         interactions (like/comment/save/delete/open) to the /reels/* endpoints.
         """
         likes_ids = r.get("likes", [])
+        views_raw = r.get("views", [])
+        view_count = max(
+            len(views_raw) if isinstance(views_raw, list) else 0,
+            int(r.get("view_count") or 0),
+        )
         return {
             "id": r["id"],
             "user_id": r["user_id"],
@@ -1727,7 +1732,10 @@ postbluom.online"""
             "comments_enabled": True,
             "likes": [{"user_id": uid, "color": "#FF3B30"} for uid in likes_ids],
             "comments": r.get("comments", []),
+            # Keep raw viewer IDs out of the feed; expose the real aggregate count.
             "views": [],
+            "views_count": view_count,
+            "view_count": view_count,
             "saves": r.get("saves", []),
             "reposts": [],
             "created_at": r.get("created_at"),
