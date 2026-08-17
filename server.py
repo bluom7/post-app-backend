@@ -1427,6 +1427,18 @@ postbluom.online"""
     MAX_POST_VIDEO_SECONDS = 30
     MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024  # 100MB raw file, uploaded straight to Cloudinary (no base64 inflation)
 
+    def _measure_upload_size(file: UploadFile) -> int:
+        """Measure and rewind the spooled upload without copying it into RAM."""
+        stream = file.file
+        stream.seek(0, _os.SEEK_END)
+        size = stream.tell()
+        stream.seek(0)
+        return size
+
+    async def _get_upload_size(file: UploadFile) -> int:
+        # File seek/tell is blocking for disk-backed uploads; keep it off the event loop.
+        return await asyncio.to_thread(_measure_upload_size, file)
+
     def _validate_post_video(video_url: Optional[str], video_duration: Optional[float]):
         """Raises HTTPException if the given video URL is missing/invalid or too long.
 
@@ -1448,12 +1460,13 @@ postbluom.online"""
             raise HTTPException(500, "Image hosting is not configured on the server")
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(400, "Please upload a valid image file")
-        raw = await file.read()
-        if len(raw) > 10 * 1024 * 1024:
+        upload_size = await _get_upload_size(file)
+        if upload_size > 10 * 1024 * 1024:
             raise HTTPException(400, "Image is too large. Max 10MB.")
         try:
-            result = cloudinary.uploader.upload(
-                raw,
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                file.file,
                 resource_type="image",
                 folder="post-app/photos",
                 public_id=f"{u['id']}_{uuid.uuid4().hex}",
@@ -1472,12 +1485,13 @@ postbluom.online"""
         ct = (file.content_type or "").split(";")[0].strip()
         if ct and not ct.startswith("audio/") and ct not in ("application/octet-stream",):
             raise HTTPException(400, "Please upload a valid audio file")
-        raw = await file.read()
-        if len(raw) > 25 * 1024 * 1024:
+        upload_size = await _get_upload_size(file)
+        if upload_size > 25 * 1024 * 1024:
             raise HTTPException(400, "Audio is too large. Max 25MB.")
         try:
-            result = cloudinary.uploader.upload(
-                raw,
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                file.file,
                 resource_type="video",   # Cloudinary uses "video" resource_type for audio files
                 folder="post-app/audio",
                 public_id=f"{u['id']}_{uuid.uuid4().hex}",
@@ -1513,8 +1527,8 @@ postbluom.online"""
         if not file.content_type or not file.content_type.startswith("video/"):
             raise HTTPException(400, "Please upload a valid video file")
 
-        raw = await file.read()
-        if len(raw) > MAX_UPLOAD_VIDEO_BYTES:
+        upload_size = await _get_upload_size(file)
+        if upload_size > MAX_UPLOAD_VIDEO_BYTES:
             raise HTTPException(400, "Video is too large. Please choose a smaller clip.")
 
         upload_kwargs = dict(
@@ -1534,7 +1548,7 @@ postbluom.online"""
             }]
 
         try:
-            result = cloudinary.uploader.upload(raw, **upload_kwargs)
+            result = await asyncio.to_thread(cloudinary.uploader.upload, file.file, **upload_kwargs)
         except Exception as e:
             # Log the full Cloudinary error server-side only — it can include
             # internal signing details ("String to sign - ...") that must never
@@ -3457,12 +3471,13 @@ postbluom.online"""
             raise HTTPException(500, "Video hosting is not configured on the server")
         if not file.content_type or not file.content_type.startswith("video/"):
             raise HTTPException(400, "Please upload a valid video file")
-        raw = await file.read()
-        if len(raw) > MAX_UPLOAD_VIDEO_BYTES:
+        upload_size = await _get_upload_size(file)
+        if upload_size > MAX_UPLOAD_VIDEO_BYTES:
             raise HTTPException(400, "Video is too large. Max 100 MB.")
         try:
-            result = cloudinary.uploader.upload(
-                raw,
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                file.file,
                 resource_type="video",
                 folder="post-app/reels",
                 public_id=f"reel_{u['id']}_{uuid.uuid4().hex}",
@@ -3947,12 +3962,13 @@ postbluom.online"""
             raise HTTPException(500, "Image hosting not configured")
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(400, "Please upload a valid image file")
-        raw = await file.read()
-        if len(raw) > 10 * 1024 * 1024:
+        upload_size = await _get_upload_size(file)
+        if upload_size > 10 * 1024 * 1024:
             raise HTTPException(400, "Image too large. Max 10MB.")
         try:
-            result = cloudinary.uploader.upload(
-                raw, resource_type="image",
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                file.file, resource_type="image",
                 folder="post-app/group-avatars",
                 public_id=f"group_{group_id}_{uuid.uuid4().hex}",
                 overwrite=False,
