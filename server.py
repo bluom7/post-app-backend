@@ -126,7 +126,7 @@ try:
         except Exception:
             return None
 
-    async def send_push(user_id, title, body):
+    async def send_push(user_id, title, body, notification_type=None):
         try:
             sub_doc = await db.push_subscriptions.find_one({'user_id': user_id})
             if not sub_doc: return
@@ -137,7 +137,10 @@ try:
             if not endpoint: return
             jwt_tok = _make_vapid_jwt(endpoint, priv)
             if not jwt_tok: return
-            payload = _json.dumps({'title': title, 'body': body}).encode()
+            payload_data = {'title': title, 'body': body}
+            if notification_type:
+                payload_data['type'] = notification_type
+            payload = _json.dumps(payload_data).encode()
             enc_body = _encrypt_push_payload(sub, payload)
             loop = asyncio.get_event_loop()
             def _req():
@@ -260,6 +263,19 @@ try:
             payload["sid"] = session_id
         return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
+    async def issue_token(uid):
+        """Create a revocable session record and bind the JWT to it."""
+        session_id = str(uuid.uuid4())
+        timestamp = now().isoformat()
+        await db.sessions.insert_one({
+            "id": session_id,
+            "user_id": uid,
+            "created_at": timestamp,
+            "last_active": timestamp,
+            "device": "Web",
+        })
+        return make_token(uid, session_id)
+
     USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
 
     # ── Translation cache (in-memory, TTL 1 h) — defined early so translate endpoint can use it
@@ -293,6 +309,13 @@ try:
         if not u:
             raise HTTPException(401, "User not found")
         if sid:
+            session = await db.sessions.find_one({"id": sid, "user_id": uid}, {"_id": 0})
+            if not session:
+                raise HTTPException(401, "Session expired or revoked")
+            await db.sessions.update_one(
+                {"id": sid, "user_id": uid},
+                {"$set": {"last_active": now().isoformat()}},
+            )
             u["_current_session_id"] = sid
         return u
 
@@ -598,6 +621,17 @@ postbluom.online"""
         mentions: Optional[bool] = None
         tags: Optional[bool] = None
 
+    class ThemeIn(BaseModel):
+        theme: str
+
+        @field_validator("theme")
+        @classmethod
+        def validate_theme(cls, v):
+            v = v.strip().lower()
+            if v not in {"light", "dark"}:
+                raise ValueError("Theme must be light or dark")
+            return v
+
     class ChangePasswordIn(BaseModel):
         current_password: str; new_password: str
 
@@ -651,6 +685,9 @@ postbluom.online"""
 
     class FriendIn(BaseModel):
         target_user_id: str
+
+    class ShareToFriendIn(BaseModel):
+        friend_id: str
 
     class ForgotPasswordInitIn(BaseModel):
         identifier: str
@@ -721,7 +758,7 @@ postbluom.online"""
             {"id": u["id"]},
             {"$set": {"is_verified": True}, "$unset": {"otp_hash": "", "otp_expires_at": ""}},
         )
-        return {"token": make_token(u["id"]), "user_id": u["id"]}
+        return {"token": await issue_token(u["id"]), "user_id": u["id"]}
 
     @api.post("/auth/login")
     async def login(p: LoginIn):
@@ -734,7 +771,7 @@ postbluom.online"""
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        token = make_token(u["id"])
+        token = await issue_token(u["id"])
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
         resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
@@ -896,7 +933,7 @@ postbluom.online"""
         }
         await db.users.insert_one(doc)
         await db.email_otps.delete_one({"email": p.email})
-        return {"token": make_token(uid), "user_id": uid, "requires_phone": True}
+        return {"token": await issue_token(uid), "user_id": uid, "requires_phone": True}
 
     # ── Auth Phone ────────────────────────────────────────────────
     @api.post("/auth/phone-signup-init")
@@ -964,7 +1001,7 @@ postbluom.online"""
         }
         await db.users.insert_one(doc)
         await db.phone_otps.delete_one({"phone": p.phone})
-        return {"token": make_token(uid), "user_id": uid, "requires_email": True}
+        return {"token": await issue_token(uid), "user_id": uid, "requires_email": True}
 
     @api.post("/auth/phone-login")
     async def phone_login(p: PhoneLoginIn):
@@ -982,7 +1019,7 @@ postbluom.online"""
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        token = make_token(u["id"])
+        token = await issue_token(u["id"])
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
         resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
@@ -1039,7 +1076,7 @@ postbluom.online"""
         if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
         await db.users.update_one({"id": u["id"]}, {"$set": {"phone": p.phone, "phone_verified": True}})
         await db.phone_otps.delete_one({"phone": p.phone})
-        return {"message": "Phone verified successfully", "token": make_token(u["id"])}
+        return {"message": "Phone verified successfully", "token": await issue_token(u["id"])}
 
     @api.post("/auth/add-email-init")
     async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
@@ -1077,7 +1114,7 @@ postbluom.online"""
         if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
         await db.users.update_one({"id": u["id"]}, {"$set": {"email": p.email, "email_verified": True}})
         await db.email_otps.delete_one({"email": p.email})
-        return {"message": "Email verified successfully", "token": make_token(u["id"])}
+        return {"message": "Email verified successfully", "token": await issue_token(u["id"])}
 
     # ── Account deletion / restore ────────────────────────────────
     @api.post("/account/delete-request")
@@ -1785,6 +1822,12 @@ postbluom.online"""
     ):
         query: dict = {}
         following_ids = u.get("following", [])
+        excluded_user_ids = set(
+            (u.get("blocked_users") or []) + (u.get("muted_users") or [])
+        )
+        if user_id and user_id != u["id"] and user_id in excluded_user_ids:
+            return {"posts": [], "total": 0, "skip": skip, "limit": limit}
+
         if following_only:
             ids = list(set(following_ids + [u["id"]]))
             query["user_id"] = {"$in": ids} if ids else {"$in": [u["id"]]}
@@ -1818,7 +1861,10 @@ postbluom.online"""
             visible_follower_docs, verified_docs = await asyncio.gather(follower_query, verified_query)
             visible_follower_ids = [v["id"] for v in visible_follower_docs]
             verified_ids = [v["id"] for v in verified_docs]
-            feed_ids = list(set(following_ids + visible_follower_ids + verified_ids + [u["id"]]))
+            feed_ids = [
+                item_id for item_id in set(following_ids + visible_follower_ids + verified_ids + [u["id"]])
+                if item_id not in excluded_user_ids
+            ]
             query["user_id"] = {"$in": feed_ids}
         else:
             if q:
@@ -1840,6 +1886,17 @@ postbluom.online"""
                 {"user_name": {"$regex": q, "$options": "i"}},
                 {"location": {"$regex": q, "$options": "i"}},
             ]
+
+        if excluded_user_ids:
+            current_user_filter = query.get("user_id")
+            if feed and isinstance(current_user_filter, dict) and "$in" in current_user_filter:
+                current_user_filter["$in"] = [
+                    item_id for item_id in current_user_filter["$in"]
+                    if item_id not in excluded_user_ids
+                ]
+            elif not user_id:
+                exclusion_filter = {"user_id": {"$nin": list(excluded_user_ids)}}
+                query = {"$and": [query, exclusion_filter]} if query else exclusion_filter
 
         # Never pull legacy base64 media into the home/profile response. Older
         # uploads can be multiple megabytes per document and were making the
@@ -2081,6 +2138,108 @@ postbluom.online"""
             asyncio.create_task(send_push(post["user_id"], "Repost", u["name"] + " reposted your post"))
         doc.pop("_id", None)
         return {"reposted": True, "post": doc}
+
+    @api.post("/posts/{pid}/repost-to-friend")
+    async def repost_to_friend(pid: str, p: ShareToFriendIn, u=Depends(current_user)):
+        friend_id = p.friend_id.strip()
+        if not friend_id:
+            raise HTTPException(400, "friend_id required")
+        if friend_id == u["id"]:
+            raise HTTPException(400, "You cannot share a post with yourself")
+
+        post = await db.posts.find_one(
+            {"id": pid},
+            {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1,
+             "user_name": 1, "user_handle": 1, "avatar_bg": 1,
+             "avatar_letter": 1, "avatar_photo": 1},
+        )
+        if not post:
+            raise HTTPException(404, "Post not found")
+        friend = await db.users.find_one(
+            {"id": friend_id},
+            {"_id": 0, "id": 1, "name": 1, "blocked_users": 1,
+             "is_badge_verified": 1},
+        )
+        if not friend:
+            raise HTTPException(404, "Friend not found")
+        if friend_id in (u.get("blocked_users") or []) or u["id"] in (friend.get("blocked_users") or []):
+            raise HTTPException(403, "Cannot share with this user")
+        friendship = await db.friend_requests.find_one({
+            "status": "accepted",
+            "$or": [
+                {"from_id": u["id"], "to_id": friend_id},
+                {"from_id": friend_id, "to_id": u["id"]},
+            ],
+        })
+        if not friendship:
+            raise HTTPException(403, "Only connected friends can receive shared posts")
+
+        existing = await db.post_shares.find_one({
+            "post_id": pid, "from_id": u["id"], "to_id": friend_id,
+        })
+        if existing:
+            message_id = existing.get("message_id")
+            if message_id:
+                await db.messages.update_one(
+                    {"id": message_id, "from_id": u["id"], "to_id": friend_id},
+                    {"$set": {
+                        "deleted_for_everyone": True,
+                        "text": "",
+                        "shared_post": None,
+                        "shared_post_id": None,
+                    }},
+                )
+                await _ws_push(friend_id, {"type": "message_deleted", "msg_id": message_id})
+            await db.post_shares.delete_one({"id": existing["id"]})
+            return {"ok": True, "reposted": False}
+
+        shared_post = {
+            "id": post["id"],
+            "content": (post.get("content") or "")[:200],
+            "photo_url": post.get("photo_url") or ((post.get("photo_urls") or [None])[0]),
+            "user_name": post.get("user_name", ""),
+            "user_handle": post.get("user_handle", ""),
+            "avatar_bg": post.get("avatar_bg", ""),
+            "avatar_letter": post.get("avatar_letter", ""),
+            "avatar_photo": post.get("avatar_photo"),
+            "type": "post",
+        }
+        message_id = str(uuid.uuid4())
+        message = {
+            "id": message_id,
+            "from_id": u["id"],
+            "from_name": u["name"],
+            "to_id": friend_id,
+            "text": "",
+            "photo_url": None,
+            "gif_url": None,
+            "mood_color": None,
+            "created_at": now().isoformat(),
+            "status": "sent",
+            "deleted_for": [],
+            "deleted_for_everyone": False,
+            "reply_to_id": None,
+            "reply_to_preview": None,
+            "shared_post": shared_post,
+            "shared_post_id": pid,
+            "shared_via_post_share": True,
+            "audio_url": None,
+            "audio_duration": None,
+        }
+        await db.messages.insert_one(message.copy())
+        await db.post_shares.insert_one({
+            "id": str(uuid.uuid4()),
+            "post_id": pid,
+            "from_id": u["id"],
+            "to_id": friend_id,
+            "message_id": message_id,
+            "created_at": message["created_at"],
+        })
+        await _ws_push(friend_id, {"type": "new_message", "message": message})
+        asyncio.create_task(send_push(
+            friend_id, "Post shared", u["name"] + " shared a post with you", "message"
+        ))
+        return {"ok": True, "reposted": True}
 
     @api.post("/posts/{pid}/mention")
     async def mention_in_post(pid: str, body: dict, u=Depends(current_user)):
@@ -2780,6 +2939,11 @@ postbluom.online"""
             )
         fresh = await db.users.find_one({"id": u["id"]}, {"_id": 0, "notifications_prefs": 1})
         return fresh.get("notifications_prefs", {})
+
+    @api.patch("/settings/theme")
+    async def update_theme(p: ThemeIn, u=Depends(current_user)):
+        await db.users.update_one({"id": u["id"]}, {"$set": {"theme": p.theme}})
+        return {"theme": p.theme}
 
     @api.post("/settings/change-password")
     async def change_password(p: ChangePasswordIn, u=Depends(current_user)):
@@ -3585,8 +3749,8 @@ postbluom.online"""
 
     @api.get("/reels")
     async def list_reels(skip: int = 0, limit: int = 10, u=Depends(current_user)):
-        blocked  = u.get("blocked", [])
-        muted    = u.get("muted", [])
+        blocked  = u.get("blocked_users", [])
+        muted    = u.get("muted_users", [])
         excluded = list(set(blocked + muted))
         query: dict = {}
         if excluded:
@@ -3620,8 +3784,8 @@ postbluom.online"""
         u=Depends(current_user),
     ):
         """Paginated discovery grid sorted by trending score (views*1 + likes*3 + comments*5 - age_decay)."""
-        blocked = u.get("blocked", [])
-        muted   = u.get("muted", [])
+        blocked = u.get("blocked_users", [])
+        muted   = u.get("muted_users", [])
         excluded = list(set(blocked + muted))
         query = {}
         if excluded:
@@ -3684,8 +3848,8 @@ postbluom.online"""
         q = q.strip()
         if not q:
             return {"reels": [], "users": [], "hashtags": []}
-        blocked  = u.get("blocked", [])
-        muted    = u.get("muted", [])
+        blocked  = u.get("blocked_users", [])
+        muted    = u.get("muted_users", [])
         excluded = list(set(blocked + muted))
         search_type = type.lower()
         results = {"reels": [], "users": [], "hashtags": []}
