@@ -1840,10 +1840,25 @@ postbluom.online"""
                 {"user_name": {"$regex": q, "$options": "i"}},
                 {"location": {"$regex": q, "$options": "i"}},
             ]
+
+        # Never pull legacy base64 media into the home/profile response. Older
+        # uploads can be multiple megabytes per document and were making the
+        # feed request consume RAM and remain stuck behind a spinner. This is a
+        # read-time guard only; the original records remain available for the
+        # Cloudinary migration endpoint.
+        legacy_media_filter = {"$nor": [
+            {"video_url": {"$regex": "^data:"}},
+            {"photo_url": {"$regex": "^data:"}},
+            {"photo_urls": {"$elemMatch": {"$regex": "^data:"}}},
+        ]}
+        feed_user_filter = query.get("user_id")
+        if feed or user_id:
+            query = {"$and": [query, legacy_media_filter]} if query else legacy_media_filter
+
         # Reels get merged into the home feed and profile grid (but not search)
         # so a shared reel shows up for followers/following, and stays on the
         # poster's own profile — reusing the same user_id filter built above.
-        include_reels = (feed or bool(user_id)) and not q and "user_id" in query
+        include_reels = (feed or bool(user_id)) and not q and feed_user_filter is not None
         fetch_n = skip + limit
         posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         if include_reels:
@@ -1857,11 +1872,11 @@ postbluom.online"""
                 # Applying limit() to one combined query can drop an old reel
                 # before the mention/repost is merged into the Home feed.
                 normal_task = db.reels.find(
-                    {"user_id": query["user_id"]}, {"_id": 0}
+                    {"$and": [{"user_id": feed_user_filter}, legacy_media_filter]}, {"_id": 0}
                 ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
                 mentioned_task = (
                     db.reels.find(
-                        {"id": {"$in": mentioned_ids}}, {"_id": 0}
+                        {"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter]}, {"_id": 0}
                     ).sort("created_at", -1).to_list(len(mentioned_ids))
                     if mentioned_ids else _empty_list()
                 )
