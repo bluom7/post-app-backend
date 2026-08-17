@@ -3088,14 +3088,17 @@ postbluom.online"""
             except Exception as e:
                 # Code 86 = IndexKeySpecsConflict: existing index has different options.
                 # Drop the old index and recreate with new specs.
-                err_code = getattr(e, "code", None) or getattr(e, "details", {}).get("code")
+                details = getattr(e, "details", None)
+                detail_code = details.get("code") if isinstance(details, dict) else None
+                err_code = getattr(e, "code", None) or detail_code
                 if err_code == 86:
                     try:
-                        index_name = options.get("name") or (
-                            "_".join(f"{k}_{v}" for k, v in ([keys] if isinstance(keys, tuple) else [(keys, 1)])) + "_1"
-                            if isinstance(keys, str) else
-                            "_".join(f"{k}_{v}" for k, v in keys)
-                        )
+                        index_name = options.get("name")
+                        if not index_name:
+                            if isinstance(keys, str):
+                                index_name = f"{keys}_1"
+                            else:
+                                index_name = "_".join(f"{k}_{v}" for k, v in keys)
                         await collection.drop_index(index_name)
                         await collection.create_index(keys, **options)
                         ok_count += 1
