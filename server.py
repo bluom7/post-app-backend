@@ -1387,7 +1387,10 @@ postbluom.online"""
     async def unfollow_user(user_id: str, u=Depends(current_user)):
         await db.users.update_one({"id": user_id}, {"$pull": {"followers": u["id"]}})
         await db.users.update_one({"id": u["id"]}, {"$pull": {"following": user_id}})
-        return {"ok": True}
+        # Also clear an outstanding private-account request so every unfollow path
+        # leaves the relationship in one consistent state.
+        await db.follow_requests.delete_many({"from_id": u["id"], "to_id": user_id})
+        return {"ok": True, "following": False, "pending": False}
 
     @api.get("/users/{user_id}/followers")
     async def get_followers(user_id: str, u=Depends(current_user)):
