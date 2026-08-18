@@ -188,6 +188,16 @@ try:
     @app.get("/ping")
     async def ping():
         return {"status": "ok"}
+
+    # Public lightweight health routes for Render/cron-job.org.
+    # They intentionally do not touch MongoDB so wake-up checks stay reliable.
+    @app.get("/")
+    async def root_health():
+        return {"status": "ok", "service": "post-app-backend"}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "service": "post-app-backend"}
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"], allow_credentials=True,
