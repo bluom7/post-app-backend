@@ -1350,46 +1350,33 @@ postbluom.online"""
         }
 
     # ── Follow / Unfollow ─────────────────────────────────────────
+    async def _persist_follow_notification(notification):
+        try:
+            await db.notifications.insert_one(notification)
+        except Exception:
+            logging.exception("Failed to persist follow notification")
+
     @api.post("/users/{user_id}/follow")
     async def follow_user(user_id: str, u=Depends(current_user)):
         if user_id == u["id"]: raise HTTPException(400, "Can't follow yourself")
         target = await db.users.find_one({"id": user_id})
         if not target: raise HTTPException(404, "User not found")
-        if u["id"] in target.get("blocked_users", []) or user_id in u.get("blocked_users", []):
-            raise HTTPException(403, "Action not allowed")
+        if u["id"] in target.get("blocked_users", []) or user_id in u.get("blocked_users", []): raise HTTPException(403, "Action not allowed")
         if target.get("is_private"):
             existing = await db.follow_requests.find_one({"from_id": u["id"], "to_id": user_id})
             if existing: return {"ok": True, "pending": True}
-            await db.follow_requests.insert_one({
-                "id": str(uuid.uuid4()), "from_id": u["id"], "to_id": user_id,
-                "status": "pending", "created_at": now().isoformat(),
-            })
-            await db.notifications.insert_one({
-                "id": str(uuid.uuid4()), "user_id": user_id,
-                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
-                "type": "follow_request", "created_at": now().isoformat(), "read": False,
-            })
+            await db.follow_requests.insert_one({"id": str(uuid.uuid4()), "from_id": u["id"], "to_id": user_id, "status": "pending", "created_at": now().isoformat()})
+            asyncio.create_task(_persist_follow_notification({"id": str(uuid.uuid4()), "user_id": user_id, "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"), "type": "follow_request", "created_at": now().isoformat(), "read": False}))
             asyncio.create_task(send_push(user_id, "New follow request", u["name"] + " wants to follow you"))
             return {"ok": True, "pending": True}
-        if u["id"] not in target.get("followers", []):
-            await db.users.update_one({"id": user_id}, {"$push": {"followers": u["id"]}})
-        if user_id not in u.get("following", []):
-            await db.users.update_one({"id": u["id"]}, {"$push": {"following": user_id}})
-        await db.notifications.insert_one({
-            "id": str(uuid.uuid4()), "user_id": user_id,
-            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
-            "type": "follow", "created_at": now().isoformat(), "read": False,
-        })
+        await asyncio.gather(db.users.update_one({"id": user_id}, {"$addToSet": {"followers": u["id"]}}), db.users.update_one({"id": u["id"]}, {"$addToSet": {"following": user_id}}))
+        asyncio.create_task(_persist_follow_notification({"id": str(uuid.uuid4()), "user_id": user_id, "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"), "type": "follow", "created_at": now().isoformat(), "read": False}))
         asyncio.create_task(send_push(user_id, "New follower", u["name"] + " started following you"))
         return {"ok": True, "pending": False}
 
     @api.post("/users/{user_id}/unfollow")
     async def unfollow_user(user_id: str, u=Depends(current_user)):
-        await db.users.update_one({"id": user_id}, {"$pull": {"followers": u["id"]}})
-        await db.users.update_one({"id": u["id"]}, {"$pull": {"following": user_id}})
-        # Also clear an outstanding private-account request so every unfollow path
-        # leaves the relationship in one consistent state.
-        await db.follow_requests.delete_many({"from_id": u["id"], "to_id": user_id})
+        await asyncio.gather(db.users.update_one({"id": user_id}, {"$pull": {"followers": u["id"]}}), db.users.update_one({"id": u["id"]}, {"$pull": {"following": user_id}}), db.follow_requests.delete_many({"from_id": u["id"], "to_id": user_id}))
         return {"ok": True, "following": False, "pending": False}
 
     @api.get("/users/{user_id}/followers")
