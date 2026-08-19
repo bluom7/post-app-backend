@@ -110,13 +110,13 @@ else:
     _library = None
     _fs = None
 
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5").strip() or "claude-sonnet-5"
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
 MODEL_CANDIDATES = list(dict.fromkeys([
     MODEL,
-    "claude-sonnet-5",
     "claude-sonnet-4-6",
-    "claude-opus-5",
-    "claude-haiku-4-5",
+    "claude-sonnet-4-5",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
 ]))
 MAX_TOKENS = 1024
 MAX_HISTORY_MESSAGES = 20       # trim to keep token usage sane on free tier
