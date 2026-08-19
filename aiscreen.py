@@ -111,6 +111,7 @@ else:
     _fs = None
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+MODEL_CANDIDATES = list(dict.fromKeys([MODEL, "claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022"]))
 MAX_TOKENS = 1024
 MAX_HISTORY_MESSAGES = 20       # trim to keep token usage sane on free tier
 MAX_MESSAGE_CHARS = 4000
@@ -248,6 +249,26 @@ def _call_with_retry(fn, retries=2):
     raise last_err
 
 
+def _create_message_with_fallback(messages):
+    last_error = None
+    for model_name in MODEL_CANDIDATES:
+        try:
+            return _call_with_retry(
+                lambda: client.messages.create(
+                    model=model_name,
+                    max_tokens=MAX_TOKENS,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                )
+            )
+        except anthropic.APIError as exc:
+            last_error = exc
+            logger.warning("Anthropic model failed: %s", model_name)
+    if last_error:
+        raise last_error
+    raise RuntimeError("No Anthropic model configured")
+
+
 def _extract_reply_and_search_flag(response):
     text_parts = []
     used_search = False
@@ -361,14 +382,7 @@ def chat(req: ChatRequest):
     messages = _build_messages(req.history, text)
 
     try:
-        response = _call_with_retry(
-            lambda: client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            )
-        )
+        response = _create_message_with_fallback(messages)
     except anthropic.APIError:
         logger.exception("AI provider error")
         raise HTTPException(status_code=502, detail="Couldn't get a reply from the AI, please try again.")
@@ -468,15 +482,7 @@ async def chat_with_image(
     ]
 
     try:
-        response = await asyncio.to_thread(
-            _call_with_retry,
-            lambda: client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_content}],
-            ),
-        )
+        response = await asyncio.to_thread(_create_message_with_fallback, [{"role": "user", "content": user_content}])
     except anthropic.APIError:
         logger.exception("AI provider error (image)")
         raise HTTPException(status_code=502, detail="Couldn't process the image, please try again.")
@@ -557,6 +563,7 @@ def health():
         "configured": client is not None,
         "history_configured": _conversations is not None,
         "auth_configured": bool(JWT_SECRET) and _users is not None,
+        "model": MODEL,
     }
 
 
