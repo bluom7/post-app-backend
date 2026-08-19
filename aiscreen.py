@@ -110,8 +110,14 @@ else:
     _library = None
     _fs = None
 
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-MODEL_CANDIDATES = list(dict.fromkeys([MODEL, "claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022"]))
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5").strip() or "claude-sonnet-5"
+MODEL_CANDIDATES = list(dict.fromkeys([
+    MODEL,
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-opus-5",
+    "claude-haiku-4-5",
+]))
 MAX_TOKENS = 1024
 MAX_HISTORY_MESSAGES = 20       # trim to keep token usage sane on free tier
 MAX_MESSAGE_CHARS = 4000
@@ -383,7 +389,7 @@ def chat(req: ChatRequest):
 
     try:
         response = _create_message_with_fallback(messages)
-    except anthropic.APIError:
+    except Exception:
         logger.exception("AI provider error")
         raise HTTPException(status_code=502, detail="Couldn't get a reply from the AI, please try again.")
 
@@ -413,30 +419,41 @@ def chat_stream(req: ChatRequest):
     oid = _get_or_create_conversation(req.conversation_id, req.user_id or "anon", text)
 
     def event_gen():
-        used_search = False
-        full_text = ""
-        try:
-            with client.messages.stream(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            ) as stream:
-                for event in stream:
-                    if event.type == "content_block_delta" and getattr(event.delta, "text", None):
-                        full_text += event.delta.text
-                        yield _sse("delta", {"text": event.delta.text})
-                    elif event.type == "content_block_start" and event.content_block.type in (
-                        "server_tool_use",
-                        "web_search_tool_result",
-                    ):
-                        used_search = True
-                        yield _sse("status", {"message": "Searching the web..."})
-            _append_turn(oid, text, full_text)
-            yield _sse("done", {"used_search": used_search, "conversation_id": str(oid) if oid else None})
-        except anthropic.APIError:
-            logger.exception("AI provider stream error")
-            yield _sse("error", {"message": "Connection to the AI dropped, please try again."})
+        # A retired/unsupported model must not take the whole chat down. Try
+        # each active candidate until a stream starts successfully.
+        last_error = None
+        for model_name in MODEL_CANDIDATES:
+            used_search = False
+            full_text = ""
+            try:
+                with client.messages.stream(
+                    model=model_name,
+                    max_tokens=MAX_TOKENS,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                ) as stream:
+                    for event in stream:
+                        if event.type == "content_block_delta" and getattr(event.delta, "text", None):
+                            full_text += event.delta.text
+                            yield _sse("delta", {"text": event.delta.text})
+                        elif event.type == "content_block_start":
+                            block_type = getattr(getattr(event, "content_block", None), "type", None)
+                            if block_type in ("server_tool_use", "web_search_tool_result"):
+                                used_search = True
+                                yield _sse("status", {"message": "Searching the web..."})
+                _append_turn(oid, text, full_text)
+                yield _sse("done", {"used_search": used_search, "conversation_id": str(oid) if oid else None})
+                return
+            except anthropic.APIError as exc:
+                last_error = exc
+                logger.warning("Anthropic streaming model failed: %s", model_name)
+                # Retrying after partial output would duplicate the answer.
+                if full_text:
+                    break
+
+        if last_error:
+            logger.error("AI provider stream failed for all configured models", exc_info=last_error)
+        yield _sse("error", {"message": "Connection to the AI dropped, please try again."})
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -483,7 +500,7 @@ async def chat_with_image(
 
     try:
         response = await asyncio.to_thread(_create_message_with_fallback, [{"role": "user", "content": user_content}])
-    except anthropic.APIError:
+    except Exception:
         logger.exception("AI provider error (image)")
         raise HTTPException(status_code=502, detail="Couldn't process the image, please try again.")
 
