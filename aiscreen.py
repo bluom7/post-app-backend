@@ -239,19 +239,20 @@ def _build_messages(history: List[ChatMessage], new_user_content):
 
 
 def _call_with_retry(fn, retries=2):
-    """Retry once on transient 5xx/overload errors before giving up."""
+    """Retry transient provider failures without depending on SDK exception class names."""
     last_err = None
     for attempt in range(retries + 1):
         try:
             return fn()
-        except anthropic.APIStatusError as e:
-            last_err = e
-            if e.status_code and e.status_code < 500:
+        except Exception as exc:
+            last_err = exc
+            status = getattr(exc, "status_code", None)
+            # Client/request errors should fail immediately; retry server and
+            # connection errors, including errors from older SDK versions.
+            if status is not None and status < 500:
                 raise
-            time.sleep(0.6 * (attempt + 1))
-        except anthropic.APIConnectionError as e:
-            last_err = e
-            time.sleep(0.6 * (attempt + 1))
+            if attempt < retries:
+                time.sleep(0.6 * (attempt + 1))
     raise last_err
 
 
@@ -283,7 +284,7 @@ def _create_message_with_fallback(messages):
                     messages=messages,
                 )
             )
-        except anthropic.APIError as exc:
+        except Exception as exc:
             last_error = exc
             logger.warning("Anthropic model failed: %s (status=%s)", model_name, getattr(exc, "status_code", None))
     if last_error:
@@ -405,12 +406,9 @@ def chat(req: ChatRequest):
 
     try:
         response = _create_message_with_fallback(messages)
-    except anthropic.APIError as exc:
+    except Exception as exc:
         logger.exception("AI provider error (status=%s)", getattr(exc, "status_code", None))
         raise HTTPException(status_code=502, detail=_provider_error_message(exc))
-    except Exception:
-        logger.exception("AI provider error")
-        raise HTTPException(status_code=502, detail="Couldn't get a reply from the AI, please try again.")
 
     reply, used_search = _extract_reply_and_search_flag(response)
     reply = reply or "I didn't quite catch that, please try again."
@@ -463,7 +461,7 @@ def chat_stream(req: ChatRequest):
                 _append_turn(oid, text, full_text)
                 yield _sse("done", {"used_search": used_search, "conversation_id": str(oid) if oid else None})
                 return
-            except anthropic.APIError as exc:
+            except Exception as exc:
                 last_error = exc
                 logger.warning("Anthropic streaming model failed: %s", model_name)
                 # Retrying after partial output would duplicate the answer.
@@ -521,12 +519,9 @@ async def chat_with_image(
 
     try:
         response = await asyncio.to_thread(_create_message_with_fallback, [{"role": "user", "content": user_content}])
-    except anthropic.APIError as exc:
+    except Exception as exc:
         logger.exception("AI provider error (image, status=%s)", getattr(exc, "status_code", None))
         raise HTTPException(status_code=502, detail=_provider_error_message(exc))
-    except Exception:
-        logger.exception("AI provider error (image)")
-        raise HTTPException(status_code=502, detail="Couldn't process the image, please try again.")
 
     reply, used_search = _extract_reply_and_search_flag(response)
     reply = reply or "I couldn't understand the image, please try again."
