@@ -21,7 +21,7 @@ try:
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption, load_der_private_key
     from cryptography.hazmat.primitives.hashes import SHA256
     from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
-    from aiscreen import ai_router
+    from aiscreen import ai_router, auth_router, library_router
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -4661,6 +4661,8 @@ postbluom.online"""
     # Register all routes
     app.include_router(api)
     app.include_router(ai_router, prefix="/api/ai", tags=["ai-agent"])
+    app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
+    app.include_router(library_router, prefix="/api/library", tags=["library"])
 
     print("==> [DIAG] server.py loaded OK — app is ready", file=_sys.stderr, flush=True)
 

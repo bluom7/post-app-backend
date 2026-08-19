@@ -82,7 +82,7 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 
 # ---- MongoDB setup (conversations + users) ------------------------------
-MONGODB_URI = os.environ.get("MONGODB_URI")
+MONGODB_URI = (os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL") or "").strip()
 _mongo_client = None
 _db = None
 _conversations = None
