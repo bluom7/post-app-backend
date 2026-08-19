@@ -255,6 +255,22 @@ def _call_with_retry(fn, retries=2):
     raise last_err
 
 
+def _provider_error_message(exc):
+    """Return a safe, actionable message without exposing provider credentials."""
+    status = getattr(exc, "status_code", None)
+    if status == 401:
+        return "AI provider authentication failed. Update ANTHROPIC_API_KEY on Render."
+    if status == 403:
+        return "AI provider access is not permitted for this key or model. Check the Anthropic account on Render."
+    if status == 404:
+        return "The configured AI model is unavailable. Set ANTHROPIC_MODEL to an active Claude model on Render."
+    if status == 429:
+        return "The AI provider rate limit or usage limit was reached. Try again shortly or check Anthropic billing."
+    if status and status >= 500:
+        return "The AI provider is temporarily unavailable. Please try again shortly."
+    return "The AI provider request failed. Check the Anthropic key, model, and Render logs."
+
+
 def _create_message_with_fallback(messages):
     last_error = None
     for model_name in MODEL_CANDIDATES:
@@ -269,7 +285,7 @@ def _create_message_with_fallback(messages):
             )
         except anthropic.APIError as exc:
             last_error = exc
-            logger.warning("Anthropic model failed: %s", model_name)
+            logger.warning("Anthropic model failed: %s (status=%s)", model_name, getattr(exc, "status_code", None))
     if last_error:
         raise last_error
     raise RuntimeError("No Anthropic model configured")
@@ -389,6 +405,9 @@ def chat(req: ChatRequest):
 
     try:
         response = _create_message_with_fallback(messages)
+    except anthropic.APIError as exc:
+        logger.exception("AI provider error (status=%s)", getattr(exc, "status_code", None))
+        raise HTTPException(status_code=502, detail=_provider_error_message(exc))
     except Exception:
         logger.exception("AI provider error")
         raise HTTPException(status_code=502, detail="Couldn't get a reply from the AI, please try again.")
@@ -452,8 +471,10 @@ def chat_stream(req: ChatRequest):
                     break
 
         if last_error:
-            logger.error("AI provider stream failed for all configured models", exc_info=last_error)
-        yield _sse("error", {"message": "Connection to the AI dropped, please try again."})
+            logger.error("AI provider stream failed for all configured models (status=%s)", getattr(last_error, "status_code", None), exc_info=last_error)
+            yield _sse("error", {"message": _provider_error_message(last_error)})
+        else:
+            yield _sse("error", {"message": "Connection to the AI dropped, please try again."})
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -500,6 +521,9 @@ async def chat_with_image(
 
     try:
         response = await asyncio.to_thread(_create_message_with_fallback, [{"role": "user", "content": user_content}])
+    except anthropic.APIError as exc:
+        logger.exception("AI provider error (image, status=%s)", getattr(exc, "status_code", None))
+        raise HTTPException(status_code=502, detail=_provider_error_message(exc))
     except Exception:
         logger.exception("AI provider error (image)")
         raise HTTPException(status_code=502, detail="Couldn't process the image, please try again.")
