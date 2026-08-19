@@ -111,7 +111,7 @@ else:
     _fs = None
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-MODEL_CANDIDATES = list(dict.fromKeys([MODEL, "claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022"]))
+MODEL_CANDIDATES = list(dict.fromkeys([MODEL, "claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022"]))
 MAX_TOKENS = 1024
 MAX_HISTORY_MESSAGES = 20       # trim to keep token usage sane on free tier
 MAX_MESSAGE_CHARS = 4000
