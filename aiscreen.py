@@ -269,7 +269,7 @@ def _provider_error_message(exc):
         return "The AI provider rate limit or usage limit was reached. Try again shortly or check Anthropic billing."
     if status and status >= 500:
         return "The AI provider is temporarily unavailable. Please try again shortly."
-    return "The AI provider request failed. Check the Anthropic key, model, and Render logs."
+    return f"The AI provider request failed ({type(exc).__name__}). Check the Anthropic key, model, and Render logs."
 
 
 def _create_message_with_fallback(messages):
