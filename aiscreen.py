@@ -110,7 +110,7 @@ else:
     _library = None
     _fs = None
 
-MODEL = "claude-sonnet-5"
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 MAX_TOKENS = 1024
 MAX_HISTORY_MESSAGES = 20       # trim to keep token usage sane on free tier
 MAX_MESSAGE_CHARS = 4000
@@ -127,8 +127,7 @@ _rate_buckets: dict = defaultdict(deque)
 SYSTEM_PROMPT = (
     "You are the AI Agent inside the POST app — a friendly, concise assistant. "
     "Users can chat with you or send a photo for you to identify/explain. "
-    "When a question needs current or real-world facts (news, prices, scores, "
-    "recent events, 'who is', 'latest', etc.), use the web_search tool before answering. "
+    "For current or time-sensitive facts, be clear when you may not have live data. "
     "Keep answers short and mobile-friendly unless the user asks for detail. "
     "You may use light markdown: **bold**, `inline code`, and short lists. "
     "Reply in the same language/style the user writes in."
@@ -368,7 +367,6 @@ def chat(req: ChatRequest):
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
                 messages=messages,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
             )
         )
     except anthropic.APIError:
@@ -409,7 +407,6 @@ def chat_stream(req: ChatRequest):
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
                 messages=messages,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
             ) as stream:
                 for event in stream:
                     if event.type == "content_block_delta" and getattr(event.delta, "text", None):
@@ -478,7 +475,6 @@ async def chat_with_image(
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_content}],
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
             ),
         )
     except anthropic.APIError:
