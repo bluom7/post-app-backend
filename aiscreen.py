@@ -238,15 +238,14 @@ def _decode_token(authorization: Optional[str]) -> str:
 
 # ---- Chat helpers --------------------------------------------------------
 def _require_client():
-      if client is None and not GEMINI_API_KEY:
-          raise HTTPException(
-              status_code=500,
-              detail="AI agent not configured — set GEMINI_API_KEY on the server.",
-          )
+    if client is None and not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="AI agent not configured — set GEMINI_API_KEY on the server.",
+        )
 
 
-
-    def _check_rate_limit(user_id: str):
+def _check_rate_limit(user_id: str):
     now = time.time()
     bucket = _rate_buckets[user_id]
     while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SEC:
@@ -285,101 +284,98 @@ def _call_with_retry(fn, retries=2):
 
 
 def _provider_error_message(exc):
-      """Return a safe, actionable message without exposing provider credentials."""
-      status = getattr(exc, "status_code", None)
-      provider = getattr(exc, "provider", "AI")
-      key_name = "GEMINI_API_KEY" if provider == "Gemini" else "ANTHROPIC_API_KEY"
-      if status in (401, 403):
-          return f"{provider} authentication failed. Check {key_name} on the backend server."
-      if status == 404:
-          return f"The configured AI model ({GEMINI_MODEL if provider == 'Gemini' else 'Claude'}) is unavailable."
-      if status == 429:
-          return f"{provider} rate or usage limit reached. Try again shortly."
-      if status and status >= 500:
-          return "The AI provider is temporarily unavailable. Please try again shortly."
-      return f"The AI provider request failed ({type(exc).__name__}). Check the backend AI configuration."
+    """Return a safe, actionable message without exposing provider credentials."""
+    status = getattr(exc, "status_code", None)
+    provider = getattr(exc, "provider", "AI")
+    key_name = "GEMINI_API_KEY" if provider == "Gemini" else "ANTHROPIC_API_KEY"
+    if status in (401, 403):
+        return f"{provider} authentication failed. Check {key_name} on the backend server."
+    if status == 404:
+        return f"The configured AI model ({GEMINI_MODEL if provider == 'Gemini' else 'Claude'}) is unavailable."
+    if status == 429:
+        return f"{provider} rate or usage limit reached. Try again shortly."
+    if status and status >= 500:
+        return "The AI provider is temporarily unavailable. Please try again shortly."
+    return f"The AI provider request failed ({type(exc).__name__}). Check the backend AI configuration."
 
 
-
-    class GeminiProviderError(Exception):
-      def __init__(self, status_code, detail=""):
-          self.status_code = status_code
-          self.provider = "Gemini"
-          super().__init__(detail or "Gemini request failed")
-
-
-    def _gemini_content_parts(content):
-      if isinstance(content, str):
-          return [{"text": content}]
-      parts = []
-      for item in content or []:
-          if item.get("type") == "text":
-              parts.append({"text": item.get("text", "")})
-          elif item.get("type") == "image" and item.get("source", {}).get("data"):
-              source = item["source"]
-              parts.append({"inline_data": {"mime_type": source.get("media_type", "image/jpeg"), "data": source["data"]}})
-      return parts or [{"text": ""}]
+class GeminiProviderError(Exception):
+    def __init__(self, status_code, detail=""):
+        self.status_code = status_code
+        self.provider = "Gemini"
+        super().__init__(detail or "Gemini request failed")
 
 
-    def _create_gemini_message(messages):
-      contents = []
-      for message in messages:
-          role = "model" if message.get("role") == "assistant" else "user"
-          contents.append({"role": role, "parts": _gemini_content_parts(message.get("content"))})
-      payload = {
-          "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-          "contents": contents,
-          "generationConfig": {"maxOutputTokens": 8192},
-      }
-      try:
-          response = httpx.post(GEMINI_URL.format(GEMINI_MODEL), params={"key": GEMINI_API_KEY}, json=payload, timeout=60.0)
-      except Exception as exc:
-          raise GeminiProviderError(503, str(exc)) from exc
-      if response.status_code >= 400:
-          raise GeminiProviderError(response.status_code, response.text[:500])
-      return {"provider": "gemini", "data": response.json()}
+def _gemini_content_parts(content):
+    if isinstance(content, str):
+        return [{"text": content}]
+    parts = []
+    for item in content or []:
+        if item.get("type") == "text":
+            parts.append({"text": item.get("text", "")})
+        elif item.get("type") == "image" and item.get("source", {}).get("data"):
+            source = item["source"]
+            parts.append({"inline_data": {"mime_type": source.get("media_type", "image/jpeg"), "data": source["data"]}})
+    return parts or [{"text": ""}]
 
 
-    def _create_message_with_fallback(messages):
-      if GEMINI_API_KEY:
-          return _call_with_retry(lambda: _create_gemini_message(messages))
-      last_error = None
-      for model_name in MODEL_CANDIDATES:
-          try:
-              return _call_with_retry(
-                  lambda: client.messages.create(
-                      model=model_name,
-                      max_tokens=MAX_TOKENS,
-                      system=SYSTEM_PROMPT,
-                      messages=messages,
-                  )
-              )
-          except Exception as exc:
-              last_error = exc
-              logger.warning("Anthropic model failed: %s (status=%s)", model_name, getattr(exc, "status_code", None))
-      if last_error:
-          raise last_error
-      raise RuntimeError("No AI model configured")
+def _create_gemini_message(messages):
+    contents = []
+    for message in messages:
+        role = "model" if message.get("role") == "assistant" else "user"
+        contents.append({"role": role, "parts": _gemini_content_parts(message.get("content"))})
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 8192},
+    }
+    try:
+        response = httpx.post(GEMINI_URL.format(GEMINI_MODEL), params={"key": GEMINI_API_KEY}, json=payload, timeout=60.0)
+    except Exception as exc:
+        raise GeminiProviderError(503, str(exc)) from exc
+    if response.status_code >= 400:
+        raise GeminiProviderError(response.status_code, response.text[:500])
+    return {"provider": "gemini", "data": response.json()}
 
 
+def _create_message_with_fallback(messages):
+    if GEMINI_API_KEY:
+        return _call_with_retry(lambda: _create_gemini_message(messages))
+    last_error = None
+    for model_name in MODEL_CANDIDATES:
+        try:
+            return _call_with_retry(
+                lambda: client.messages.create(
+                    model=model_name,
+                    max_tokens=MAX_TOKENS,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                )
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Anthropic model failed: %s (status=%s)", model_name, getattr(exc, "status_code", None))
+    if last_error:
+        raise last_error
+    raise RuntimeError("No AI model configured")
 
-    def _extract_reply_and_search_flag(response):
-      if isinstance(response, dict) and response.get("provider") == "gemini":
-          candidates = response.get("data", {}).get("candidates", [])
-          parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-          return "\n".join(part.get("text", "") for part in parts if part.get("text")).strip(), False
-      text_parts = []
-      used_search = False
-      for block in response.content:
-          if block.type == "text":
-              text_parts.append(block.text)
-          elif block.type in ("server_tool_use", "web_search_tool_result"):
-              used_search = True
-      return "\n".join(text_parts).strip(), used_search
+
+def _extract_reply_and_search_flag(response):
+    if isinstance(response, dict) and response.get("provider") == "gemini":
+        candidates = response.get("data", {}).get("candidates", [])
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        return "\n".join(part.get("text", "") for part in parts if part.get("text")).strip(), False
+    text_parts = []
+    used_search = False
+    for block in response.content:
+        if block.type == "text":
+            text_parts.append(block.text)
+        elif block.type in ("server_tool_use", "web_search_tool_result"):
+            used_search = True
+    return "\n".join(text_parts).strip(), used_search
 
 
-
-    def _sse(event: str, data: dict) -> str:
+def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
