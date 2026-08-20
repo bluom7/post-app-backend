@@ -110,6 +110,26 @@ GEMINI_MODEL_CANDIDATES = list(dict.fromkeys([
 ]))
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 
+
+def _gemini_model_candidates():
+    """Prefer configured models, then discover models enabled for this API key."""
+    candidates = list(GEMINI_MODEL_CANDIDATES)
+    try:
+        response = httpx.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"key": GEMINI_API_KEY},
+            timeout=15.0,
+        )
+        if response.status_code < 400:
+            for item in response.json().get("models", []):
+                methods = item.get("supportedGenerationMethods", [])
+                name = (item.get("name") or "").removeprefix("models/")
+                if name and "generateContent" in methods:
+                    candidates.append(name)
+    except Exception as exc:
+        logger.warning("Could not discover Gemini models: %s", type(exc).__name__)
+    return list(dict.fromkeys(candidates))
+
 # ---- JWT setup (real auth — same secret your login endpoint signs with) --
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
@@ -347,7 +367,7 @@ def _create_gemini_message(messages, model_name=None):
 def _create_message_with_fallback(messages):
     if GEMINI_API_KEY:
         last_error = None
-        for model_name in GEMINI_MODEL_CANDIDATES:
+        for model_name in _gemini_model_candidates():
             try:
                 return _call_with_retry(lambda: _create_gemini_message(messages, model_name))
             except Exception as exc:
