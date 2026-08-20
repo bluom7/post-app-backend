@@ -380,13 +380,20 @@ def _create_message_with_fallback(messages):
     raise RuntimeError("No AI model configured")
 
 
-def _clean_reply(text):
+def _clean_reply(text, user_text=""):
     """Remove leaked planning text and keep mobile replies concise."""
     cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.IGNORECASE | re.DOTALL)
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    markers = ("the user said", "the user is", "* role:", "* tone:", "* task:", "role: ai agent", "thought process")
+    markers = ("the user said", "the user is", "* role:", "* tone:", "* task:", "role: ai agent", "thought process", "the system instructions state", "system instructions:", "system prompt:", "you are the ai agent")
     marker_indexes = [i for i, line in enumerate(lines) if line.lower().startswith(markers)]
     if marker_indexes:
+        lowered = cleaned.lower()
+        leak_markers = ("the system instructions state", "system instructions:", "system prompt:", "you are the ai agent")
+        if any(marker in lowered for marker in leak_markers):
+            user_lower = (user_text or "").strip().lower()
+            if re.match(r"^(hi|hello|hey|hii|h29|namaste|kaise ho|how are you)\b", user_lower):
+                return "Hi! How can I help you today?"
+            return "I’m here to help. Please ask your question again."
         tail = lines[max(marker_indexes) + 1:]
         candidates = []
         for line in tail:
@@ -408,11 +415,11 @@ def _clean_reply(text):
     return cleaned.strip()
 
 
-def _extract_reply_and_search_flag(response):
+def _extract_reply_and_search_flag(response, user_text=""):
     if isinstance(response, dict) and response.get("provider") == "gemini":
         candidates = response.get("data", {}).get("candidates", [])
         parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-        return _clean_reply("\n".join(part.get("text", "") for part in parts if part.get("text"))), False
+        return _clean_reply("\n".join(part.get("text", "") for part in parts if part.get("text")), user_text), False
     text_parts = []
     used_search = False
     for block in response.content:
@@ -420,7 +427,7 @@ def _extract_reply_and_search_flag(response):
             text_parts.append(block.text)
         elif block.type in ("server_tool_use", "web_search_tool_result"):
             used_search = True
-    return _clean_reply("\n".join(text_parts)), used_search
+    return _clean_reply("\n".join(text_parts), user_text), used_search
 
 
 def _sse(event: str, data: dict) -> str:
@@ -530,7 +537,7 @@ def chat(req: ChatRequest):
         logger.exception("AI provider error (status=%s)", getattr(exc, "status_code", None))
         raise HTTPException(status_code=502, detail=_provider_error_message(exc))
 
-    reply, used_search = _extract_reply_and_search_flag(response)
+    reply, used_search = _extract_reply_and_search_flag(response, text)
     reply = reply or "I didn't quite catch that, please try again."
 
     oid = _get_or_create_conversation(req.conversation_id, req.user_id or "anon", text)
@@ -561,7 +568,7 @@ def chat_stream(req: ChatRequest):
             for model_name in GEMINI_MODEL_CANDIDATES:
                 try:
                     response = _call_with_retry(lambda: _create_gemini_message(messages, model_name))
-                    reply, used_search = _extract_reply_and_search_flag(response)
+                    reply, used_search = _extract_reply_and_search_flag(response, text)
                     if reply:
                         yield _sse("delta", {"text": reply})
                     _append_turn(oid, text, reply)
