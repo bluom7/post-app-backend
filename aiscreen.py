@@ -99,9 +99,9 @@ async def generate_image(body: GenerateImageRequest):
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# Gemini is intentionally locked to the single requested model.
+# Gemini is intentionally locked to the requested Gemma model.
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemma-4-26b-a4b-it"
 GEMINI_MODEL_CANDIDATES = [GEMINI_MODEL]
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 
