@@ -117,7 +117,7 @@ def _gemini_model_candidates():
     try:
         response = httpx.get(
             "https://generativelanguage.googleapis.com/v1beta/models",
-            params={"key": GEMINI_API_KEY},
+            headers={"x-goog-api-key": GEMINI_API_KEY},
             timeout=15.0,
         )
         if response.status_code < 400:
@@ -356,7 +356,12 @@ def _create_gemini_message(messages, model_name=None):
         "generationConfig": {"maxOutputTokens": 8192},
     }
     try:
-        response = httpx.post(GEMINI_URL.format(model_name or GEMINI_MODEL), params={"key": GEMINI_API_KEY}, json=payload, timeout=60.0)
+        response = httpx.post(
+            GEMINI_URL.format(model_name or GEMINI_MODEL),
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            json=payload,
+            timeout=60.0,
+        )
     except Exception as exc:
         raise GeminiProviderError(503, str(exc)) from exc
     if response.status_code >= 400:
