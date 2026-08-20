@@ -98,6 +98,11 @@ async def generate_image(body: GenerateImageRequest):
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
+# Gemini is primary when GEMINI_API_KEY is configured on the backend runtime.
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+
 # ---- JWT setup (real auth — same secret your login endpoint signs with) --
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
@@ -232,14 +237,15 @@ def _decode_token(authorization: Optional[str]) -> str:
 
 # ---- Chat helpers --------------------------------------------------------
 def _require_client():
-    if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="AI agent not configured — set ANTHROPIC_API_KEY on the server.",
-        )
+      if client is None and not GEMINI_API_KEY:
+          raise HTTPException(
+              status_code=500,
+              detail="AI agent not configured — set GEMINI_API_KEY on the server.",
+          )
 
 
-def _check_rate_limit(user_id: str):
+
+    def _check_rate_limit(user_id: str):
     now = time.time()
     bucket = _rate_buckets[user_id]
     while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SEC:
@@ -278,53 +284,101 @@ def _call_with_retry(fn, retries=2):
 
 
 def _provider_error_message(exc):
-    """Return a safe, actionable message without exposing provider credentials."""
-    status = getattr(exc, "status_code", None)
-    if status == 401:
-        return "AI provider authentication failed. Update ANTHROPIC_API_KEY on Render."
-    if status == 403:
-        return "AI provider access is not permitted for this key or model. Check the Anthropic account on Render."
-    if status == 404:
-        return "The configured AI model is unavailable. Set ANTHROPIC_MODEL to an active Claude model on Render."
-    if status == 429:
-        return "The AI provider rate limit or usage limit was reached. Try again shortly or check Anthropic billing."
-    if status and status >= 500:
-        return "The AI provider is temporarily unavailable. Please try again shortly."
-    return f"The AI provider request failed ({type(exc).__name__}). Check the Anthropic key, model, and Render logs."
+      """Return a safe, actionable message without exposing provider credentials."""
+      status = getattr(exc, "status_code", None)
+      provider = getattr(exc, "provider", "AI")
+      key_name = "GEMINI_API_KEY" if provider == "Gemini" else "ANTHROPIC_API_KEY"
+      if status in (401, 403):
+          return f"{provider} authentication failed. Check {key_name} on the backend server."
+      if status == 404:
+          return f"The configured AI model ({GEMINI_MODEL if provider == 'Gemini' else 'Claude'}) is unavailable."
+      if status == 429:
+          return f"{provider} rate or usage limit reached. Try again shortly."
+      if status and status >= 500:
+          return "The AI provider is temporarily unavailable. Please try again shortly."
+      return f"The AI provider request failed ({type(exc).__name__}). Check the backend AI configuration."
 
 
-def _create_message_with_fallback(messages):
-    last_error = None
-    for model_name in MODEL_CANDIDATES:
-        try:
-            return _call_with_retry(
-                lambda: client.messages.create(
-                    model=model_name,
-                    max_tokens=MAX_TOKENS,
-                    system=SYSTEM_PROMPT,
-                    messages=messages,
-                )
-            )
-        except Exception as exc:
-            last_error = exc
-            logger.warning("Anthropic model failed: %s (status=%s)", model_name, getattr(exc, "status_code", None))
-    if last_error:
-        raise last_error
-    raise RuntimeError("No Anthropic model configured")
+
+    class GeminiProviderError(Exception):
+      def __init__(self, status_code, detail=""):
+          self.status_code = status_code
+          self.provider = "Gemini"
+          super().__init__(detail or "Gemini request failed")
 
 
-def _extract_reply_and_search_flag(response):
-    text_parts = []
-    used_search = False
-    for block in response.content:
-        if block.type == "text":
-            text_parts.append(block.text)
-        elif block.type in ("server_tool_use", "web_search_tool_result"):
-            used_search = True
-    return "\n".join(text_parts).strip(), used_search
+    def _gemini_content_parts(content):
+      if isinstance(content, str):
+          return [{"text": content}]
+      parts = []
+      for item in content or []:
+          if item.get("type") == "text":
+              parts.append({"text": item.get("text", "")})
+          elif item.get("type") == "image" and item.get("source", {}).get("data"):
+              source = item["source"]
+              parts.append({"inline_data": {"mime_type": source.get("media_type", "image/jpeg"), "data": source["data"]}})
+      return parts or [{"text": ""}]
 
 
-def _sse(event: str, data: dict) -> str:
+    def _create_gemini_message(messages):
+      contents = []
+      for message in messages:
+          role = "model" if message.get("role") == "assistant" else "user"
+          contents.append({"role": role, "parts": _gemini_content_parts(message.get("content"))})
+      payload = {
+          "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+          "contents": contents,
+          "generationConfig": {"maxOutputTokens": 8192},
+      }
+      try:
+          response = httpx.post(GEMINI_URL.format(GEMINI_MODEL), params={"key": GEMINI_API_KEY}, json=payload, timeout=60.0)
+      except Exception as exc:
+          raise GeminiProviderError(503, str(exc)) from exc
+      if response.status_code >= 400:
+          raise GeminiProviderError(response.status_code, response.text[:500])
+      return {"provider": "gemini", "data": response.json()}
+
+
+    def _create_message_with_fallback(messages):
+      if GEMINI_API_KEY:
+          return _call_with_retry(lambda: _create_gemini_message(messages))
+      last_error = None
+      for model_name in MODEL_CANDIDATES:
+          try:
+              return _call_with_retry(
+                  lambda: client.messages.create(
+                      model=model_name,
+                      max_tokens=MAX_TOKENS,
+                      system=SYSTEM_PROMPT,
+                      messages=messages,
+                  )
+              )
+          except Exception as exc:
+              last_error = exc
+              logger.warning("Anthropic model failed: %s (status=%s)", model_name, getattr(exc, "status_code", None))
+      if last_error:
+          raise last_error
+      raise RuntimeError("No AI model configured")
+
+
+
+    def _extract_reply_and_search_flag(response):
+      if isinstance(response, dict) and response.get("provider") == "gemini":
+          candidates = response.get("data", {}).get("candidates", [])
+          parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+          return "\n".join(part.get("text", "") for part in parts if part.get("text")).strip(), False
+      text_parts = []
+      used_search = False
+      for block in response.content:
+          if block.type == "text":
+              text_parts.append(block.text)
+          elif block.type in ("server_tool_use", "web_search_tool_result"):
+              used_search = True
+      return "\n".join(text_parts).strip(), used_search
+
+
+
+    def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
@@ -457,7 +511,20 @@ def chat_stream(req: ChatRequest):
     oid = _get_or_create_conversation(req.conversation_id, req.user_id or "anon", text)
 
     def event_gen():
-        # A retired/unsupported model must not take the whole chat down. Try
+        if GEMINI_API_KEY:
+              try:
+                  response = _call_with_retry(lambda: _create_gemini_message(messages))
+                  reply, used_search = _extract_reply_and_search_flag(response)
+                  if reply:
+                      yield _sse("delta", {"text": reply})
+                  _append_turn(oid, text, reply)
+                  yield _sse("done", {"used_search": used_search, "conversation_id": str(oid) if oid else None})
+              except Exception as exc:
+                  logger.exception("Gemini streaming fallback failed")
+                  yield _sse("error", {"message": _provider_error_message(exc)})
+              return
+
+            # A retired/unsupported model must not take the whole chat down. Try
         # each active candidate until a stream starts successfully.
         last_error = None
         for model_name in MODEL_CANDIDATES:
