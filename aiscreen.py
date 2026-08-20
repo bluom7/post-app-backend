@@ -73,6 +73,27 @@ ai_router = APIRouter()
 auth_router = APIRouter()
 library_router = APIRouter()
 
+class GenerateImageRequest(BaseModel):
+    prompt: str
+    seed: Optional[int] = None
+
+
+@ai_router.post("/generate-image")
+async def generate_image(body: GenerateImageRequest):
+    """Return a real generated image URL for an Album preset."""
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required.")
+    seed = body.seed if body.seed is not None else int(time.time() * 1000) % 2147483647
+    from urllib.parse import quote
+    image_url = (
+        "https://image.pollinations.ai/prompt/"
+        + quote(prompt, safe="")
+        + f"?width=768&height=768&nologo=true&seed={seed}"
+    )
+    return {"image_url": image_url, "prompt": prompt, "seed": seed}
+
+
 # ---- Anthropic client setup --------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
