@@ -99,36 +99,15 @@ async def generate_image(body: GenerateImageRequest):
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# Gemini is primary when GEMINI_API_KEY is configured on the backend runtime.
+# Gemini is intentionally locked to the single requested model.
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
-_raw_gemini_model = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
-GEMINI_MODEL = _raw_gemini_model.removeprefix("models/").removesuffix(":generateContent")
-GEMINI_MODEL_CANDIDATES = list(dict.fromkeys([
-    GEMINI_MODEL,
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-]))
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL_CANDIDATES = [GEMINI_MODEL]
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 
 
 def _gemini_model_candidates():
-    """Prefer configured models, then discover models enabled for this API key."""
-    candidates = list(GEMINI_MODEL_CANDIDATES)
-    try:
-        response = httpx.get(
-            "https://generativelanguage.googleapis.com/v1beta/models",
-            headers={"x-goog-api-key": GEMINI_API_KEY},
-            timeout=15.0,
-        )
-        if response.status_code < 400:
-            for item in response.json().get("models", []):
-                methods = item.get("supportedGenerationMethods", [])
-                name = (item.get("name") or "").removeprefix("models/")
-                if name and "generateContent" in methods:
-                    candidates.append(name)
-    except Exception as exc:
-        logger.warning("Could not discover Gemini models: %s", type(exc).__name__)
-    return list(dict.fromkeys(candidates))
+    return [GEMINI_MODEL]
 
 # ---- JWT setup (real auth — same secret your login endpoint signs with) --
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
