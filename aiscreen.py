@@ -391,7 +391,7 @@ def _clean_reply(text, user_text=""):
         leak_markers = ("the system instructions state", "system instructions:", "system prompt:", "you are the ai agent")
         if any(marker in lowered for marker in leak_markers):
             user_lower = (user_text or "").strip().lower()
-            if re.match(r"^(hi|hello|hey|hii|h29|namaste|kaise ho|how are you)\b", user_lower):
+            if re.match(r"^(hi|hello|hey|hii|hii|namaste|kaise ho|how are you)\b", user_lower):
                 return "Hi! How can I help you today?"
             return "I’m here to help. Please ask your question again."
         tail = lines[max(marker_indexes) + 1:]
@@ -667,7 +667,7 @@ async def chat_with_image(
         logger.exception("AI provider error (image, status=%s)", getattr(exc, "status_code", None))
         raise HTTPException(status_code=502, detail=_provider_error_message(exc))
 
-    reply, used_search = _extract_reply_and_search_flag(response)
+    reply, used_search = _extract_reply_and_search_flag(response, user_text_for_history)
     reply = reply or "I couldn't understand the image, please try again."
 
     oid = await asyncio.to_thread(
