@@ -42,6 +42,7 @@ Mount in main.py:
 import os
 import time
 import json
+import httpx
 import base64
 import asyncio
 import logging
