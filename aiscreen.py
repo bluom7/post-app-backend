@@ -384,15 +384,15 @@ def _clean_reply(text, user_text=""):
     """Remove leaked planning text and keep mobile replies concise."""
     cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.IGNORECASE | re.DOTALL)
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    markers = ("the user said", "the user is", "* role:", "* tone:", "* task:", "role: ai agent", "thought process", "the system instructions state", "system instructions:", "system prompt:", "you are the ai agent")
+    markers = ("the user said", "the user is", "user says:", "the user says:", "constraint check:", "* role:", "* tone:", "* task:", "* draft:", "role: ai agent", "thought process", "the system instructions state", "the system instruction says", "wait, the system", "system instructions:", "system prompt:", "you are the ai agent", "does it reveal", "is it short", "is it english", "goal:", "response:", "selection:")
     marker_indexes = [i for i, line in enumerate(lines) if line.lower().startswith(markers)]
     if marker_indexes:
         lowered = cleaned.lower()
-        leak_markers = ("the system instructions state", "system instructions:", "system prompt:", "you are the ai agent")
+        leak_markers = ("the system instructions state", "the system instruction says", "wait, the system", "system instructions:", "system prompt:", "you are the ai agent", "constraint check:", "does it reveal", "is it short", "is it english", "goal:", "selection:")
         if any(marker in lowered for marker in leak_markers):
             user_lower = (user_text or "").strip().lower()
             if re.match(r"^(hi|hello|hey|hii|hii|namaste|kaise ho|how are you)\b", user_lower):
-                return "Hi! How can I help you today?"
+                return "I'm doing well, thank you! How can I help you today?"
             return "I’m here to help. Please ask your question again."
         tail = lines[max(marker_indexes) + 1:]
         candidates = []
