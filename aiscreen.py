@@ -101,7 +101,13 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY els
 
 # Gemini is primary when GEMINI_API_KEY is configured on the backend runtime.
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
-GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+_raw_gemini_model = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+GEMINI_MODEL = _raw_gemini_model.removeprefix("models/").removesuffix(":generateContent")
+GEMINI_MODEL_CANDIDATES = list(dict.fromkeys([
+    GEMINI_MODEL,
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]))
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 
 # ---- JWT setup (real auth — same secret your login endpoint signs with) --
@@ -319,7 +325,7 @@ def _gemini_content_parts(content):
     return parts or [{"text": ""}]
 
 
-def _create_gemini_message(messages):
+def _create_gemini_message(messages, model_name=None):
     contents = []
     for message in messages:
         role = "model" if message.get("role") == "assistant" else "user"
@@ -330,7 +336,7 @@ def _create_gemini_message(messages):
         "generationConfig": {"maxOutputTokens": 8192},
     }
     try:
-        response = httpx.post(GEMINI_URL.format(GEMINI_MODEL), params={"key": GEMINI_API_KEY}, json=payload, timeout=60.0)
+        response = httpx.post(GEMINI_URL.format(model_name or GEMINI_MODEL), params={"key": GEMINI_API_KEY}, json=payload, timeout=60.0)
     except Exception as exc:
         raise GeminiProviderError(503, str(exc)) from exc
     if response.status_code >= 400:
@@ -340,7 +346,15 @@ def _create_gemini_message(messages):
 
 def _create_message_with_fallback(messages):
     if GEMINI_API_KEY:
-        return _call_with_retry(lambda: _create_gemini_message(messages))
+        last_error = None
+        for model_name in GEMINI_MODEL_CANDIDATES:
+            try:
+                return _call_with_retry(lambda: _create_gemini_message(messages, model_name))
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Gemini model failed: %s (status=%s)", model_name, getattr(exc, "status_code", None))
+        if last_error:
+            raise last_error
     last_error = None
     for model_name in MODEL_CANDIDATES:
         try:
@@ -509,20 +523,24 @@ def chat_stream(req: ChatRequest):
 
     def event_gen():
         if GEMINI_API_KEY:
-              try:
-                  response = _call_with_retry(lambda: _create_gemini_message(messages))
-                  reply, used_search = _extract_reply_and_search_flag(response)
-                  if reply:
-                      yield _sse("delta", {"text": reply})
-                  _append_turn(oid, text, reply)
-                  yield _sse("done", {"used_search": used_search, "conversation_id": str(oid) if oid else None})
-              except Exception as exc:
-                  logger.exception("Gemini streaming fallback failed")
-                  yield _sse("error", {"message": _provider_error_message(exc)})
-              return
+            last_error = None
+            for model_name in GEMINI_MODEL_CANDIDATES:
+                try:
+                    response = _call_with_retry(lambda: _create_gemini_message(messages, model_name))
+                    reply, used_search = _extract_reply_and_search_flag(response)
+                    if reply:
+                        yield _sse("delta", {"text": reply})
+                    _append_turn(oid, text, reply)
+                    yield _sse("done", {"used_search": used_search, "conversation_id": str(oid) if oid else None})
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("Gemini streaming model failed: %s", model_name)
+            logger.exception("Gemini streaming fallback failed", exc_info=last_error)
+            yield _sse("error", {"message": _provider_error_message(last_error)})
+            return
 
-            # A retired/unsupported model must not take the whole chat down. Try
-        # each active candidate until a stream starts successfully.
+        # A retired/unsupported model must not take the whole chat down. Try
         last_error = None
         for model_name in MODEL_CANDIDATES:
             used_search = False
