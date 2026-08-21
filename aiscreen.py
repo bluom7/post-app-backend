@@ -354,6 +354,9 @@ def _gemini_content_parts(content):
         elif item.get("type") == "image" and item.get("source", {}).get("data"):
             source = item["source"]
             parts.append({"inline_data": {"mime_type": source.get("media_type", "image/jpeg"), "data": source["data"]}})
+        elif item.get("type") == "audio" and item.get("source", {}).get("data"):
+            source = item["source"]
+            parts.append({"inline_data": {"mime_type": source.get("media_type", "audio/webm"), "data": source["data"]}})
     return parts or [{"text": ""}]
 
 
@@ -593,6 +596,33 @@ def _append_turn(oid, user_text: str, assistant_text: str):
 
 
 # ---- AI Agent routes ------------------------------------------------------
+@ai_router.post("/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """Transcribe a real microphone recording using Gemini audio understanding."""
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="Voice transcription is not configured.")
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Recording is empty.")
+    if len(audio_bytes) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Recording is too large.")
+    mime_type = (audio.content_type or "audio/webm").split(";")[0]
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "Transcribe this voice recording exactly. Return only the spoken words, with no commentary, labels, or quotation marks."},
+        {"type": "audio", "source": {"media_type": mime_type, "data": base64.b64encode(audio_bytes).decode("ascii")}},
+    ]}]
+    last_error = None
+    for model_name in _gemini_model_candidates("gemini-3.5-flash-lite"):
+        try:
+            response = _call_with_retry(lambda: _create_gemini_message(messages, model_name))
+            text, _ = _extract_reply_and_search_flag(response, "transcription")
+            return {"text": (text or "").strip()}
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Voice transcription failed: %s", getattr(exc, "status_code", None))
+    raise HTTPException(status_code=502, detail=_provider_error_message(last_error) if last_error else "Voice transcription failed.")
+
+
 @ai_router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     """Non-streaming text chat (fallback for clients that can't read SSE)."""
