@@ -104,11 +104,19 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY els
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
 GEMINI_MODEL = "gemma-4-26b-a4b-it"
 GEMINI_MODEL_CANDIDATES = [GEMINI_MODEL]
+GEMINI_MODEL_ALIASES = {
+    # The UI names follow the model choices shown to users. Each choice tries
+    # its requested API id first, then known compatible Gemini fallbacks.
+    "gemma": [GEMINI_MODEL],
+    "gemini-3.5-flash-lite": ["gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash", GEMINI_MODEL],
+    "gemini-3.6-flash": ["gemini-3.6-flash", "gemini-3-flash-preview", "gemini-2.5-flash", GEMINI_MODEL],
+}
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 
 
-def _gemini_model_candidates():
-    return [GEMINI_MODEL]
+def _gemini_model_candidates(model_key=None):
+    candidates = GEMINI_MODEL_ALIASES.get(model_key or "gemma", [GEMINI_MODEL])
+    return list(dict.fromkeys(candidates))
 
 # ---- JWT setup (real auth — same secret your login endpoint signs with) --
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
@@ -186,6 +194,7 @@ class ChatRequest(BaseModel):
     history: Optional[List[ChatMessage]] = []
     user_id: Optional[str] = "anon"
     conversation_id: Optional[str] = None
+    model: Optional[str] = "gemma"
 
 
 class ChatResponse(BaseModel):
@@ -359,10 +368,10 @@ def _create_gemini_message(messages, model_name=None):
     return {"provider": "gemini", "data": response.json()}
 
 
-def _create_message_with_fallback(messages):
+def _create_message_with_fallback(messages, model_key=None):
     if GEMINI_API_KEY:
         last_error = None
-        for model_name in _gemini_model_candidates():
+        for model_name in _gemini_model_candidates(model_key):
             try:
                 return _call_with_retry(lambda: _create_gemini_message(messages, model_name))
             except Exception as exc:
@@ -586,7 +595,7 @@ def chat(req: ChatRequest):
     messages = _build_messages(req.history, text)
 
     try:
-        response = _create_message_with_fallback(messages)
+        response = _create_message_with_fallback(messages, req.model)
     except Exception as exc:
         logger.exception("AI provider error (status=%s)", getattr(exc, "status_code", None))
         raise HTTPException(status_code=502, detail=_provider_error_message(exc))
@@ -619,7 +628,7 @@ def chat_stream(req: ChatRequest):
     def event_gen():
         if GEMINI_API_KEY:
             last_error = None
-            for model_name in GEMINI_MODEL_CANDIDATES:
+            for model_name in _gemini_model_candidates(req.model):
                 try:
                     response = _call_with_retry(lambda: _create_gemini_message(messages, model_name))
                     reply, used_search = _extract_reply_and_search_flag(response, text)
@@ -685,6 +694,7 @@ async def chat_with_image(
     image: UploadFile = File(...),
     user_id: str = Form("anon"),
     conversation_id: str = Form(""),
+    model: str = Form("gemma"),
 ):
     """Photo + optional caption. Agent identifies/explains the image,
     and can still search the web for current info about what it sees."""
@@ -720,7 +730,7 @@ async def chat_with_image(
     ]
 
     try:
-        response = await asyncio.to_thread(_create_message_with_fallback, [{"role": "user", "content": user_content}])
+        response = await asyncio.to_thread(_create_message_with_fallback, [{"role": "user", "content": user_content}], model)
     except Exception as exc:
         logger.exception("AI provider error (image, status=%s)", getattr(exc, "status_code", None))
         raise HTTPException(status_code=502, detail=_provider_error_message(exc))
