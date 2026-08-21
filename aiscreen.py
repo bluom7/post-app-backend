@@ -110,6 +110,7 @@ GEMINI_MODEL_ALIASES = {
     "gemma": [GEMINI_MODEL],
     "gemini-3.5-flash-lite": ["gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash", GEMINI_MODEL],
     "gemini-3.6-flash": ["gemini-3.6-flash", "gemini-3-flash-preview", "gemini-2.5-flash", GEMINI_MODEL],
+    "gemini-3.1-pro": ["gemini-3.1-pro", "gemini-2.5-pro", "gemini-2.5-flash", GEMINI_MODEL],
 }
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 
