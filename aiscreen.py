@@ -754,29 +754,29 @@ async def chat_with_image(
         _get_or_create_conversation, conversation_id or None, user_id, user_text_for_history
     )
     await asyncio.to_thread(_append_turn, oid, user_text_for_history, reply)
-      # Keep camera/photo messages in Library > Images as real GridFS files.
-      if _library is not None and _fs is not None:
-          try:
-              file_id = await asyncio.to_thread(
-                  _fs.upload_from_stream,
-                  image.filename or "camera-image",
-                  raw,
-                  metadata={"user_id": user_id, "content_type": media_type, "source": "camera"},
-              )
-              await asyncio.to_thread(_library.insert_one, {
-                  "user_id": user_id,
-                  "name": image.filename or "Camera image",
-                  "type": "image",
-                  "mime_type": media_type,
-                  "size": len(raw),
-                  "file_id": file_id,
-                  "deleted": False,
-                  "created_at": datetime.now(timezone.utc),
-              })
-          except PyMongoError:
-              logger.exception("Could not save camera image to library")
+    # Keep camera/photo messages in Library > Images as real GridFS files.
+    if _library is not None and _fs is not None:
+        try:
+            file_id = await asyncio.to_thread(
+                _fs.upload_from_stream,
+                image.filename or "camera-image",
+                raw,
+                metadata={"user_id": user_id, "content_type": media_type, "source": "camera"},
+            )
+            await asyncio.to_thread(_library.insert_one, {
+                "user_id": user_id,
+                "name": image.filename or "Camera image",
+                "type": "image",
+                "mime_type": media_type,
+                "size": len(raw),
+                "file_id": file_id,
+                "deleted": False,
+                "created_at": datetime.now(timezone.utc),
+            })
+        except PyMongoError:
+            logger.exception("Could not save camera image to library")
 
-      return ChatResponse(
+    return ChatResponse(
         reply=reply, used_search=used_search, conversation_id=str(oid) if oid else (conversation_id or None)
     )
 
