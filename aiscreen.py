@@ -235,7 +235,8 @@ class AccountInfo(BaseModel):
 class LibraryItem(BaseModel):
     id: str
     name: str
-    type: str  # "image" | "file" | "folder"
+    type: str  # "text" | "image" | "file" | "folder"
+    conversation_id: Optional[str] = None
     mime_type: Optional[str] = None
     size: Optional[int] = None
     file_id: Optional[str] = None  # GridFS id, used to build the download URL
@@ -753,8 +754,29 @@ async def chat_with_image(
         _get_or_create_conversation, conversation_id or None, user_id, user_text_for_history
     )
     await asyncio.to_thread(_append_turn, oid, user_text_for_history, reply)
+      # Keep camera/photo messages in Library > Images as real GridFS files.
+      if _library is not None and _fs is not None:
+          try:
+              file_id = await asyncio.to_thread(
+                  _fs.upload_from_stream,
+                  image.filename or "camera-image",
+                  raw,
+                  metadata={"user_id": user_id, "content_type": media_type, "source": "camera"},
+              )
+              await asyncio.to_thread(_library.insert_one, {
+                  "user_id": user_id,
+                  "name": image.filename or "Camera image",
+                  "type": "image",
+                  "mime_type": media_type,
+                  "size": len(raw),
+                  "file_id": file_id,
+                  "deleted": False,
+                  "created_at": datetime.now(timezone.utc),
+              })
+          except PyMongoError:
+              logger.exception("Could not save camera image to library")
 
-    return ChatResponse(
+      return ChatResponse(
         reply=reply, used_search=used_search, conversation_id=str(oid) if oid else (conversation_id or None)
     )
 
@@ -872,6 +894,7 @@ def _serialize_library_item(doc) -> dict:
         "id": str(doc["_id"]),
         "name": doc.get("name", "Untitled"),
         "type": doc.get("type", "file"),
+        "conversation_id": doc.get("conversation_id"),
         "mime_type": doc.get("mime_type"),
         "size": doc.get("size"),
         "file_id": str(doc["file_id"]) if doc.get("file_id") else None,
@@ -881,28 +904,47 @@ def _serialize_library_item(doc) -> dict:
 
 
 @library_router.get("/items", response_model=List[LibraryItem])
-def list_library_items(
-    tab: str = "all",
-    search: Optional[str] = None,
-    deleted: bool = False,
-    authorization: Optional[str] = Header(None),
-):
-    _require_library()
-    user_id = _decode_token(authorization)
-    query: dict = {"user_id": user_id, "deleted": deleted}
-    if tab == "images":
-        query["type"] = "image"
-    elif tab == "files":
-        query["type"] = {"$in": ["file", "folder"]}
-    if search:
-        query["name"] = {"$regex": search.strip(), "$options": "i"}
-    try:
-        docs = _library.find(query).sort("created_at", -1).limit(200)
-        return [_serialize_library_item(d) for d in docs]
-    except PyMongoError:
-        logger.exception("Could not list library items")
-        raise HTTPException(status_code=502, detail="Couldn't load your library, please try again.")
-
+    def list_library_items(
+      tab: str = "all",
+      search: Optional[str] = None,
+      deleted: bool = False,
+      authorization: Optional[str] = Header(None),
+    ):
+      _require_library()
+      user_id = _decode_token(authorization)
+      query: dict = {"user_id": user_id, "deleted": deleted}
+      if tab == "images":
+          query["type"] = "image"
+      elif tab == "files":
+          query["type"] = {"$in": ["file", "folder"]}
+      if search:
+          query["name"] = {"$regex": search.strip(), "$options": "i"}
+      try:
+          docs = list(_library.find(query).sort("created_at", -1).limit(200))
+          items = [_serialize_library_item(d) for d in docs]
+          if tab == "all" and not deleted and _conversations is not None:
+              chats = _conversations.find({"user_id": user_id}).sort("updated_at", -1).limit(MAX_RECENTS)
+              for chat in chats:
+                  title = chat.get("title") or "New chat"
+                  if search and not re.search(re.escape(search.strip()), title, re.IGNORECASE):
+                      continue
+                  items.append({
+                      "id": "chat:" + str(chat["_id"]),
+                      "name": title,
+                      "type": "text",
+                      "conversation_id": str(chat["_id"]),
+                      "mime_type": None,
+                      "size": None,
+                      "file_id": None,
+                      "deleted": False,
+                      "created_at": chat.get("updated_at").isoformat() if chat.get("updated_at") else None,
+                  })
+          items.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+          return items[:200]
+      except PyMongoError:
+          logger.exception("Could not list library items")
+          raise HTTPException(status_code=502, detail="Couldn't load your library, please try again.")
+    
 
 @library_router.post("/upload", response_model=LibraryItem)
 async def upload_library_file(
@@ -974,6 +1016,16 @@ def create_library_folder(name: str = Form(...), authorization: Optional[str] = 
 def delete_library_item(item_id: str, authorization: Optional[str] = Header(None)):
     _require_library()
     user_id = _decode_token(authorization)
+    if item_id.startswith("chat:"):
+        if _conversations is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        chat_oid = _to_object_id(item_id[5:])
+        if not chat_oid:
+            raise HTTPException(status_code=400, detail="Invalid chat id.")
+        result = _conversations.delete_one({"_id": chat_oid, "user_id": user_id})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        return {"status": "deleted"}
     oid = _to_object_id(item_id)
     if not oid:
         raise HTTPException(status_code=400, detail="Invalid item id.")
