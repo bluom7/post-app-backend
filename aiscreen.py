@@ -855,9 +855,7 @@ async def edit_image(
     prompt = (
         "Edit the supplied photo exactly as requested. Preserve the subject's identity, pose,"
         " proportions, important details, and realistic lighting unless the instruction asks otherwise. "
-        "Do not add text, logos, watermarks, or unrelated objects. Return the edited image.
-
-"
+        "Do not add text, logos, watermarks, or unrelated objects. Return the edited image.\n\n"
         + instruction
     )
     payload = {
