@@ -890,7 +890,7 @@ async def edit_image(
               except Exception as exc:
                   last_error = exc
                   logger.warning("Gemini image edit model failed: %s", model_name)
-        if not image_b64:
+    if not image_b64:
         logger.error("All Gemini image edit models failed: %s", last_error)
         raise HTTPException(status_code=502, detail="BluOm AI could not create the edited image. Try a simpler instruction.")
 
