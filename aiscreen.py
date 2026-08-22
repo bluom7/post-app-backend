@@ -1121,3 +1121,196 @@ def download_library_file(
             yield chunk
 
     return StreamingResponse(stream(), media_type=content_type)
+
+
+    # ---- AI Photo Studio -------------------------------------------------------
+    # These endpoints intentionally keep image work code-based and transparent.
+    # They never promise Photoshop-style pixel editing or reproduce protected work.
+    PHOTO_MAX_BYTES = 12 * 1024 * 1024
+    PHOTO_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+    PHOTO_SAFETY = (
+      "Respect privacy and safety. Do not sexualize or misuse real people. "
+      "Do not recreate a real logo or copyrighted artwork exactly; describe or transform only in an original way. "
+      "State uncertainty when text is unreadable."
+    )
+
+
+    def _photo_operation_prompt(operation: str, instruction: str = "") -> str:
+      prompts = {
+          "describe": "Describe the photo precisely: visible objects, people without guessing identity, setting, actions, colors, composition, and uncertainty.",
+          "ocr": "Read all visible printed text and handwriting. Preserve line breaks where possible. Mark unclear characters as [unclear] and do not invent text.",
+          "chart": "Explain this chart, graph, or diagram: title, axes, legend, key values, trend, comparisons, and a concise takeaway. Say when a value cannot be read.",
+          "extract": "Extract useful fields from this document, ID, invoice, or receipt. Return a clear list of field: value pairs, preserve dates and amounts, and flag missing or uncertain fields. Do not infer sensitive values.",
+          "product": "Review this product photo for branding consistency, visible quality, packaging, legibility, lighting, framing, and actionable improvements. Do not identify a brand unless it is clearly visible.",
+          "ui": "Review this app or UI screenshot for usability problems, visible bugs, hierarchy, accessibility, spacing, contrast, and concrete fixes. Focus only on what is visible.",
+          "caption": "Write five original captions and one accessible alt description for this photo. Match the requested tone if provided.",
+          "creative": "Create an original design or illustration brief inspired by the photo's mood, composition, and colors. Do not copy any person, logo, or copyrighted artwork; explicitly call out what should be changed.",
+      }
+      return prompts.get(operation, prompts["describe"]) + ("\nExtra request: " + instruction[:2000] if instruction.strip() else "") + "\n" + PHOTO_SAFETY
+
+
+    async def _read_photo_upload(image: UploadFile):
+      if image.content_type not in PHOTO_TYPES:
+          raise HTTPException(status_code=400, detail="Only JPEG, PNG, or WebP images are supported.")
+      raw = await image.read()
+      if not raw:
+          raise HTTPException(status_code=400, detail="Image is empty.")
+      if len(raw) > PHOTO_MAX_BYTES:
+          raise HTTPException(status_code=400, detail="Image is too large (max 12MB).")
+      return ("image/jpeg" if image.content_type == "image/jpg" else image.content_type), raw
+
+
+    @ai_router.post("/photo/analyze")
+    async def photo_analyze(
+      image: UploadFile = File(...),
+      operation: str = Form("describe"),
+      instruction: str = Form(""),
+      model: str = Form("gemini-3.5-flash-lite"),
+    ):
+      _require_client()
+      media_type, raw = await _read_photo_upload(image)
+      operation = (operation or "describe").strip().lower()
+      if operation not in {"describe", "ocr", "chart", "extract", "product", "ui", "caption", "creative"}:
+          raise HTTPException(status_code=400, detail="Unsupported photo analysis operation.")
+      content = [
+          {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(raw).decode("utf-8")}},
+          {"type": "text", "text": _photo_operation_prompt(operation, instruction)},
+      ]
+      try:
+          response = await asyncio.to_thread(_create_message_with_fallback, [{"role": "user", "content": content}], model)
+          reply, _ = _extract_reply_and_search_flag(response, operation)
+      except Exception as exc:
+          logger.exception("AI photo analysis failed")
+          raise HTTPException(status_code=502, detail=_provider_error_message(exc))
+      return {"operation": operation, "reply": reply or "I could not read enough from this image.", "filename": image.filename}
+
+
+    @ai_router.post("/photo/creative")
+    async def photo_creative(image: UploadFile = File(...), instruction: str = Form(""), model: str = Form("gemini-3.5-flash-lite")):
+      return await photo_analyze(image=image, operation="creative", instruction=instruction, model=model)
+
+
+    @ai_router.post("/photo/edit")
+    async def photo_edit(
+      image: UploadFile = File(...),
+      operation: str = Form("resize"),
+      width: int = Form(1200),
+      height: int = Form(1200),
+      angle: float = Form(0),
+      format: str = Form("PNG"),
+      brightness: float = Form(1.0),
+      contrast: float = Form(1.0),
+      watermark: str = Form(""),
+      background: str = Form("#FFFFFF"),
+    ):
+      media_type, raw = await _read_photo_upload(image)
+      try:
+          from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageChops
+          from fastapi.responses import Response
+          from io import BytesIO
+          import math
+          im = Image.open(BytesIO(raw)).convert("RGBA")
+          op = (operation or "resize").lower().strip()
+          if op == "resize":
+              width = max(1, min(int(width), 4000)); height = max(1, min(int(height), 4000))
+              im.thumbnail((width, height), Image.Resampling.LANCZOS)
+          elif op == "crop":
+              width = max(1, min(int(width), im.width)); height = max(1, min(int(height), im.height))
+              left = max(0, (im.width - width) // 2); top = max(0, (im.height - height) // 2)
+              im = im.crop((left, top, left + width, top + height))
+          elif op == "rotate":
+              im = im.rotate(float(angle), expand=True, resample=Image.Resampling.BICUBIC)
+          elif op in {"adjust", "filter"}:
+              im = ImageEnhance.Brightness(im).enhance(max(0.1, min(float(brightness), 3.0)))
+              im = ImageEnhance.Contrast(im).enhance(max(0.1, min(float(contrast), 3.0)))
+          elif op in {"background-remove", "background-change"}:
+              rgb = im.convert("RGB"); px = rgb.load(); sample = []
+              for x, y in [(0,0), (rgb.width-1,0), (0,rgb.height-1), (rgb.width-1,rgb.height-1)]: sample.append(px[x,y])
+              base = tuple(sum(c[i] for c in sample)//len(sample) for i in range(3))
+              mask = Image.new("L", rgb.size, 0); mp = mask.load()
+              for y in range(rgb.height):
+                  for x in range(rgb.width):
+                      p = px[x,y]; dist = math.sqrt(sum((p[i]-base[i])**2 for i in range(3)))
+                      if dist < 55: mp[x,y] = 255
+              if op == "background-remove":
+                  im.putalpha(ImageChops.invert(mask))
+              else:
+                  try: color = tuple(int(background.lstrip("#")[i:i+2],16) for i in (0,2,4))
+                  except Exception: color = (255,255,255)
+                  bg = Image.new("RGBA", im.size, color + (255,)); bg.paste(im, mask=ImageChops.invert(mask)); im = bg
+          elif op == "watermark":
+              if watermark.strip():
+                  draw = ImageDraw.Draw(im); size = max(18, im.width // 28)
+                  try: font = ImageFont.truetype("DejaVuSans.ttf", size)
+                  except Exception: font = ImageFont.load_default()
+                  box = draw.textbbox((0,0), watermark[:100], font=font); pad=20
+                  draw.text((im.width-(box[2]-box[0])-pad, im.height-(box[3]-box[1])-pad), watermark[:100], fill=(255,255,255,180), font=font)
+          else:
+              raise HTTPException(status_code=400, detail="Unsupported edit operation.")
+          out_format = (format or "PNG").upper()
+          if out_format not in {"PNG", "JPEG", "WEBP"}: out_format = "PNG"
+          if out_format == "JPEG": im = im.convert("RGB")
+          buf = BytesIO(); im.save(buf, format=out_format, quality=92)
+          ext = "jpg" if out_format == "JPEG" else out_format.lower()
+          return Response(content=buf.getvalue(), media_type="image/" + ("jpeg" if ext == "jpg" else ext), headers={"Content-Disposition": "attachment; filename=edited." + ext})
+      except HTTPException:
+          raise
+      except Exception as exc:
+          logger.exception("Photo edit failed")
+          raise HTTPException(status_code=400, detail="Could not edit this image: " + str(exc))
+
+
+    @ai_router.post("/photo/merge")
+    async def photo_merge(images: List[UploadFile] = File(...), layout: str = Form("pdf")):
+      if not images or len(images) > 20: raise HTTPException(status_code=400, detail="Upload between 1 and 20 images.")
+      try:
+          from PIL import Image, ImageOps
+          from fastapi.responses import Response
+          from io import BytesIO
+          opened = []
+          for image in images:
+              _, raw = await _read_photo_upload(image)
+              opened.append(Image.open(BytesIO(raw)).convert("RGB"))
+          mode = (layout or "pdf").lower()
+          if mode == "collage":
+              thumb_w, thumb_h = 420, 420; cols = min(4, max(1, len(opened))); rows = (len(opened)+cols-1)//cols
+              canvas = Image.new("RGB", (cols*thumb_w, rows*thumb_h), "white")
+              for i, im in enumerate(opened): canvas.paste(ImageOps.contain(im, (thumb_w-20, thumb_h-20)), ((i%cols)*thumb_w+10, (i//cols)*thumb_h+10))
+              buf=BytesIO(); canvas.save(buf, format="JPEG", quality=92); return Response(content=buf.getvalue(), media_type="image/jpeg", headers={"Content-Disposition":"attachment; filename=collage.jpg"})
+          buf=BytesIO(); opened[0].save(buf, format="PDF", save_all=True, append_images=opened[1:], resolution=150.0)
+          return Response(content=buf.getvalue(), media_type="application/pdf", headers={"Content-Disposition":"attachment; filename=photos.pdf"})
+      except HTTPException: raise
+      except Exception as exc:
+          logger.exception("Photo merge failed")
+          raise HTTPException(status_code=400, detail="Could not merge images: " + str(exc))
+
+
+    @ai_router.post("/photo/report")
+    async def photo_report(image: UploadFile = File(...), report_format: str = Form("pdf"), instruction: str = Form("")):
+      analysis = await photo_analyze(image=image, operation="extract", instruction=instruction, model="gemini-3.5-flash-lite")
+      text = analysis["reply"]
+      fmt = (report_format or "pdf").lower()
+      try:
+          from io import BytesIO
+          from fastapi.responses import Response
+          if fmt == "xlsx":
+              from openpyxl import Workbook
+              wb=Workbook(); ws=wb.active; ws.title="Photo extraction"; ws.append(["Field", "Value"])
+              for line in text.splitlines():
+                  if ":" in line: ws.append([line.split(":",1)[0].strip(), line.split(":",1)[1].strip()])
+                  elif line.strip(): ws.append(["Notes", line.strip()])
+              buf=BytesIO(); wb.save(buf); return Response(content=buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition":"attachment; filename=photo-report.xlsx"})
+          if fmt == "docx":
+              from docx import Document
+              doc=Document(); doc.add_heading("Photo extraction report", 0); doc.add_paragraph(text); buf=BytesIO(); doc.save(buf); return Response(content=buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition":"attachment; filename=photo-report.docx"})
+          from reportlab.lib.pagesizes import A4
+          from reportlab.pdfgen import canvas
+          buf=BytesIO(); pdf=canvas.Canvas(buf, pagesize=A4); y=800; pdf.setFont("Helvetica-Bold", 16); pdf.drawString(45,y,"Photo extraction report"); y-=30; pdf.setFont("Helvetica", 10)
+          for line in text.splitlines():
+              if y < 50: pdf.showPage(); y=800; pdf.setFont("Helvetica",10)
+              pdf.drawString(45,y,line[:120]); y-=15
+          pdf.save(); return Response(content=buf.getvalue(), media_type="application/pdf", headers={"Content-Disposition":"attachment; filename=photo-report.pdf"})
+      except Exception as exc:
+          logger.exception("Photo report generation failed")
+          raise HTTPException(status_code=500, detail="Report generation failed: " + str(exc))
+    
