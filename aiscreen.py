@@ -813,7 +813,7 @@ class PhotoEditResponse(BaseModel):
 IMAGE_EDIT_MODEL_CANDIDATES = [
     item.strip() for item in os.environ.get(
         "GEMINI_IMAGE_EDIT_MODELS",
-        "gemini-2.5-flash-image,gemini-3-pro-image-preview,gemini-2.0-flash-exp-image-generation",
+        "gemini-2.5-flash-image,gemini-3-pro-image-preview,gemini-2.0-flash-exp",
     ).split(",") if item.strip()
 ]
 
@@ -864,12 +864,13 @@ async def edit_image(
             {"inline_data": {"mime_type": media_type, "data": base64.b64encode(raw).decode("utf-8")}},
             {"text": prompt},
         ]}],
-        "generationConfig": {"responseModalities": ["IMAGE"]},
+        # Gemini image models require TEXT + IMAGE for image output.
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
     image_b64 = None
     output_type = None
     last_error = None
-    async with httpx.AsyncClient(timeout=45.0) as http:
+    async with httpx.AsyncClient(timeout=120.0) as http:
         for model_name in IMAGE_EDIT_MODEL_CANDIDATES:
             try:
                 response = await http.post(
@@ -877,14 +878,20 @@ async def edit_image(
                     params={"key": GEMINI_API_KEY},
                     json=payload,
                 )
-                data = response.json()
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = {"error": {"message": response.text[:500]}}
                 if response.is_success:
                     image_b64, output_type = _extract_gemini_image(data)
                     if image_b64:
                         break
-                    last_error = RuntimeError("Gemini returned no edited image")
-                    break
-                last_error = RuntimeError(data.get("error", {}).get("message", "Gemini image edit failed"))
+                    last_error = RuntimeError(model_name + " returned no edited image")
+                    logger.warning("Gemini image model returned no inline image: %s", model_name)
+                    continue
+                error_message = data.get("error", {}).get("message", "Gemini image edit failed")
+                last_error = RuntimeError(model_name + "; " + error_message)
+                logger.warning("Gemini image edit failed for %s (status=%s): %s", model_name, response.status_code, error_message)
                 if response.status_code not in (400, 404):
                     break
             except Exception as exc:
