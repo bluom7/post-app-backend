@@ -810,12 +810,15 @@ class PhotoEditResponse(BaseModel):
     model: Optional[str] = None
 
 
-IMAGE_EDIT_MODEL_CANDIDATES = [
-    item.strip() for item in os.environ.get(
-        "GEMINI_IMAGE_EDIT_MODELS",
-        "gemini-2.5-flash-image,gemini-3-pro-image-preview,gemini-2.0-flash-exp",
-    ).split(",") if item.strip()
+_configured_image_models = [
+    item.strip() for item in os.environ.get("GEMINI_IMAGE_EDIT_MODELS", "").split(",") if item.strip()
 ]
+# Keep deployment overrides, but always retain known image-capable fallbacks.
+IMAGE_EDIT_MODEL_CANDIDATES = list(dict.fromkeys(_configured_image_models + [
+    "gemini-2.5-flash-image",
+    "gemini-3-pro-image-preview",
+    "gemini-2.0-flash-exp",
+]))
 
 
 def _extract_gemini_image(response_data: dict):
@@ -875,7 +878,7 @@ async def edit_image(
             try:
                 response = await http.post(
                     GEMINI_URL.format(model_name),
-                    params={"key": GEMINI_API_KEY},
+                    headers={"x-goog-api-key": GEMINI_API_KEY},
                     json=payload,
                 )
                 try:
