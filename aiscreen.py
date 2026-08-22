@@ -813,7 +813,7 @@ class PhotoEditResponse(BaseModel):
 IMAGE_EDIT_MODEL_CANDIDATES = [
     item.strip() for item in os.environ.get(
         "GEMINI_IMAGE_EDIT_MODELS",
-        "gemini-2.5-flash-image,gemini-2.0-flash-exp",
+        "gemini-2.5-flash-image,gemini-3-pro-image-preview,gemini-2.0-flash-exp-image-generation",
     ).split(",") if item.strip()
 ]
 
@@ -855,7 +855,8 @@ async def edit_image(
     prompt = (
         "Edit the supplied photo exactly as requested. Preserve the subject's identity, pose,"
         " proportions, important details, and realistic lighting unless the instruction asks otherwise. "
-        "Do not add text, logos, watermarks, or unrelated objects. Return the edited image.\n\n"
+        "For quality enhancement, increase sharpness, resolution, and fine detail without changing the composition. "
+        "Do not add text, logos, watermarks, or unrelated objects. Return only the edited image.\n\n"
         + instruction
     )
     payload = {
@@ -863,7 +864,7 @@ async def edit_image(
             {"inline_data": {"mime_type": media_type, "data": base64.b64encode(raw).decode("utf-8")}},
             {"text": prompt},
         ]}],
-        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+        "generationConfig": {"responseModalities": ["IMAGE"]},
     }
     image_b64 = None
     output_type = None
