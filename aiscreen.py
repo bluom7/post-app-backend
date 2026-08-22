@@ -102,6 +102,8 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY els
 
 # Gemini is intentionally locked to the requested Gemma model.
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+# Photo editing may use a separate quota/key from text chat.
+GEMINI_IMAGE_API_KEY = (os.environ.get("GEMINI_IMAGE_API_KEY") or GEMINI_API_KEY).strip()
 GEMINI_MODEL = "gemma-4-26b-a4b-it"
 GEMINI_MODEL_CANDIDATES = [GEMINI_MODEL]
 GEMINI_MODEL_ALIASES = {
@@ -852,8 +854,8 @@ async def edit_image(
         raise HTTPException(status_code=400, detail="Image is empty.")
     if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=400, detail="Image is too large (max 5MB).")
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=503, detail="Photo editing is not configured yet. Add GEMINI_API_KEY on the backend.")
+    if not GEMINI_IMAGE_API_KEY:
+        raise HTTPException(status_code=503, detail="Photo editing is not configured yet. Add GEMINI_IMAGE_API_KEY on the backend.")
 
     prompt = (
         "Edit the supplied photo exactly as requested. Preserve the subject's identity, pose,"
@@ -878,7 +880,7 @@ async def edit_image(
             try:
                 response = await http.post(
                     GEMINI_URL.format(model_name),
-                    headers={"x-goog-api-key": GEMINI_API_KEY},
+                    headers={"x-goog-api-key": GEMINI_IMAGE_API_KEY},
                     json=payload,
                 )
                 try:
