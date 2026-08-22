@@ -802,6 +802,109 @@ async def chat_with_image(
     )
 
 
+class PhotoEditResponse(BaseModel):
+    image_data_url: str
+    mime_type: str
+    reply: str
+    conversation_id: Optional[str] = None
+    model: Optional[str] = None
+
+
+IMAGE_EDIT_MODEL_CANDIDATES = [
+    item.strip() for item in os.environ.get(
+        "GEMINI_IMAGE_EDIT_MODELS",
+        "gemini-2.5-flash-image,gemini-2.0-flash-exp",
+    ).split(",") if item.strip()
+]
+
+
+def _extract_gemini_image(response_data: dict):
+    for candidate in response_data.get("candidates", []):
+        content = candidate.get("content") or {}
+        for part in content.get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return inline.get("data"), inline.get("mimeType") or inline.get("mime_type") or "image/png"
+    return None, None
+
+
+@ai_router.post("/edit-image", response_model=PhotoEditResponse)
+async def edit_image(
+    instruction: str = Form(...),
+    image: UploadFile = File(...),
+    user_id: str = Form("anon"),
+    conversation_id: str = Form(""),
+    model: str = Form("gemma"),
+):
+    """Apply a natural-language edit to an uploaded photo using Gemini image output."""
+    _check_rate_limit(user_id)
+    instruction = (instruction or "").strip()[:MAX_MESSAGE_CHARS]
+    if not instruction:
+        raise HTTPException(status_code=400, detail="Tell BluOm AI what to change in the photo.")
+    if image.content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg"):
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP, or GIF images are supported.")
+    media_type = "image/jpeg" if image.content_type == "image/jpg" else image.content_type
+    raw = await image.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Image is empty.")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Image is too large (max 5MB).")
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="Photo editing is not configured yet. Add GEMINI_API_KEY on the backend.")
+
+    prompt = (
+        "Edit the supplied photo exactly as requested. Preserve the subject's identity, pose,"
+        " proportions, important details, and realistic lighting unless the instruction asks otherwise. "
+        "Do not add text, logos, watermarks, or unrelated objects. Return the edited image.
+
+"
+        + instruction
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [
+            {"inline_data": {"mime_type": media_type, "data": base64.b64encode(raw).decode("utf-8")}},
+            {"text": prompt},
+        ]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+    }
+    image_b64 = None
+    output_type = None
+    last_error = None
+    async with httpx.AsyncClient(timeout=90.0) as http:
+        for model_name in IMAGE_EDIT_MODEL_CANDIDATES:
+            try:
+                response = await http.post(
+                    GEMINI_URL.format(model_name),
+                    params={"key": GEMINI_API_KEY},
+                    json=payload,
+                )
+                data = response.json()
+                if response.is_success:
+                    image_b64, output_type = _extract_gemini_image(data)
+                    if image_b64:
+                        break
+                    last_error = RuntimeError("Gemini returned no edited image")
+                else:
+                    last_error = RuntimeError(data.get("error", {}).get("message", "Gemini image edit failed"))
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Gemini image edit model failed: %s", model_name)
+    if not image_b64:
+        logger.error("All Gemini image edit models failed: %s", last_error)
+        raise HTTPException(status_code=502, detail="BluOm AI could not create the edited image. Try a simpler instruction.")
+
+    reply = "Done — I edited the photo as requested. You can send another change for this conversation."
+    oid = await asyncio.to_thread(_get_or_create_conversation, conversation_id or None, user_id, instruction)
+    await asyncio.to_thread(_append_turn, oid, instruction, reply)
+    return PhotoEditResponse(
+        image_data_url=f"data:{output_type};base64,{image_b64}",
+        mime_type=output_type,
+        reply=reply,
+        conversation_id=str(oid) if oid else (conversation_id or None),
+        model=model,
+    )
+
+
 # ---- Conversation history endpoints (Recents sidebar) -------------------
 def _require_db():
     if _conversations is None:
