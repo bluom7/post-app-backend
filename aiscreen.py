@@ -902,7 +902,9 @@ async def edit_image(
                 logger.warning("Gemini image edit model failed: %s", model_name)
     if not image_b64:
         logger.error("All Gemini image edit models failed: %s", last_error)
-        raise HTTPException(status_code=502, detail="BluOm AI could not create the edited image. Try a simpler instruction.")
+        safe_error = str(last_error or "Unknown image provider error")[:300]
+        safe_error = re.sub(r"(?i)(key=|api[_-]?key[=:])[^&\s]+", r"\1[redacted]", safe_error)
+        raise HTTPException(status_code=502, detail="Photo editing failed: " + safe_error)
 
     reply = "Done — I edited the photo as requested. You can send another change for this conversation."
     oid = await asyncio.to_thread(_get_or_create_conversation, conversation_id or None, user_id, instruction)
