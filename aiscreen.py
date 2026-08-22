@@ -869,7 +869,7 @@ async def edit_image(
     image_b64 = None
     output_type = None
     last_error = None
-    async with httpx.AsyncClient(timeout=90.0) as http:
+    async with httpx.AsyncClient(timeout=45.0) as http:
         for model_name in IMAGE_EDIT_MODEL_CANDIDATES:
             try:
                 response = await http.post(
@@ -879,16 +879,17 @@ async def edit_image(
                 )
                 data = response.json()
                 if response.is_success:
-                    image_b64, output_type = _extract_gemini_image(data)
-                    if image_b64:
-                        break
-                    last_error = RuntimeError("Gemini returned no edited image")
-                else:
-                    last_error = RuntimeError(data.get("error", {}).get("message", "Gemini image edit failed"))
-            except Exception as exc:
-                last_error = exc
-                logger.warning("Gemini image edit model failed: %s", model_name)
-    if not image_b64:
+                      image_b64, output_type = _extract_gemini_image(data)
+                      if image_b64:
+                          break
+                      last_error = RuntimeError("Gemini returned no edited image")
+                      break
+                  last_error = RuntimeError(data.get("error", {}).get("message", "Gemini image edit failed"))
+                  # Retry only when the selected model is unavailable. Avoid
+                  # making users wait through repeated provider failures.
+                  if response.status_code not in (400, 404):
+                      break
+        if not image_b64:
         logger.error("All Gemini image edit models failed: %s", last_error)
         raise HTTPException(status_code=502, detail="BluOm AI could not create the edited image. Try a simpler instruction.")
 
