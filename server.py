@@ -4140,7 +4140,7 @@ postbluom.online"""
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
         member_docs = await db.users.find(
             {"id": {"$in": g["members"]}},
-            {"_id": 0, "id": 1, "name": 1, "handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1, "is_online": 1}
+            {"_id": 0, "id": 1, "name": 1, "handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1, "bio": 1, "is_online": 1}
         ).to_list(200)
         g["member_details"] = member_docs
         return g
