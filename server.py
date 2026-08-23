@@ -2776,7 +2776,7 @@ postbluom.online"""
         user_ids   = [c["_id"] for c in convs]
         pub = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
                "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1,
-               "is_online": 1, "last_seen": 1}
+               "is_badge_verified": 1, "is_online": 1, "last_seen": 1}
         users_list = await db.users.find({"id": {"$in": user_ids}}, pub).to_list(200)
         users_map  = {uu["id"]: uu for uu in users_list}
 
