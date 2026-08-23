@@ -2760,12 +2760,16 @@ postbluom.online"""
             {"$project": {
                 "_id": 0,
                 "other_id": {"$cond": [{"$eq": ["$from_id", u["id"]]}, "$to_id", "$from_id"]},
-                "text": 1, "photo_url": 1, "created_at": 1, "status": 1, "from_id": 1, "mood_color": 1,
+                "text": 1, "photo_url": 1, "gif_url": 1, "shared_post_id": 1, "shared_reel_id": 1, "audio_url": 1, "created_at": 1, "status": 1, "from_id": 1, "mood_color": 1,
             }},
             {"$group": {
                 "_id":         "$other_id",
                 "last_text":   {"$first": "$text"},
                 "last_photo":  {"$first": "$photo_url"},
+                "last_gif":    {"$first": "$gif_url"},
+                "last_shared_post": {"$first": "$shared_post_id"},
+                "last_shared_reel": {"$first": "$shared_reel_id"},
+                "last_audio":  {"$first": "$audio_url"},
                 "last_time":   {"$first": "$created_at"},
                 "last_status": {"$first": "$status"},
                 "last_from":   {"$first": "$from_id"},
