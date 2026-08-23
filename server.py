@@ -4189,11 +4189,17 @@ postbluom.online"""
 
     @api.post("/groups/{group_id}/members")
     async def add_group_member(group_id: str, body: dict, u=Depends(current_user)):
-        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1})
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1, "members": 1})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("admins", []): raise HTTPException(403, "Only admins can add members")
         new_uid = body.get("user_id")
         if not new_uid: raise HTTPException(400, "user_id required")
+        if new_uid == u["id"]: raise HTTPException(400, "You are already in the group")
+        if new_uid in g.get("members", []): return {"ok": True, "already_member": True}
+        connected_ids = set((u.get("followers") or []) + (u.get("following") or []))
+        if new_uid not in connected_ids: raise HTTPException(403, "You can only add your followers, following, or mutual connections")
+        target = await db.users.find_one({"id": new_uid}, {"_id": 0, "id": 1})
+        if not target: raise HTTPException(404, "User not found")
         await db.groups.update_one({"id": group_id}, {"$addToSet": {"members": new_uid}})
         return {"ok": True}
 
