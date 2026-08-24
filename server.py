@@ -4156,8 +4156,13 @@ postbluom.online"""
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(400, "Please upload a valid image file")
         upload_size = await _get_upload_size(file)
+        if upload_size <= 0:
+            raise HTTPException(400, "Image file is empty")
         if upload_size > 10 * 1024 * 1024:
             raise HTTPException(400, "Image too large. Max 10MB.")
+        # _get_upload_size rewinds the stream; rewind once more immediately before
+        # handing it to Cloudinary so the complete selected image is uploaded.
+        file.file.seek(0)
         try:
             result = await asyncio.to_thread(
                 cloudinary.uploader.upload,
@@ -4169,9 +4174,13 @@ postbluom.online"""
         except Exception:
             logging.exception("Group avatar upload failed")
             raise HTTPException(502, "Image upload failed. Please try again.")
-        photo_url = result.get("secure_url")
-        await db.groups.update_one({"id": group_id}, {"$set": {"avatar_photo": photo_url}})
-        return {"ok": True, "avatar_photo": photo_url}
+        photo_url = result.get("secure_url") or result.get("url")
+        if not photo_url:
+            raise HTTPException(502, "Image upload did not return a URL")
+        update_result = await db.groups.update_one({"id": group_id}, {"$set": {"avatar_photo": photo_url}})
+        if not update_result.matched_count:
+            raise HTTPException(404, "Group not found")
+        return {"ok": True, "group_id": group_id, "avatar_photo": photo_url}
 
     @api.patch("/groups/{group_id}")
     async def update_group(group_id: str, body: dict, u=Depends(current_user)):
