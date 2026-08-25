@@ -2451,6 +2451,16 @@ postbluom.online"""
         await db.general_reports.insert_one(doc)
         return {"ok": True, "message": "Report submitted. Our team will review it within 24 hours."}
 
+    @api.delete("/users/me/reports/{report_id}")
+    async def delete_my_report(report_id: str, u=Depends(current_user)):
+        """Allow a user to remove only their own submitted report."""
+        deleted = await db.reports.delete_one({"id": report_id, "reported_by": u["id"]})
+        if deleted.deleted_count == 0:
+            deleted = await db.general_reports.delete_one({"id": report_id, "reported_by": u["id"]})
+        if deleted.deleted_count == 0:
+            raise HTTPException(404, "Report not found")
+        return {"ok": True}
+
     @api.get("/users/me/reports")
     async def get_my_reports(u=Depends(current_user)):
         """Return all reports submitted by the current user (general + content reports)."""
