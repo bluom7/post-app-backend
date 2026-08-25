@@ -1233,20 +1233,20 @@ postbluom.online"""
         actor = public_profile(u)
         posts = []
         async for post in db.posts.find({"user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"photo_url":1,"photo_urls":1,"video_url":1}).sort("created_at",-1).limit(50):
-            posts.append({"id":post.get("id"),"type":"post","content":post.get("content") or "(media post)","created_at":post.get("created_at"),"author":actor,"has_media":bool(post.get("photo_url") or post.get("photo_urls") or post.get("video_url"))})
+            posts.append({"id":post.get("id"),"type":"post","content":post.get("content") or "(media post)","created_at":post.get("created_at"),"author":actor,"has_media":bool(post.get("photo_url") or post.get("photo_urls") or post.get("video_url")),"media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
         comments=[]; owner_ids=set()
-        async for post in db.posts.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"comments":1}):
+        async for post in db.posts.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"comments":1,"photo_url":1,"photo_urls":1}):
             owner_id=post.get("user_id")
             if owner_id: owner_ids.add(owner_id)
             for comment in post.get("comments",[]):
                 if comment.get("user_id")==u["id"]:
-                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id})
-        async for reel in db.reels.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"comments":1}):
+                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id,"target_media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
+        async for reel in db.reels.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"comments":1,"photo_url":1}):
             owner_id=reel.get("user_id")
             if owner_id: owner_ids.add(owner_id)
             for comment in reel.get("comments",[]):
                 if comment.get("user_id")==u["id"]:
-                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id})
+                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
         owners=await db.users.find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1,"is_badge_verified":1}).to_list(len(owner_ids)) if owner_ids else []
         owner_map={profile.get("id"):public_profile(profile) for profile in owners}
         for item in comments: item["target_author"]=owner_map.get(item.get("target_user_id"))
