@@ -1247,15 +1247,39 @@ postbluom.online"""
             for comment in reel.get("comments",[]):
                 if comment.get("user_id")==u["id"]:
                     comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
+        like_items=[]
+        async for post in db.posts.find({"likes.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"photo_url":1,"photo_urls":1}):
+            owner_id=post.get("user_id")
+            if owner_id: owner_ids.add(owner_id)
+            like_items.append({"id":"post:"+post.get("id"),"type":"like","actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id,"target_media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
+        async for reel in db.reels.find({"likes":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"photo_url":1}):
+            owner_id=reel.get("user_id")
+            if owner_id: owner_ids.add(owner_id)
+            like_items.append({"id":"reel:"+reel.get("id"),"type":"like","actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
         owners=await db.users.find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1,"is_badge_verified":1}).to_list(len(owner_ids)) if owner_ids else []
         owner_map={profile.get("id"):public_profile(profile) for profile in owners}
         for item in comments: item["target_author"]=owner_map.get(item.get("target_user_id"))
         comments.sort(key=lambda item:item.get("created_at") or "",reverse=True)
-        return {"actor":actor,"posts":posts,"comments":comments[:50]}
+        for item in like_items: item["target_author"]=owner_map.get(item.get("target_user_id"))
+        like_items.sort(key=lambda item:item.get("target_created_at") or "",reverse=True)
+        return {"actor":actor,"posts":posts,"comments":comments[:50],"likes":like_items[:50]}
 
     @api.delete("/data/activity-log/{activity_type}/{activity_id}")
     async def delete_activity_log_item(activity_type: str, activity_id: str, u=Depends(current_user)):
         """Permanently delete one of the signed-in user's posts or comments."""
+        if activity_type == "like":
+            if ":" not in activity_id:
+                raise HTTPException(400, "Invalid like activity")
+            target_type, target_id = activity_id.split(":", 1)
+            if target_type == "post":
+                result = await db.posts.update_one({"id": target_id}, {"$pull": {"likes": {"user_id": u["id"]}}})
+            elif target_type == "reel":
+                result = await db.reels.update_one({"id": target_id}, {"$pull": {"likes": u["id"]}})
+            else:
+                raise HTTPException(400, "Unsupported like target")
+            if not result.modified_count:
+                raise HTTPException(404, "Activity not found")
+            return {"ok": True, "deleted": "like"}
         if activity_type == "post":
             result = await db.posts.delete_one({"id": activity_id, "user_id": u["id"]})
             if not result.deleted_count:
