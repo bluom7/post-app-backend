@@ -274,7 +274,23 @@ try:
             payload["sid"] = session_id
         return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-    async def issue_token(uid):
+    def _session_metadata(request: Request | None = None) -> dict:
+        """Capture useful device details at login without storing credentials."""
+        ua = request.headers.get("user-agent", "") if request else ""
+        ua_lower = ua.lower()
+        device_name = _parse_device_name(ua)
+        city = (request.headers.get("x-city", "") if request else "").strip()
+        country = (request.headers.get("x-country", "") if request else "").strip()
+        location = ", ".join(part for part in (city, country) if part) or "Unknown location"
+        return {
+            "device_name": device_name,
+            "device": device_name,
+            "is_mobile": any(x in ua_lower for x in ("android", "iphone", "ipad", "mobile")),
+            "location": location,
+            "user_agent": ua[:500],
+        }
+
+    async def issue_token(uid, request: Request | None = None):
         """Create a revocable session record and bind the JWT to it."""
         session_id = str(uuid.uuid4())
         timestamp = now().isoformat()
@@ -283,7 +299,7 @@ try:
             "user_id": uid,
             "created_at": timestamp,
             "last_active": timestamp,
-            "device": "Web",
+            **_session_metadata(request),
         })
         return make_token(uid, session_id)
 
@@ -772,7 +788,7 @@ postbluom.online"""
         return {"token": await issue_token(u["id"]), "user_id": u["id"]}
 
     @api.post("/auth/login")
-    async def login(p: LoginIn):
+    async def login(request: Request, p: LoginIn):
         u = await db.users.find_one(_email_q(p.email))          # case-insensitive lookup
         if not u: raise HTTPException(404, "User not found")
         if not u.get("is_verified"):                             # fast check BEFORE slow hash
@@ -782,7 +798,7 @@ postbluom.online"""
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        token = await issue_token(u["id"])
+        token = await issue_token(u["id"], request)
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
         resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
@@ -1015,7 +1031,7 @@ postbluom.online"""
         return {"token": await issue_token(uid), "user_id": uid, "requires_email": True}
 
     @api.post("/auth/phone-login")
-    async def phone_login(p: PhoneLoginIn):
+    async def phone_login(request: Request, p: PhoneLoginIn):
         # Flexible lookup: match +91XXXXXXXXXX or bare 10-digit, whichever is stored
         _ph = p.phone
         _ph_variants = [_ph]
@@ -1030,7 +1046,7 @@ postbluom.online"""
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        token = await issue_token(u["id"])
+        token = await issue_token(u["id"], request)
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
         resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
@@ -4615,10 +4631,15 @@ postbluom.online"""
         if "iphone" in ua_lower: return "iPhone"
         if "ipad" in ua_lower: return "iPad"
         if "android" in ua_lower:
+            # Android browsers expose the model between the version and Build/.
+            match = re.search(r"Android[^;)]*;\s*(?:[a-z]{2}-[A-Z]{2};\s*)?([^;)]+?)(?:\s+Build[/;]|;wv|\))", ua)
+            if match:
+                model = re.sub(r"\s+Build.*$", "", match.group(1)).replace("_", " ").strip()
+                if model and model.lower() not in {"wv", "mobile", "tablet"}: return model
             return "Android Mobile" if "mobile" in ua_lower else "Android Tablet"
         if "windows" in ua_lower: return "Windows PC"
         if "macintosh" in ua_lower or "mac os" in ua_lower: return "Mac"
-        if "linux" in ua_lower: return "Linux"
+        if "linux" in ua_lower: return "Linux PC"
         if ua.strip(): return ua[:40]
         return "Unknown device"
 
