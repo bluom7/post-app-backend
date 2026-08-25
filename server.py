@@ -1229,7 +1229,7 @@ postbluom.online"""
         """Return the signed-in user's recent posts and comments with safe display metadata."""
         def public_profile(profile):
             if not profile: return None
-            return {"id":profile.get("id"),"name":profile.get("name"),"handle":profile.get("handle"),"username":profile.get("username"),"avatar_photo":profile.get("avatar_photo"),"avatar_bg":profile.get("avatar_bg"),"avatar_letter":profile.get("avatar_letter")}
+            return {"id":profile.get("id"),"name":profile.get("name"),"handle":profile.get("handle"),"username":profile.get("username"),"avatar_photo":profile.get("avatar_photo"),"avatar_bg":profile.get("avatar_bg"),"avatar_letter":profile.get("avatar_letter"),"is_badge_verified":bool(profile.get("is_badge_verified"))}
         actor = public_profile(u)
         posts = []
         async for post in db.posts.find({"user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"photo_url":1,"photo_urls":1,"video_url":1}).sort("created_at",-1).limit(50):
@@ -1247,7 +1247,7 @@ postbluom.online"""
             for comment in reel.get("comments",[]):
                 if comment.get("user_id")==u["id"]:
                     comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id})
-        owners=await db.users.find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1}).to_list(len(owner_ids)) if owner_ids else []
+        owners=await db.users.find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1,"is_badge_verified":1}).to_list(len(owner_ids)) if owner_ids else []
         owner_map={profile.get("id"):public_profile(profile) for profile in owners}
         for item in comments: item["target_author"]=owner_map.get(item.get("target_user_id"))
         comments.sort(key=lambda item:item.get("created_at") or "",reverse=True)
