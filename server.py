@@ -1236,12 +1236,6 @@ postbluom.online"""
         comments = sorted(comments, key=lambda x: x.get("created_at",""), reverse=True)[:50]
         return {"posts": posts, "liked_posts": liked_posts, "comments": comments}
 
-    @api.get("/data/export")
-    async def export_user_data(u=Depends(current_user)):
-        user_data = await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
-        posts = await db.posts.find({"user_id": u["id"]}, {"_id": 0}).to_list(1000)
-        messages_sent = await db.messages.find({"from_id": u["id"]}, {"_id": 0}).to_list(1000)
-        return {"profile": user_data, "posts": posts, "messages_sent": messages_sent, "exported_at": now().isoformat()}
 
     @api.patch("/profile/online")
     async def update_online_status(body: dict, u=Depends(current_user)):
