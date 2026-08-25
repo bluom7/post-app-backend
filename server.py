@@ -1226,16 +1226,32 @@ postbluom.online"""
 
     @api.get("/data/activity-log")
     async def get_activity_log(u=Depends(current_user)):
-        posts = await db.posts.find({"user_id": u["id"]}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
-        liked_posts = await db.posts.find({"likes": u["id"]}, {"_id": 0, "id": 1, "content": 1, "created_at": 1}).sort("created_at", -1).limit(50).to_list(50)
-        comments = []
-        async for post in db.posts.find({"comments.user_id": u["id"]}, {"_id": 0, "id": 1, "comments": 1}):
-            for c in post.get("comments", []):
-                if c.get("user_id") == u["id"]:
-                    comments.append({"post_id": post["id"], "comment": c.get("text",""), "created_at": c.get("created_at","")})
-        comments = sorted(comments, key=lambda x: x.get("created_at",""), reverse=True)[:50]
-        return {"posts": posts, "liked_posts": liked_posts, "comments": comments}
-
+        """Return the signed-in user's recent posts and comments with safe display metadata."""
+        def public_profile(profile):
+            if not profile: return None
+            return {"id":profile.get("id"),"name":profile.get("name"),"handle":profile.get("handle"),"username":profile.get("username"),"avatar_photo":profile.get("avatar_photo"),"avatar_bg":profile.get("avatar_bg"),"avatar_letter":profile.get("avatar_letter")}
+        actor = public_profile(u)
+        posts = []
+        async for post in db.posts.find({"user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"photo_url":1,"photo_urls":1,"video_url":1}).sort("created_at",-1).limit(50):
+            posts.append({"id":post.get("id"),"type":"post","content":post.get("content") or "(media post)","created_at":post.get("created_at"),"author":actor,"has_media":bool(post.get("photo_url") or post.get("photo_urls") or post.get("video_url"))})
+        comments=[]; owner_ids=set()
+        async for post in db.posts.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"comments":1}):
+            owner_id=post.get("user_id")
+            if owner_id: owner_ids.add(owner_id)
+            for comment in post.get("comments",[]):
+                if comment.get("user_id")==u["id"]:
+                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id})
+        async for reel in db.reels.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"comments":1}):
+            owner_id=reel.get("user_id")
+            if owner_id: owner_ids.add(owner_id)
+            for comment in reel.get("comments",[]):
+                if comment.get("user_id")==u["id"]:
+                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id})
+        owners=await db.users.find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1}).to_list(len(owner_ids)) if owner_ids else []
+        owner_map={profile.get("id"):public_profile(profile) for profile in owners}
+        for item in comments: item["target_author"]=owner_map.get(item.get("target_user_id"))
+        comments.sort(key=lambda item:item.get("created_at") or "",reverse=True)
+        return {"actor":actor,"posts":posts,"comments":comments[:50]}
 
     @api.patch("/profile/online")
     async def update_online_status(body: dict, u=Depends(current_user)):
