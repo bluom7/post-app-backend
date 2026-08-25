@@ -2471,6 +2471,19 @@ postbluom.online"""
                 target = await db.users.find_one({"id": target_id}, {"_id": 0, "name": 1, "handle": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1})
                 if target:
                     r["reported_user"] = target
+            source = None
+            if r.get("post_id"):
+                source = await db.posts.find_one({"id": r["post_id"]}, {"_id": 0, "photo_urls": 1, "photo_url": 1, "video_url": 1})
+            elif r.get("reel_id"):
+                source = await db.reels.find_one({"id": r["reel_id"]}, {"_id": 0, "photo_urls": 1, "photo_url": 1, "video_url": 1})
+            if source:
+                photos = source.get("photo_urls") or ([source.get("photo_url")] if source.get("photo_url") else [])
+                if photos:
+                    r["reported_media_url"] = photos[0]
+                    r["reported_media_type"] = "image"
+                elif source.get("video_url"):
+                    r["reported_media_url"] = source["video_url"]
+                    r["reported_media_type"] = "video"
             all_reports.append(r)
         all_reports.sort(key=lambda x: x.get("created_at", ""), reverse=True)
         return {"reports": all_reports[:50]}
