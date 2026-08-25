@@ -1253,6 +1253,37 @@ postbluom.online"""
         comments.sort(key=lambda item:item.get("created_at") or "",reverse=True)
         return {"actor":actor,"posts":posts,"comments":comments[:50]}
 
+    @api.delete("/data/activity-log/{activity_type}/{activity_id}")
+    async def delete_activity_log_item(activity_type: str, activity_id: str, u=Depends(current_user)):
+        """Permanently delete one of the signed-in user's posts or comments."""
+        if activity_type == "post":
+            result = await db.posts.delete_one({"id": activity_id, "user_id": u["id"]})
+            if not result.deleted_count:
+                raise HTTPException(404, "Activity not found")
+            return {"ok": True, "deleted": "post"}
+        if activity_type != "comment":
+            raise HTTPException(400, "Unsupported activity type")
+        post_result = await db.posts.update_one(
+            {"comments": {"$elemMatch": {"id": activity_id, "user_id": u["id"]}}},
+            {"$pull": {"comments": {"id": activity_id, "user_id": u["id"]}}},
+        )
+        if post_result.modified_count:
+            await db.posts.update_many(
+                {"comments": {"$exists": True}},
+                [{"$set": {"comment_count": {"$size": {"$ifNull": ["$comments", []]}}}}],
+            )
+            return {"ok": True, "deleted": "comment"}
+        reel_result = await db.reels.update_one(
+            {"comments": {"$elemMatch": {"id": activity_id, "user_id": u["id"]}}},
+            {"$pull": {"comments": {"id": activity_id, "user_id": u["id"]}}},
+        )
+        if reel_result.modified_count:
+            await db.reels.update_one(
+                {"comments": {"$exists": True}},
+                [{"$set": {"comment_count": {"$size": {"$ifNull": ["$comments", []]}}}}],
+            )
+            return {"ok": True, "deleted": "comment"}
+        raise HTTPException(404, "Activity not found")
     @api.patch("/profile/online")
     async def update_online_status(body: dict, u=Depends(current_user)):
         is_online = body.get("is_online", True)
