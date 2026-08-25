@@ -279,6 +279,8 @@ try:
         ua = request.headers.get("user-agent", "") if request else ""
         ua_lower = ua.lower()
         device_name = _parse_device_name(ua)
+        client_model = (request.headers.get("sec-ch-ua-model", "") if request else "").strip().strip('"')
+        if client_model: device_name = client_model.replace("_", " ")
         city = (request.headers.get("x-city", "") if request else "").strip()
         country = (request.headers.get("x-country", "") if request else "").strip()
         location = ", ".join(part for part in (city, country) if part) or "Unknown location"
