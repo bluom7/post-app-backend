@@ -4210,8 +4210,10 @@ postbluom.online"""
         if new_uid in g.get("members", []): return {"ok": True, "already_member": True}
         connected_ids = set((u.get("followers") or []) + (u.get("following") or []))
         if new_uid not in connected_ids: raise HTTPException(403, "You can only add your followers, following, or mutual connections")
-        target = await db.users.find_one({"id": new_uid}, {"_id": 0, "id": 1})
+        target = await db.users.find_one({"id": new_uid}, {"_id": 0, "id": 1, "is_badge_verified": 1, "followers": 1})
         if not target: raise HTTPException(404, "User not found")
+        if target.get("is_badge_verified") and not u.get("is_badge_verified") and u["id"] not in (target.get("followers") or []):
+            raise HTTPException(403, "Verified users can only be added when they follow you")
         await db.groups.update_one({"id": group_id}, {"$addToSet": {"members": new_uid}})
         return {"ok": True}
 
