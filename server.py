@@ -2466,6 +2466,11 @@ postbluom.online"""
             r["report_kind"] = r.get("type", "content")
             if not r.get("type"):
                 r["type"] = "post" if r.get("post_id") else "reel"
+            target_id = r.get("reported_user_id")
+            if target_id:
+                target = await db.users.find_one({"id": target_id}, {"_id": 0, "name": 1, "handle": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1})
+                if target:
+                    r["reported_user"] = target
             all_reports.append(r)
         all_reports.sort(key=lambda x: x.get("created_at", ""), reverse=True)
         return {"reports": all_reports[:50]}
