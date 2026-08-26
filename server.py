@@ -2809,18 +2809,18 @@ postbluom.online"""
                         })
 
                 # ── typing indicator: DM or group chat ─────────────
-                    elif msg_type == "typing":
-                        to_uid = data.get("to_user_id", "")
-                        group_id = data.get("group_id", "")
-                        is_t = bool(data.get("is_typing", True))
-                        if group_id:
-                            group = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
-                            if not group or user_id not in group.get("members", []):
-                                continue
-                            payload = {"type": "typing", "group_id": group_id, "from_user_id": user_id, "is_typing": is_t}
-                            await asyncio.gather(*[_ws_push(member_id, payload) for member_id in group.get("members", []) if member_id != user_id])
-                        elif to_uid:
-                            await _ws_push(to_uid, {"type": "typing", "from_user_id": user_id, "is_typing": is_t})
+                elif msg_type == "typing":
+                    to_uid = data.get("to_user_id", "")
+                    group_id = data.get("group_id", "")
+                    is_t = bool(data.get("is_typing", True))
+                    if group_id:
+                        group = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
+                        if not group or user_id not in group.get("members", []):
+                            continue
+                        payload = {"type": "typing", "group_id": group_id, "from_user_id": user_id, "is_typing": is_t}
+                        await asyncio.gather(*[_ws_push(member_id, payload) for member_id in group.get("members", []) if member_id != user_id])
+                    elif to_uid:
+                        await _ws_push(to_uid, {"type": "typing", "from_user_id": user_id, "is_typing": is_t})
 
                     # ── ping / keepalive — no-op ──────────────────────
                 elif msg_type == "ping":
