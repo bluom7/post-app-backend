@@ -299,7 +299,8 @@ try:
             return {}
         try:
             url = f"https://ipwho.is/{urllib.parse.quote(client_ip, safe='')}"
-            with urllib.request.urlopen(url, timeout=3) as response:
+            request = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+            with urllib.request.urlopen(request, timeout=3) as response:
                 data = _json.loads(response.read().decode("utf-8"))
             if data.get("success") is False:
                 return {}
@@ -336,12 +337,13 @@ try:
         """Create a revocable session record and bind the JWT to it."""
         session_id = str(uuid.uuid4())
         timestamp = now().isoformat()
+        metadata = await asyncio.to_thread(_session_metadata, request)
         await db.sessions.insert_one({
             "id": session_id,
             "user_id": uid,
             "created_at": timestamp,
             "last_active": timestamp,
-            **_session_metadata(request),
+            **metadata,
         })
         return make_token(uid, session_id)
 
@@ -4687,8 +4689,15 @@ postbluom.online"""
 
     # ── Security & Sessions endpoints ─────────────────────────────────────────
     @api.get("/security/sessions")
-    async def get_security_sessions(u=Depends(current_user)):
+    async def get_security_sessions(request: Request, u=Depends(current_user)):
         current_sid = u.get("_current_session_id")
+        if current_sid:
+            current_metadata = await asyncio.to_thread(_session_metadata, request)
+            if current_metadata.get("location") != "Unknown location":
+                await db.sessions.update_one(
+                    {"id": current_sid, "user_id": u["id"]},
+                    {"$set": current_metadata},
+                )
         sessions = await db.sessions.find(
             {"user_id": u["id"]}, {"_id": 0}
         ).sort("last_active", -1).to_list(50)
