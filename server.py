@@ -294,25 +294,71 @@ try:
         return ""
 
     def _lookup_ip_location(client_ip: str) -> dict:
-        """Resolve a public IP to a city/region/country without requiring an API key."""
+        """Resolve a public IP to a city/region/country using short, keyless fallbacks."""
         if not client_ip:
             return {}
+        encoded_ip = urllib.parse.quote(client_ip, safe="")
+        providers = (
+            (f"https://ipwho.is/{encoded_ip}", "ipwho"),
+            (f"https://ipapi.co/{encoded_ip}/json/", "ipapi"),
+        )
+        for url, provider in providers:
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    data = _json.loads(response.read().decode("utf-8"))
+                if data.get("success") is False or data.get("error") is True:
+                    continue
+                if provider == "ipwho":
+                    location = {
+                        "city": str(data.get("city") or "").strip(),
+                        "region": str(data.get("region") or "").strip(),
+                        "country": str(data.get("country") or "").strip(),
+                    }
+                else:
+                    location = {
+                        "city": str(data.get("city") or "").strip(),
+                        "region": str(data.get("region") or data.get("region_code") or "").strip(),
+                        "country": str(data.get("country_name") or data.get("country") or "").strip(),
+                    }
+                if any(location.values()):
+                    return location
+            except Exception:
+                continue
+        return {}
+
+    def _lookup_coordinate_location(client_location: dict | None) -> dict:
+        """Reverse-geocode browser coordinates; coordinates are not persisted."""
+        if not client_location:
+            return {}
         try:
-            url = f"https://ipwho.is/{urllib.parse.quote(client_ip, safe='')}"
-            request = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
-            with urllib.request.urlopen(request, timeout=3) as response:
-                data = _json.loads(response.read().decode("utf-8"))
-            if data.get("success") is False:
+            latitude = float(client_location.get("latitude"))
+            longitude = float(client_location.get("longitude"))
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
                 return {}
+            query = urllib.parse.urlencode({
+                "format": "json",
+                "lat": latitude,
+                "lon": longitude,
+                "zoom": 10,
+                "addressdetails": 1,
+            })
+            request = urllib.request.Request(
+                f"https://nominatim.openstreetmap.org/reverse?{query}",
+                headers={"User-Agent": "PostApp/1.0 (login location)"},
+            )
+            with urllib.request.urlopen(request, timeout=4) as response:
+                data = _json.loads(response.read().decode("utf-8"))
+            address = data.get("address") or {}
             return {
-                "city": str(data.get("city") or "").strip(),
-                "region": str(data.get("region") or "").strip(),
-                "country": str(data.get("country") or "").strip(),
+                "city": str(address.get("city") or address.get("town") or address.get("village") or address.get("municipality") or "").strip(),
+                "region": str(address.get("state") or address.get("region") or "").strip(),
+                "country": str(address.get("country") or "").strip(),
             }
         except Exception:
             return {}
 
-    def _session_metadata(request: Request | None = None) -> dict:
+    def _session_metadata(request: Request | None = None, client_location: dict | None = None) -> dict:
         """Capture device and city-level login location without storing credentials."""
         ua = request.headers.get("user-agent", "") if request else ""
         ua_lower = ua.lower()
@@ -320,7 +366,8 @@ try:
         client_model = (request.headers.get("sec-ch-ua-model", "") if request else "").strip().strip('"')
         if client_model: device_name = client_model.replace("_", " ")
         client_ip = _client_ip(request)
-        ip_location = _lookup_ip_location(client_ip)
+        coordinate_location = _lookup_coordinate_location(client_location)
+        ip_location = coordinate_location or _lookup_ip_location(client_ip)
         city = ip_location.get("city") or (request.headers.get("x-city", "") if request else "").strip()
         region = ip_location.get("region") or (request.headers.get("x-region", "") if request else "").strip()
         country = ip_location.get("country") or (request.headers.get("x-country", "") if request else "").strip()
@@ -333,11 +380,11 @@ try:
             "user_agent": ua[:500],
         }
 
-    async def issue_token(uid, request: Request | None = None):
+    async def issue_token(uid, request: Request | None = None, client_location: dict | None = None):
         """Create a revocable session record and bind the JWT to it."""
         session_id = str(uuid.uuid4())
         timestamp = now().isoformat()
-        metadata = await asyncio.to_thread(_session_metadata, request)
+        metadata = await asyncio.to_thread(_session_metadata, request, client_location)
         await db.sessions.insert_one({
             "id": session_id,
             "user_id": uid,
@@ -591,8 +638,14 @@ postbluom.online"""
     class OtpIn(BaseModel):
         email: EmailStr; otp: str
 
+    class ClientLocationIn(BaseModel):
+        latitude: float
+        longitude: float
+        accuracy: Optional[float] = None
+
     class LoginIn(BaseModel):
         email: EmailStr; password: str
+        client_location: Optional[ClientLocationIn] = None
 
     class PhoneInitIn(BaseModel):
         phone: str
@@ -630,6 +683,7 @@ postbluom.online"""
 
     class PhoneLoginIn(BaseModel):
         phone: str; password: str
+        client_location: Optional[ClientLocationIn] = None
 
     class ProfileUpdate(BaseModel):
         name: Optional[str] = None
@@ -842,7 +896,8 @@ postbluom.online"""
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        token = await issue_token(u["id"], request)
+        client_location = p.client_location.model_dump() if p.client_location else None
+        token = await issue_token(u["id"], request, client_location)
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
         resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
@@ -1090,7 +1145,8 @@ postbluom.online"""
             asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
         asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
-        token = await issue_token(u["id"], request)
+        client_location = p.client_location.model_dump() if p.client_location else None
+        token = await issue_token(u["id"], request, client_location)
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
         resp = {"token": token, "user_id": u["id"], "user": user_profile}
         if u.get("deleted_at"):
