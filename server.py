@@ -4534,7 +4534,7 @@ postbluom.online"""
         if not invite_code:
             invite_code = str(uuid.uuid4())[:8].upper()
             await db.groups.update_one({"id": group_id}, {"$set": {"invite_code": invite_code}})
-        frontend_url = os.environ.get("FRONTEND_URL", "https://post-app-frontend.onrender.com")
+        frontend_url = os.environ.get("FRONTEND_URL", "https://post-app-frontend-xd7v.onrender.com")
         return {"invite_code": invite_code, "invite_link": f"{frontend_url}?join={invite_code}"}
 
     @api.post("/groups/join")
