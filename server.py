@@ -10,7 +10,7 @@ try:
     from fastapi.middleware.gzip import GZipMiddleware
     from motor.motor_asyncio import AsyncIOMotorClient
     from dotenv import load_dotenv
-    import os, uuid, random, secrets, logging, bcrypt, jwt, re, io, ipaddress
+    import os, uuid, random, secrets, logging, bcrypt, jwt, re, io, ipaddress, threading as _threading
     from pydantic import BaseModel, EmailStr, field_validator
     from typing import Optional, List
     from datetime import datetime, timezone, timedelta
@@ -4775,6 +4775,144 @@ postbluom.online"""
             raise HTTPException(404, "Session not found")
         await db.sessions.delete_one({"id": session_id, "user_id": u["id"]})
         return {"ok": True}
+
+
+    # ── Our Planet: public Earth explorer adapters ───────────────────────────
+    _PLANET_CONTACT_EMAIL = os.environ.get("OUR_PLANET_CONTACT_EMAIL", "support@postbluom.online").strip()
+    _PLANET_UA = f"PostApp-OurPlanet/1.0 ({_PLANET_CONTACT_EMAIL})"
+    _PLANET_CACHE = {}
+    _PLANET_CACHE_TTL = 1800
+    _PLANET_NOMINATIM_LOCK = _threading.Lock()
+    _PLANET_NOMINATIM_LAST = 0.0
+    _PLANET_NOMINATIM = "https://nominatim.openstreetmap.org/search"
+    _PLANET_WIKI = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+    _PLANET_COMMONS = "https://commons.wikimedia.org/w/api.php"
+    _PLANET_GBIF = "https://api.gbif.org/v1/species/match"
+    _PLANET_NASA = "https://cmr.earthdata.nasa.gov/search/granules.json"
+    _PLANET_ARCGIS = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
+
+    def _planet_get_json(url, params=None, timeout=10):
+        try:
+            if params:
+                url += "?" + urllib.parse.urlencode(params, doseq=True)
+            req = urllib.request.Request(url, headers={"User-Agent": _PLANET_UA, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return _json.loads(response.read(4_000_000).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _planet_geo(query):
+        global _PLANET_NOMINATIM_LAST
+        with _PLANET_NOMINATIM_LOCK:
+            pause = 1.0 - (_time.time() - _PLANET_NOMINATIM_LAST)
+            if pause > 0:
+                _time.sleep(pause)
+            data = _planet_get_json(_PLANET_NOMINATIM, {"q": query, "format": "json", "limit": 1}, 10)
+            _PLANET_NOMINATIM_LAST = _time.time()
+        try:
+            item = data[0]
+            return {"lat": float(item["lat"]), "lon": float(item["lon"]), "display": item.get("display_name", ""), "osm_class": item.get("class"), "osm_type": item.get("type")}
+        except (IndexError, KeyError, TypeError, ValueError):
+            return {}
+
+    def _planet_wiki(query):
+        data = _planet_get_json(_PLANET_WIKI + urllib.parse.quote(query.replace(" ", "_")), timeout=10)
+        if data.get("type") == "disambiguation" or not data.get("title"):
+            return {}
+        return {"title": data.get("title"), "extract": data.get("extract"), "description": (data.get("description") or "").lower(), "thumbnail": (data.get("thumbnail") or {}).get("source"), "page_url": (data.get("content_urls") or {}).get("desktop", {}).get("page")}
+
+    def _planet_photo(query):
+        data = _planet_get_json(_PLANET_COMMONS, {"action":"query", "generator":"search", "gsrsearch":query + " filetype:bitmap", "gsrnamespace":6, "gsrlimit":3, "prop":"imageinfo", "iiprop":"url|extmetadata", "iiurlwidth":1400, "format":"json"}, 12)
+        for page in (data.get("query", {}).get("pages", {}) or {}).values():
+            info = (page.get("imageinfo") or [{}])[0]
+            meta = info.get("extmetadata") or {}
+            artist = (meta.get("Artist") or {}).get("value", "")
+            return {"photo_url": info.get("thumburl") or info.get("url"), "photo_credit": __import__("html").unescape(str(artist))}
+        return {}
+
+    def _planet_bio(query):
+        data = _planet_get_json(_PLANET_GBIF, {"name": query}, 10)
+        if data.get("usageKey") and data.get("matchType") != "NONE":
+            return {"scientific": data.get("scientificName"), "key": data.get("usageKey")}
+        return {}
+
+    def _planet_nasa(query):
+        data = _planet_get_json(_PLANET_NASA, [("keyword", query), ("page_size", 3), ("sort_key[]", "-start_date")], 12)
+        entry = (data.get("feed", {}).get("entry") or [{}])[0]
+        for link in entry.get("links", []):
+            marker = ((link.get("title") or "") + " " + (link.get("type") or "")).lower()
+            if any(word in marker for word in ("image", "browse", "thumbnail")):
+                return {"satellite_desc": entry.get("summary"), "source_url": entry.get("id"), "satellite_url": link.get("href")}
+        return {}
+
+    def _planet_satellite(lat, lon):
+        if lat is None or lon is None:
+            return None
+        params = {"bbox": f"{lon-0.2},{lat-0.2},{lon+0.2},{lat+0.2}", "bboxSR":4326, "imageSR":4326, "size":"800,500", "format":"jpg", "f":"image"}
+        return _PLANET_ARCGIS + "?" + urllib.parse.urlencode(params)
+
+    _PLANET_TYPES = {("waterway","river"):"River", ("waterway","stream"):"River", ("natural","water"):"Lake", ("place","ocean"):"Ocean / Sea", ("place","sea"):"Ocean / Sea", ("natural","peak"):"Mountain / Peak", ("natural","ridge"):"Mountain / Range", ("natural","wood"):"Forest", ("landuse","forest"):"Forest", ("natural","desert"):"Desert", ("place","country"):"Country / Region", ("boundary","administrative"):"Country / Region", ("place","city"):"City", ("place","town"):"Town"}
+    _PLANET_WORDS = [("river","River"), ("mountain range","Mountain / Range"), ("mountain","Mountain / Peak"), ("ocean","Ocean / Sea"), ("sea","Ocean / Sea"), ("rainforest","Forest"), ("forest","Forest"), ("desert","Desert"), ("lake","Lake"), ("country","Country / Region"), ("city","City")]
+
+    def _planet_type(bio, geo_data, wiki_data):
+        if bio:
+            return "Species"
+        mapped = _PLANET_TYPES.get((geo_data.get("osm_class"), geo_data.get("osm_type")))
+        if mapped:
+            return mapped
+        for word, label in _PLANET_WORDS:
+            if word in (wiki_data.get("description") or ""):
+                return label
+        return "Place / Geographic Feature" if geo_data else "Earth Entity"
+
+    def _planet_profile(query):
+        key = " ".join(query.strip().lower().split())
+        cached_profile = _PLANET_CACHE.get(key)
+        if cached_profile and _time.time() - cached_profile[0] < _PLANET_CACHE_TTL:
+            return cached_profile[1]
+        geo_data = _planet_geo(query)
+        bio = _planet_bio(query)
+        wiki_data = _planet_wiki(query)
+        photo = _planet_photo(query)
+        nasa = _planet_nasa(query)
+        satellite_url = _planet_satellite(geo_data.get("lat"), geo_data.get("lon"))
+        result = {
+            "id": "earth-" + _hl.sha1(key.encode("utf-8")).hexdigest()[:16],
+            "name": wiki_data.get("title") or query,
+            "entity_type": _planet_type(bio, geo_data, wiki_data),
+            "description": wiki_data.get("extract") or geo_data.get("display") or f"Explore detailed Earth information about {query}.",
+            "lat": geo_data.get("lat"), "lon": geo_data.get("lon"),
+            "photo_url": photo.get("photo_url") or wiki_data.get("thumbnail"), "photo_credit": photo.get("photo_credit"),
+            "satellite_url": satellite_url,
+            "sections": {
+                "geography": geo_data.get("display") or "Coordinates, terrain, boundaries and nearby places when available.",
+                "satellite": nasa.get("satellite_desc") or ("Satellite view centered on this location." if satellite_url else "No location found to generate a satellite view."),
+                "photos": photo.get("photo_credit") or ("Wikipedia" if wiki_data.get("thumbnail") else "Real source photographs when available."),
+                "water": "Hydrology, water level, discharge and water-quality data when available.",
+                "environment": "Ecosystems, land cover, vegetation and environmental observations when available.",
+                "biodiversity": f"Scientific name: {bio.get('scientific')}" if bio else "Species and biodiversity observations when available.",
+                "climate": "Temperature, rainfall, climate normals and trends when available.",
+                "events": "Earthquakes, floods, fires, storms and other events when available.",
+                "culture": "Nearby cities, protected places, landmarks and cultural information when available.",
+                "statistics": "Provider-specific measurements, counts and trends when available.",
+                "history": "Historical satellite/data records when available.",
+                "ai": "Earth AI can summarize returned data, compare dates and explain the entity with source citations.",
+            },
+            "related": [query + " map", query + " photos", query + " satellite", query + " biodiversity"],
+            "source": "Wikipedia + Wikimedia Commons + OpenStreetMap + GBIF + Esri World Imagery" + (" + NASA Earthdata" if nasa.get("satellite_desc") else ""),
+            "source_url": wiki_data.get("page_url") or nasa.get("source_url"),
+        }
+        _PLANET_CACHE[key] = (_time.time(), result)
+        return result
+
+    @api.get("/our-planet/search")
+    async def our_planet_search(q: str = Query("", max_length=200)):
+        clean_query = q.strip()
+        return {"results": [] if not clean_query else [await asyncio.to_thread(_planet_profile, clean_query)]}
+
+    @api.get("/our-planet/health")
+    async def our_planet_health():
+        return {"ok": True, "feature": "universal-earth-profiles", "providers": ["Wikipedia", "Wikimedia Commons", "OpenStreetMap/Nominatim", "GBIF", "NASA Earthdata", "Esri World Imagery"]}
 
 
     # Register all routes
