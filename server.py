@@ -10,7 +10,7 @@ try:
     from fastapi.middleware.gzip import GZipMiddleware
     from motor.motor_asyncio import AsyncIOMotorClient
     from dotenv import load_dotenv
-    import os, uuid, random, secrets, logging, bcrypt, jwt, re, io
+    import os, uuid, random, secrets, logging, bcrypt, jwt, re, io, ipaddress
     from pydantic import BaseModel, EmailStr, field_validator
     from typing import Optional, List
     from datetime import datetime, timezone, timedelta
@@ -274,16 +274,56 @@ try:
             payload["sid"] = session_id
         return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
+    def _client_ip(request: Request | None = None) -> str:
+        """Get the public client IP, including the proxy header used by Render."""
+        if not request:
+            return ""
+        candidates = []
+        candidates.extend(request.headers.get("x-forwarded-for", "").split(","))
+        candidates.append(request.headers.get("x-real-ip", ""))
+        candidates.append(request.headers.get("cf-connecting-ip", ""))
+        candidates.append(request.client.host if request.client else "")
+        for value in candidates:
+            value = value.strip()
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            if not (address.is_private or address.is_loopback or address.is_reserved or address.is_link_local):
+                return str(address)
+        return ""
+
+    def _lookup_ip_location(client_ip: str) -> dict:
+        """Resolve a public IP to a city/region/country without requiring an API key."""
+        if not client_ip:
+            return {}
+        try:
+            url = f"https://ipwho.is/{urllib.parse.quote(client_ip, safe='')}"
+            with urllib.request.urlopen(url, timeout=3) as response:
+                data = _json.loads(response.read().decode("utf-8"))
+            if data.get("success") is False:
+                return {}
+            return {
+                "city": str(data.get("city") or "").strip(),
+                "region": str(data.get("region") or "").strip(),
+                "country": str(data.get("country") or "").strip(),
+            }
+        except Exception:
+            return {}
+
     def _session_metadata(request: Request | None = None) -> dict:
-        """Capture useful device details at login without storing credentials."""
+        """Capture device and city-level login location without storing credentials."""
         ua = request.headers.get("user-agent", "") if request else ""
         ua_lower = ua.lower()
         device_name = _parse_device_name(ua)
         client_model = (request.headers.get("sec-ch-ua-model", "") if request else "").strip().strip('"')
         if client_model: device_name = client_model.replace("_", " ")
-        city = (request.headers.get("x-city", "") if request else "").strip()
-        country = (request.headers.get("x-country", "") if request else "").strip()
-        location = ", ".join(part for part in (city, country) if part) or "Unknown location"
+        client_ip = _client_ip(request)
+        ip_location = _lookup_ip_location(client_ip)
+        city = ip_location.get("city") or (request.headers.get("x-city", "") if request else "").strip()
+        region = ip_location.get("region") or (request.headers.get("x-region", "") if request else "").strip()
+        country = ip_location.get("country") or (request.headers.get("x-country", "") if request else "").strip()
+        location = ", ".join(part for part in (city, region, country) if part) or "Unknown location"
         return {
             "device_name": device_name,
             "device": device_name,
@@ -775,7 +815,7 @@ postbluom.online"""
         return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
     @api.post("/auth/verify-otp")
-    async def verify_otp(p: OtpIn):
+    async def verify_otp(request: Request, p: OtpIn):
         u = await db.users.find_one({"email": p.email})
         if not u: raise HTTPException(400, "User not found")
         if u.get("is_verified"): raise HTTPException(400, "Already verified")
@@ -787,7 +827,7 @@ postbluom.online"""
             {"id": u["id"]},
             {"$set": {"is_verified": True}, "$unset": {"otp_hash": "", "otp_expires_at": ""}},
         )
-        return {"token": await issue_token(u["id"]), "user_id": u["id"]}
+        return {"token": await issue_token(u["id"], request), "user_id": u["id"]}
 
     @api.post("/auth/login")
     async def login(request: Request, p: LoginIn):
@@ -935,7 +975,7 @@ postbluom.online"""
         return {"message": "Email verified"}
 
     @api.post("/auth/email-signup")
-    async def email_signup(p: EmailSignupIn):
+    async def email_signup(request: Request, p: EmailSignupIn):
         rec = await db.email_otps.find_one({"email": p.email, "verified": True})
         if not rec: raise HTTPException(400, "Email not verified")
         existing = await db.users.find_one({"email": p.email, "is_verified": True})
@@ -962,7 +1002,7 @@ postbluom.online"""
         }
         await db.users.insert_one(doc)
         await db.email_otps.delete_one({"email": p.email})
-        return {"token": await issue_token(uid), "user_id": uid, "requires_phone": True}
+        return {"token": await issue_token(uid, request), "user_id": uid, "requires_phone": True}
 
     # ── Auth Phone ────────────────────────────────────────────────
     @api.post("/auth/phone-signup-init")
@@ -1003,7 +1043,7 @@ postbluom.online"""
         return {"message": "Phone verified"}
 
     @api.post("/auth/phone-signup")
-    async def phone_signup(p: PhoneSignupIn):
+    async def phone_signup(request: Request, p: PhoneSignupIn):
         rec = await db.phone_otps.find_one({"phone": p.phone, "verified": True})
         if not rec: raise HTTPException(400, "Phone not verified")
         existing = await db.users.find_one({"phone": p.phone, "is_verified": True})
@@ -1030,7 +1070,7 @@ postbluom.online"""
         }
         await db.users.insert_one(doc)
         await db.phone_otps.delete_one({"phone": p.phone})
-        return {"token": await issue_token(uid), "user_id": uid, "requires_email": True}
+        return {"token": await issue_token(uid, request), "user_id": uid, "requires_email": True}
 
     @api.post("/auth/phone-login")
     async def phone_login(request: Request, p: PhoneLoginIn):
@@ -1094,7 +1134,7 @@ postbluom.online"""
         return {"message": "OTP sent", "demo_otp": demo, "sms_error": sms_err}
 
     @api.post("/auth/add-phone-verify")
-    async def add_phone_verify(p: AddPhoneVerifyIn, u=Depends(raw_user)):
+    async def add_phone_verify(request: Request, p: AddPhoneVerifyIn, u=Depends(raw_user)):
         if u.get("signup_method") != "email": raise HTTPException(403, "Only for email-registered accounts")
         if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
         rec = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
@@ -1105,7 +1145,7 @@ postbluom.online"""
         if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
         await db.users.update_one({"id": u["id"]}, {"$set": {"phone": p.phone, "phone_verified": True}})
         await db.phone_otps.delete_one({"phone": p.phone})
-        return {"message": "Phone verified successfully", "token": await issue_token(u["id"])}
+        return {"message": "Phone verified successfully", "token": await issue_token(u["id"], request)}
 
     @api.post("/auth/add-email-init")
     async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
@@ -1132,7 +1172,7 @@ postbluom.online"""
         return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
 
     @api.post("/auth/add-email-verify")
-    async def add_email_verify(p: AddEmailVerifyIn, u=Depends(raw_user)):
+    async def add_email_verify(request: Request, p: AddEmailVerifyIn, u=Depends(raw_user)):
         if u.get("signup_method") != "phone": raise HTTPException(403, "Only for phone-registered accounts")
         if u.get("email_verified"): raise HTTPException(400, "Email already verified")
         rec = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
@@ -1143,7 +1183,7 @@ postbluom.online"""
         if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
         await db.users.update_one({"id": u["id"]}, {"$set": {"email": p.email, "email_verified": True}})
         await db.email_otps.delete_one({"email": p.email})
-        return {"message": "Email verified successfully", "token": await issue_token(u["id"])}
+        return {"message": "Email verified successfully", "token": await issue_token(u["id"], request)}
 
     # ── Account deletion / restore ────────────────────────────────
     @api.post("/account/delete-request")
