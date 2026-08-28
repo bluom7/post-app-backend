@@ -4790,12 +4790,80 @@ postbluom.online"""
     _PLANET_GBIF = "https://api.gbif.org/v1/species/match"
     _PLANET_NASA = "https://cmr.earthdata.nasa.gov/search/granules.json"
     _PLANET_ARCGIS = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
+    _PLANET_NASA_KEY = os.environ.get("NASA_API_KEY", "").strip()
+    _PLANET_GFW_KEY = os.environ.get("GFW_API_KEY", "").strip()
 
-    def _planet_get_json(url, params=None, timeout=10):
+    from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+    _PLANET_NASA_KEY = os.environ.get("NASA_API_KEY", "").strip()
+    _PLANET_GFW_KEY = os.environ.get("GFW_API_KEY", "").strip()
+
+    def _planet_weather(lat, lon):
+        if lat is None or lon is None: return {}
+        return _planet_get_json("https://api.open-meteo.com/v1/forecast", {"latitude":lat,"longitude":lon,"current_weather":"true","daily":"temperature_2m_max,temperature_2m_min,precipitation_sum","timezone":"auto"}, 10)
+
+    def _planet_power(lat, lon):
+        if lat is None or lon is None: return {}
+        return _planet_get_json("https://power.larc.nasa.gov/api/temporal/climatology/point", {"parameters":"T2M,PRECTOTCORR,ALLSKY_SFC_SW_DWN","community":"RE","longitude":lon,"latitude":lat,"format":"JSON"}, 12)
+
+    def _planet_gfw(lat, lon):
+        if lat is None or lon is None or not _PLANET_GFW_KEY: return {}
+        try:
+            lat, lon = float(lat), float(lon)
+            sql = ("SELECT SUM(area__ha) FROM data "
+                   f"WHERE lat BETWEEN {max(-90,lat-0.5)} AND {min(90,lat+0.5)} "
+                   f"AND lon BETWEEN {max(-180,lon-0.5)} AND {min(180,lon+0.5)}")
+            return _planet_get_json("https://data-api.globalforestwatch.org/dataset/umd_tree_cover_loss/latest/query", {"sql":sql}, 15, {"x-api-key":_PLANET_GFW_KEY})
+        except (TypeError, ValueError): return {}
+
+    def _planet_nasa_library(query):
+        if not _PLANET_NASA_KEY: return {}
+        data = _planet_get_json("https://images-api.nasa.gov/search", {"q":query,"media_type":"image"}, 15)
+        item = (data.get("collection",{}).get("items") or [{}])[0]
+        return {"nasa_image_url":((item.get("links") or [{}])[0]).get("href")} if item else {}
+
+    def _planet_addons(query, lat, lon):
+        with _ThreadPoolExecutor(max_workers=4) as pool:
+            jobs = {
+                "weather": pool.submit(_planet_weather, lat, lon),
+                "power": pool.submit(_planet_power, lat, lon),
+                "gfw": pool.submit(_planet_gfw, lat, lon),
+                "nasa": pool.submit(_planet_nasa_library, query),
+            }
+            data = {name:job.result() for name,job in jobs.items()}
+        weather, power, gfw = data["weather"] or {}, data["power"] or {}, data["gfw"] or {}
+        current, daily = weather.get("current_weather") or {}, weather.get("daily") or {}
+        parameter = (power.get("properties") or {}).get("parameter") or {}
+        climate=[]
+        if current:
+            climate.append(f"Live conditions: {current.get('temperature','—')}°C, wind {current.get('windspeed','—')} km/h")
+            highs, lows, rain = daily.get("temperature_2m_max") or [], daily.get("temperature_2m_min") or [], daily.get("precipitation_sum") or []
+            if highs or lows: climate.append(f"Today's forecast: {highs[0] if highs else '—'}°C high / {lows[0] if lows else '—'}°C low")
+            if rain: climate.append(f"Precipitation today: {rain[0]} mm")
+        if parameter:
+            climate.extend([f"Long-term temperature: {parameter.get('T2M',{}).get('ANN','—')}°C",f"Average precipitation: {parameter.get('PRECTOTCORR',{}).get('ANN','—')} mm/day",f"Average solar energy: {parameter.get('ALLSKY_SFC_SW_DWN',{}).get('ANN','—')} kWh/m²/day"])
+        environment=None
+        if _PLANET_GFW_KEY:
+            try:
+                value=(gfw.get("data") or [{}])[0].get("sum(area__ha)")
+                environment=f"Tree cover loss in the surrounding area: {round(float(value)):,} hectares." if value is not None else "Global Forest Watch returned no tree-cover-loss record for this location."
+            except (AttributeError,TypeError,ValueError): environment="Global Forest Watch returned no tree-cover-loss record for this location."
+        sources=[]
+        if current: sources.append("Open-Meteo")
+        if parameter: sources.append("NASA POWER")
+        if data["nasa"].get("nasa_image_url"): sources.append("NASA Image Library")
+        if _PLANET_GFW_KEY and gfw: sources.append("Global Forest Watch")
+        return {"nasa_image_url":data["nasa"].get("nasa_image_url"),"climate":"\\n".join(climate) or None,"environment":environment,"source_suffix":(" + "+" + ".join(sources)) if sources else ""}
+
+
+    def _planet_get_json(url, params=None, timeout=10, extra_headers=None):
         try:
             if params:
                 url += "?" + urllib.parse.urlencode(params, doseq=True)
-            req = urllib.request.Request(url, headers={"User-Agent": _PLANET_UA, "Accept": "application/json"})
+            request_headers = {"User-Agent": _PLANET_UA, "Accept": "application/json"}
+            if extra_headers:
+                request_headers.update(extra_headers)
+            req = urllib.request.Request(url, headers=request_headers)
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 return _json.loads(response.read(4_000_000).decode("utf-8"))
         except Exception:
@@ -4876,6 +4944,7 @@ postbluom.online"""
         photo = _planet_photo(query)
         nasa = _planet_nasa(query)
         satellite_url = _planet_satellite(geo_data.get("lat"), geo_data.get("lon"))
+        addons = _planet_addons(query, geo_data.get("lat"), geo_data.get("lon"))
         result = {
             "id": "earth-" + _hl.sha1(key.encode("utf-8")).hexdigest()[:16],
             "name": wiki_data.get("title") or query,
@@ -4884,6 +4953,7 @@ postbluom.online"""
             "lat": geo_data.get("lat"), "lon": geo_data.get("lon"),
             "photo_url": photo.get("photo_url") or wiki_data.get("thumbnail"), "photo_credit": photo.get("photo_credit"),
             "satellite_url": satellite_url,
+            "nasa_image_url": addons.get("nasa_image_url"),
             "sections": {
                 "geography": geo_data.get("display") or "Coordinates, terrain, boundaries and nearby places when available.",
                 "satellite": nasa.get("satellite_desc") or ("Satellite view centered on this location." if satellite_url else "No location found to generate a satellite view."),
@@ -4899,7 +4969,7 @@ postbluom.online"""
                 "ai": "Earth AI can summarize returned data, compare dates and explain the entity with source citations.",
             },
             "related": [query + " map", query + " photos", query + " satellite", query + " biodiversity"],
-            "source": "Wikipedia + Wikimedia Commons + OpenStreetMap + GBIF + Esri World Imagery" + (" + NASA Earthdata" if nasa.get("satellite_desc") else ""),
+            "source": "Wikipedia + Wikimedia Commons + OpenStreetMap + GBIF + Esri World Imagery" + (" + NASA Earthdata" if nasa.get("satellite_desc") else "") + addons.get("source_suffix", ""),
             "source_url": wiki_data.get("page_url") or nasa.get("source_url"),
         }
         _PLANET_CACHE[key] = (_time.time(), result)
@@ -4912,7 +4982,8 @@ postbluom.online"""
 
     @api.get("/our-planet/health")
     async def our_planet_health():
-        return {"ok": True, "feature": "universal-earth-profiles", "providers": ["Wikipedia", "Wikimedia Commons", "OpenStreetMap/Nominatim", "GBIF", "NASA Earthdata", "Esri World Imagery"]}
+        return {"ok": True, "feature": "universal-earth-profiles", "providers": ["Wikipedia", "Wikimedia Commons", "OpenStreetMap/Nominatim", "GBIF", "Open-Meteo", "NASA POWER", "NASA Earthdata", "NASA Image Library", "Esri World Imagery", "Global Forest Watch"],
+            "configured": {"nasa_api": bool(_PLANET_NASA_KEY), "global_forest_watch": bool(_PLANET_GFW_KEY)}}
 
 
     # Register all routes
