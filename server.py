@@ -4795,9 +4795,6 @@ postbluom.online"""
 
     from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 
-    _PLANET_NASA_KEY = os.environ.get("NASA_API_KEY", "").strip()
-    _PLANET_GFW_KEY = os.environ.get("GFW_API_KEY", "").strip()
-
     def _planet_weather(lat, lon):
         if lat is None or lon is None: return {}
         return _planet_get_json("https://api.open-meteo.com/v1/forecast", {"latitude":lat,"longitude":lon,"current_weather":"true","daily":"temperature_2m_max,temperature_2m_min,precipitation_sum","timezone":"auto"}, 10)
@@ -4810,10 +4807,11 @@ postbluom.online"""
         if lat is None or lon is None or not _PLANET_GFW_KEY: return {}
         try:
             lat, lon = float(lat), float(lon)
-            sql = ("SELECT SUM(area__ha) FROM data "
-                   f"WHERE lat BETWEEN {max(-90,lat-0.5)} AND {min(90,lat+0.5)} "
-                   f"AND lon BETWEEN {max(-180,lon-0.5)} AND {min(180,lon+0.5)}")
-            return _planet_get_json("https://data-api.globalforestwatch.org/dataset/umd_tree_cover_loss/latest/query", {"sql":sql}, 15, {"x-api-key":_PLANET_GFW_KEY})
+            west, east = max(-180.0, lon - 0.5), min(180.0, lon + 0.5)
+            south, north = max(-90.0, lat - 0.5), min(90.0, lat + 0.5)
+            geometry = {"type":"Polygon","coordinates":[[[west,south],[east,south],[east,north],[west,north],[west,south]]]}
+            sql = "SELECT SUM(area__ha) AS loss_ha FROM data"
+            return _planet_post_json("https://data-api.globalforestwatch.org/dataset/umd_tree_cover_loss/latest/query/json", {"sql":sql,"geometry":geometry}, 15, {"x-api-key":_PLANET_GFW_KEY})
         except (TypeError, ValueError): return {}
 
     def _planet_nasa_library(query):
@@ -4864,6 +4862,18 @@ postbluom.online"""
             if extra_headers:
                 request_headers.update(extra_headers)
             req = urllib.request.Request(url, headers=request_headers)
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return _json.loads(response.read(4_000_000).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _planet_post_json(url, payload, timeout=10, extra_headers=None):
+        try:
+            request_headers = {"User-Agent": _PLANET_UA, "Accept": "application/json", "Content-Type": "application/json"}
+            if extra_headers:
+                request_headers.update(extra_headers)
+            body = _json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 return _json.loads(response.read(4_000_000).decode("utf-8"))
         except Exception:
@@ -4959,9 +4969,9 @@ postbluom.online"""
                 "satellite": nasa.get("satellite_desc") or ("Satellite view centered on this location." if satellite_url else "No location found to generate a satellite view."),
                 "photos": photo.get("photo_credit") or ("Wikipedia" if wiki_data.get("thumbnail") else "Real source photographs when available."),
                 "water": "Hydrology, water level, discharge and water-quality data when available.",
-                "environment": "Ecosystems, land cover, vegetation and environmental observations when available.",
+                "environment": addons.get("environment") or "Ecosystems, land cover, vegetation and environmental observations when available.",
                 "biodiversity": f"Scientific name: {bio.get('scientific')}" if bio else "Species and biodiversity observations when available.",
-                "climate": "Temperature, rainfall, climate normals and trends when available.",
+                "climate": addons.get("climate") or "Temperature, rainfall, climate normals and trends when available.",
                 "events": "Earthquakes, floods, fires, storms and other events when available.",
                 "culture": "Nearby cities, protected places, landmarks and cultural information when available.",
                 "statistics": "Provider-specific measurements, counts and trends when available.",
