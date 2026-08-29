@@ -4843,7 +4843,8 @@ postbluom.online"""
         environment=None
         if _PLANET_GFW_KEY:
             try:
-                value=(gfw.get("data") or [{}])[0].get("sum(area__ha)")
+                row=(gfw.get("data") or [{}])[0]
+                value=row.get("loss_ha") or row.get("sum(area__ha)")
                 environment=f"Tree cover loss in the surrounding area: {round(float(value)):,} hectares." if value is not None else "Global Forest Watch returned no tree-cover-loss record for this location."
             except (AttributeError,TypeError,ValueError): environment="Global Forest Watch returned no tree-cover-loss record for this location."
         sources=[]
