@@ -4870,13 +4870,30 @@ postbluom.online"""
 
     def _planet_post_json(url, payload, timeout=10, extra_headers=None):
         try:
+            # urllib normalizes x-api-key to X-api-key; GFW's gateway requires the lowercase header.
+            import http.client as _http_client
             request_headers = {"User-Agent": _PLANET_UA, "Accept": "application/json", "Content-Type": "application/json"}
             if extra_headers:
                 request_headers.update(extra_headers)
             body = _json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                return _json.loads(response.read(4_000_000).decode("utf-8"))
+            for _attempt in range(2):
+                parsed = urllib.parse.urlsplit(url)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += "?" + parsed.query
+                connection = _http_client.HTTPSConnection(parsed.netloc, timeout=timeout)
+                connection.request("POST", path, body=body, headers=request_headers)
+                response = connection.getresponse()
+                raw = response.read(4_000_000)
+                if response.status in (301, 302, 307, 308) and response.getheader("location"):
+                    url = urllib.parse.urljoin(url, response.getheader("location"))
+                    connection.close()
+                    continue
+                connection.close()
+                if response.status >= 400:
+                    return {}
+                return _json.loads(raw.decode("utf-8"))
+            return {}
         except Exception:
             return {}
 
