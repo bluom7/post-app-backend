@@ -3915,8 +3915,15 @@ postbluom.online"""
         emoji_overlays   = [{"id": e.get("id",""), "emoji": str(e.get("emoji",""))[:8], "xPct": float(e.get("xPct",50)), "yPct": float(e.get("yPct",50)), "size": int(e.get("size",64))} for e in (body.get("emoji_overlays") or []) if e.get("emoji")][:20]
         video_effect     = (body.get("video_effect") or "none").strip()[:20]
         music_url        = (body.get("music_url") or "").strip() or None
-        music_start_time = float(body.get("music_start_time") or 0)
-        music_clip_duration = max(1, min(30, int(body.get("music_clip_duration") or 15)))
+        try:
+            music_start_time = max(0.0, float(body.get("music_start_time") or 0))
+        except (TypeError, ValueError):
+            music_start_time = 0.0
+        try:
+            requested_music_clip = int(float(body.get("music_clip_duration") or 15))
+        except (TypeError, ValueError):
+            requested_music_clip = 15
+        music_clip_duration = max(1, min(30, requested_music_clip))
         music_title      = (body.get("music_title") or "").strip() or None
         music_artist     = (body.get("music_artist") or "").strip() or None
         music_artwork    = (body.get("music_artwork") or "").strip() or None
