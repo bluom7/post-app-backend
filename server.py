@@ -3867,6 +3867,33 @@ postbluom.online"""
 
     # ── Reels ─────────────────────────────────────────────────────
 
+    @api.post("/reels/upload-signature")
+    async def sign_reel_upload(u=Depends(current_user)):
+        """Create a short-lived signature for direct browser -> Cloudinary reel uploads."""
+        cloud_name = CLOUDINARY_CLOUD_NAME
+        api_key = CLOUDINARY_API_KEY
+        api_secret = CLOUDINARY_API_SECRET
+        if not (cloud_name and api_key and api_secret) and CLOUDINARY_URL:
+            parsed = urllib.parse.urlparse(CLOUDINARY_URL)
+            cloud_name = parsed.hostname or ""
+            api_key = urllib.parse.unquote(parsed.username or "")
+            api_secret = urllib.parse.unquote(parsed.password or "")
+        if not (cloud_name and api_key and api_secret):
+            raise HTTPException(500, "Video hosting is not configured on the server")
+        timestamp = int(_time.time())
+        folder = "post-app/reels"
+        public_id = f"reel_{u['id']}_{uuid.uuid4().hex}"
+        sign_params = f"folder={folder}&public_id={public_id}&timestamp={timestamp}"
+        signature = _hl.sha1((sign_params + api_secret).encode("utf-8")).hexdigest()
+        return {
+            "upload_url": f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload",
+            "api_key": api_key,
+            "timestamp": timestamp,
+            "signature": signature,
+            "folder": folder,
+            "public_id": public_id,
+        }
+
     @api.post("/reels/upload")
     async def upload_reel_video(
         file: UploadFile = File(...),
