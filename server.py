@@ -1970,6 +1970,8 @@ postbluom.online"""
             "views_count": view_count,
             "view_count": view_count,
             "saves": r.get("saves", []),
+            "save_count": max(len(r.get("saves") or []), int(r.get("save_count") or 0)),
+            "share_count": max(len(r.get("shares") or []), int(r.get("share_count") or 0)),
             "reposts": [],
             "created_at": r.get("created_at"),
             "edited_at": None,
@@ -3981,6 +3983,7 @@ postbluom.online"""
             "audience_users":    audience_users if audience == "only_show" else [],
             "likes":             [],
             "saves":             [],
+            "shares":            [],
             "comments":          [],
             "comment_count":     0,
             "view_count":        0,
@@ -4001,6 +4004,8 @@ postbluom.online"""
         doc["is_liked"]     = False
         doc["like_count"]   = 0
         doc["is_saved"]     = False
+        doc["save_count"]   = 0
+        doc["share_count"]  = 0
         doc["is_following"] = False
         return doc
 
@@ -4020,11 +4025,14 @@ postbluom.online"""
         mention_counts = {row["_id"]: row["count"] for row in mention_rows}
         following_ids = set(u.get("following", []))
         for r in reels_list:
-            likes = r.get("likes", [])
-            saves = r.get("saves", [])
+            likes = r.get("likes") or []
+            saves = r.get("saves") or []
+            shares = r.get("shares") or []
             r["is_liked"]     = u["id"] in likes
             r["like_count"]   = len(likes)
             r["is_saved"]     = u["id"] in saves
+            r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
+            r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
             r["mention_count"] = mention_counts.get(r["id"], 0)
             r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
             r.pop("likes", None)
@@ -4075,11 +4083,14 @@ postbluom.online"""
         page = reels_raw[skip: skip + limit]
         following_ids = set(u.get("following", []))
         for r in page:
-            likes = r.get("likes", [])
-            saves = r.get("saves", [])
+            likes = r.get("likes") or []
+            saves = r.get("saves") or []
+            shares = r.get("shares") or []
             r["is_liked"]     = u["id"] in likes
             r["like_count"]   = len(likes)
             r["is_saved"]     = u["id"] in saves
+            r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
+            r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
             r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
             _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
             r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
@@ -4123,11 +4134,13 @@ postbluom.online"""
             reels_found = await db.reels.find(reel_q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
             following_ids = set(u.get("following", []))
             for r in reels_found:
-                likes = r.get("likes", [])
-                saves = r.get("saves", [])
+                likes = r.get("likes") or []
+                saves = r.get("saves") or []
                 r["is_liked"]     = u["id"] in likes
                 r["like_count"]   = len(likes)
                 r["is_saved"]     = u["id"] in saves
+                r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
+                r["share_count"]  = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
                 r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
                 _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
                 r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
@@ -4196,6 +4209,20 @@ postbluom.online"""
         if not reel:
             raise HTTPException(404, "Reel not found")
         return {"comments": reel.get("comments", [])}
+
+    @api.post("/reels/{reel_id}/share")
+    async def share_reel(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"shares": 1, "share_count": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        result = await db.reels.update_one(
+            {"id": reel_id, "shares": {"$ne": u["id"]}},
+            {"$addToSet": {"shares": u["id"]}},
+        )
+        updated = await db.reels.find_one({"id": reel_id}, {"shares": 1, "share_count": 1, "_id": 0})
+        shares = (updated or reel).get("shares") or []
+        share_count = max(len(shares), int((updated or reel).get("share_count") or 0))
+        return {"shared": result.modified_count > 0, "share_count": share_count}
 
     @api.post("/reels/{reel_id}/comments")
     async def add_reel_comment(reel_id: str, body: dict, u=Depends(current_user)):
