@@ -3935,6 +3935,11 @@ postbluom.online"""
         caption        = (body.get("caption") or "").strip()
         audio_label    = (body.get("audio_label") or "Original Audio").strip()
         duration       = int(body.get("duration") or 0)
+        category       = (body.get("category") or "general").strip().lower()[:40] or "general"
+        tags_input     = body.get("tags") or body.get("hashtags") or []
+        if isinstance(tags_input, str):
+            tags_input = tags_input.split()
+        tags            = list(dict.fromkeys(str(tag).strip().lower().lstrip("#")[:40] for tag in tags_input if str(tag).strip()))[:20]
         location       = (body.get("location") or "").strip() or None
         tagged_users   = [h.lstrip("@") for h in (body.get("tagged_users") or []) if h][:20]
         audience       = (body.get("audience") or "public").strip()
@@ -3975,6 +3980,8 @@ postbluom.online"""
             "video_url":         video_url if not is_photo_reel else None,
             "photo_url":         photo_url if is_photo_reel else None,
             "caption":           caption,
+            "category":          category,
+            "tags":              tags,
             "audio_label":       audio_label,
             "duration":          duration if not is_photo_reel else 0,
             "location":          location,
@@ -4097,11 +4104,39 @@ postbluom.online"""
         return {"reels": page, "has_more": (skip + limit) < len(reels_raw), "skip": skip, "limit": limit}
 
     @api.post("/reels/{reel_id}/view")
-    async def view_reel(reel_id: str, u=Depends(current_user)):
-        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
+    async def view_reel(reel_id: str, body: Optional[dict] = None, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1, "category": 1})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        await db.reels.update_one({"id": reel_id}, {"$addToSet": {"views": u["id"]}, "$inc": {"view_count": 1}})
+        payload = body or {}
+        try:
+            watch_seconds = max(0.0, min(3600.0, float(payload.get("watch_seconds") or 0)))
+        except (TypeError, ValueError):
+            watch_seconds = 0.0
+        try:
+            completion_ratio = max(0.0, min(1.0, float(payload.get("completion_ratio") or 0)))
+        except (TypeError, ValueError):
+            completion_ratio = 0.0
+        category = str(payload.get("category") or reel.get("category") or "general").strip().lower()[:40] or "general"
+        await db.reels.update_one(
+            {"id": reel_id},
+            {"$addToSet": {"views": u["id"]}, "$inc": {"view_count": 1}},
+        )
+        await db.reel_view_events.insert_one({
+            "user_id": u["id"],
+            "reel_id": reel_id,
+            "creator_id": reel.get("user_id"),
+            "category": category,
+            "watch_seconds": watch_seconds,
+            "completion_ratio": completion_ratio,
+            "event_at": now().isoformat(),
+        })
+        await db.reel_rank_stats.update_one(
+            {"reel_id": reel_id},
+            {"$inc": {"total_views": 1, "completion_sum": completion_ratio, "watch_seconds_sum": watch_seconds},
+             "$set": {"reel_id": reel_id, "updated_at": now().isoformat()}},
+            upsert=True,
+        )
         return {"ok": True}
 
     @api.get("/search")
@@ -5074,6 +5109,396 @@ postbluom.online"""
         return {"ok": True, "feature": "universal-earth-profiles", "providers": ["Wikipedia", "Wikimedia Commons", "OpenStreetMap/Nominatim", "GBIF", "Open-Meteo", "NASA POWER", "NASA Earthdata", "NASA Image Library", "Esri World Imagery", "Global Forest Watch"],
             "configured": {"nasa_api": bool(_PLANET_NASA_KEY), "global_forest_watch": bool(_PLANET_GFW_KEY)}}
 
+
+
+    # ===================================================================
+    # REELS RECOMMENDATION ALGORITHM (schema-compatible, live signals)
+    # ===================================================================
+    # This lives on the existing /api router so the frontend can later call
+    # GET /api/reels/feed without adding another service or database client.
+    REELS_ALGO_PAGE_SIZE = 20
+    REELS_ALGO_LOOKBACK_DAYS = 7
+    REELS_ALGO_SEEN_LOOKBACK_DAYS = 7
+    REELS_ALGO_QUICK_SKIP_SECONDS = 2.0
+    REELS_ALGO_QUICK_SKIP_MIN_COUNT = 3
+    REELS_ALGO_VIRAL_MIN_VIEWS_1H = 500
+    REELS_ALGO_VIRAL_RATIO = 0.15
+    REELS_ALGO_TASK = None
+
+    _REELS_WEIGHTS = {
+        "A": {"completion_rate": 0.40, "engagement_rate": 0.30, "recency": 0.20, "affinity": 0.10},
+        "B": {"completion_rate": 0.30, "engagement_rate": 0.40, "recency": 0.20, "affinity": 0.10},
+    }
+
+    def _reels_parse_datetime(value):
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return now()
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _reels_category(reel):
+        return str(reel.get("category") or "general").strip().lower()[:40] or "general"
+
+    def _reels_tags(reel):
+        raw = reel.get("tags") or reel.get("hashtags") or []
+        if isinstance(raw, str):
+            raw = raw.split()
+        return [str(tag).strip().lower().lstrip("#")[:40] for tag in raw if str(tag).strip()][:20]
+
+    def _reels_user_can_see(reel, user_id, following_ids):
+        owner_id = str(reel.get("user_id") or "")
+        if owner_id == user_id:
+            return True
+        audience = reel.get("audience") or "public"
+        if audience == "only_me":
+            return False
+        if audience == "friends" and owner_id not in following_ids:
+            return False
+        if audience == "only_show" and user_id not in (reel.get("audience_users") or []):
+            return False
+        return True
+
+    async def _reels_user_categories(user_id, days=14, limit=5):
+        since = (now() - timedelta(days=days)).isoformat()
+        rows = await db.reel_view_events.aggregate([
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}}},
+            {"$group": {"_id": "$category", "watch_seconds": {"$sum": "$watch_seconds"}}},
+            {"$sort": {"watch_seconds": -1}},
+            {"$limit": limit},
+        ]).to_list(length=limit)
+        return [row["_id"] for row in rows if row.get("_id")]
+
+    async def _reels_session_categories(user_id):
+        since = (now() - timedelta(minutes=5)).isoformat()
+        rows = await db.reel_view_events.aggregate([
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}}},
+            {"$group": {"_id": "$category", "watch_seconds": {"$sum": "$watch_seconds"}}},
+            {"$sort": {"watch_seconds": -1}},
+            {"$limit": 3},
+        ]).to_list(length=3)
+        return [row["_id"] for row in rows if row.get("_id")]
+
+    async def _reels_active_hour_categories(user_id):
+        since = (now() - timedelta(days=14)).isoformat()
+        current_hour = now().hour
+        rows = await db.reel_view_events.find(
+            {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}},
+            {"_id": 0, "category": 1, "watch_seconds": 1, "event_at": 1},
+        ).to_list(2000)
+        totals = {}
+        for row in rows:
+            if _reels_parse_datetime(row.get("event_at")).hour != current_hour:
+                continue
+            category = row.get("category")
+            totals[category] = totals.get(category, 0.0) + float(row.get("watch_seconds") or 0)
+        return [category for category, _ in sorted(totals.items(), key=lambda item: item[1], reverse=True)[:3]]
+
+    async def _reels_seen_ids(user_id):
+        since = (now() - timedelta(days=REELS_ALGO_SEEN_LOOKBACK_DAYS)).isoformat()
+        return set(await db.reel_view_events.distinct("reel_id", {"user_id": user_id, "event_at": {"$gte": since}}))
+
+    async def _reels_negative_signals(user_id):
+        not_interested = set(await db.reel_feedback.distinct("reel_id", {"user_id": user_id, "action": "not_interested"}))
+        hidden_creators = set(await db.reel_feedback.distinct(
+            "creator_id", {"user_id": user_id, "action": {"$in": ["report", "hide_creator"]}}
+        ))
+        since = (now() - timedelta(days=3)).isoformat()
+        quick_rows = await db.reel_view_events.aggregate([
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "watch_seconds": {"$lt": REELS_ALGO_QUICK_SKIP_SECONDS}}},
+            {"$group": {"_id": "$category", "skip_count": {"$sum": 1}}},
+            {"$match": {"skip_count": {"$gte": REELS_ALGO_QUICK_SKIP_MIN_COUNT}}},
+        ]).to_list(length=None)
+        return {
+            "not_interested_ids": not_interested,
+            "hidden_creator_ids": hidden_creators,
+            "quick_skip_categories": {row["_id"] for row in quick_rows if row.get("_id")},
+        }
+
+    async def _reels_liked_creators(user_id):
+        liked_reels = await db.reels.find({"likes": user_id}, {"_id": 0, "user_id": 1}).to_list(100)
+        return {row.get("user_id") for row in liked_reels if row.get("user_id")}
+
+    async def _reels_similar_user_reels(user_id):
+        liked = await db.reels.find({"likes": user_id}, {"_id": 0, "id": 1}).to_list(100)
+        liked_ids = [row.get("id") for row in liked if row.get("id")]
+        if not liked_ids:
+            return set()
+        liked_docs = await db.reels.find({"id": {"$in": liked_ids}}, {"_id": 0, "likes": 1}).to_list(100)
+        similar_users = set()
+        for row in liked_docs:
+            similar_users.update(row.get("likes") or [])
+        similar_users.discard(user_id)
+        if not similar_users:
+            return set()
+        recommendations = await db.reels.find(
+            {"likes": {"$in": list(similar_users)}, "id": {"$nin": liked_ids}},
+            {"_id": 0, "id": 1},
+        ).limit(100).to_list(100)
+        return {row.get("id") for row in recommendations if row.get("id")}
+
+    async def _reels_live_stats(reel_ids):
+        if not reel_ids:
+            return {}
+        stats = {}
+        stored = await db.reel_rank_stats.find({"reel_id": {"$in": reel_ids}}, {"_id": 0}).to_list(len(reel_ids))
+        for row in stored:
+            stats[row["reel_id"]] = dict(row)
+        since = (now() - timedelta(hours=1)).isoformat()
+        hourly = await db.reel_view_events.aggregate([
+            {"$match": {"reel_id": {"$in": reel_ids}, "event_at": {"$gte": since}}},
+            {"$group": {
+                "_id": "$reel_id",
+                "views_1h": {"$sum": 1},
+                "watch_seconds_1h": {"$sum": "$watch_seconds"},
+            }},
+        ]).to_list(length=None)
+        for row in hourly:
+            stats.setdefault(row["_id"], {}).update({
+                "views_1h": int(row.get("views_1h") or 0),
+                "watch_seconds_1h": float(row.get("watch_seconds_1h") or 0),
+            })
+        return stats
+
+    def _reels_diversify(items, page_size):
+        result, pool, categories = [], list(items), []
+        last_creator = None
+        while pool and len(result) < page_size:
+            selected = None
+            for index, item in enumerate(pool):
+                category = item.get("category") or "general"
+                creator = item.get("user_id")
+                category_ok = categories[-2:].count(category) < 2
+                creator_ok = creator != last_creator
+                if category_ok and creator_ok:
+                    selected = index
+                    break
+            if selected is None:
+                selected = 0
+            chosen = pool.pop(selected)
+            result.append(chosen)
+            categories.append(chosen.get("category") or "general")
+            last_creator = chosen.get("user_id")
+        return result
+
+    @api.get("/reels/feed")
+    async def get_algorithmic_reels_feed(
+        page: int = Query(0, ge=0),
+        limit: int = Query(REELS_ALGO_PAGE_SIZE, ge=1, le=50),
+        u=Depends(current_user),
+    ):
+        user_id = u["id"]
+        limit = min(limit, 50)
+        now_utc = now()
+        cutoff = now_utc - timedelta(days=REELS_ALGO_LOOKBACK_DAYS)
+        following_ids = set(u.get("following") or [])
+        excluded_users = set((u.get("blocked_users") or []) + (u.get("muted_users") or []))
+        raw_candidates = await db.reels.find(
+            {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
+            {"_id": 0},
+        ).sort("created_at", -1).limit(2000).to_list(2000)
+        candidates = []
+        for reel in raw_candidates:
+            created_at = _reels_parse_datetime(reel.get("created_at"))
+            owner_id = str(reel.get("user_id") or "")
+            if created_at < cutoff or owner_id in excluded_users:
+                continue
+            if not _reels_user_can_see(reel, user_id, following_ids):
+                continue
+            candidates.append(reel)
+        if not candidates:
+            return {"page": page, "limit": limit, "reels": [], "has_more": False, "ab_group": "A", "algorithm": "reels_v1"}
+
+        seen_ids = await _reels_seen_ids(user_id)
+        negative = await _reels_negative_signals(user_id)
+        filtered = [
+            reel for reel in candidates
+            if reel.get("id") not in negative["not_interested_ids"]
+            and reel.get("user_id") not in negative["hidden_creator_ids"]
+        ]
+        unseen = [reel for reel in filtered if reel.get("id") not in seen_ids]
+        if unseen:
+            filtered = unseen
+        if not filtered:
+            filtered = candidates
+
+        reel_ids = [reel.get("id") for reel in filtered if reel.get("id")]
+        live_stats = await _reels_live_stats(reel_ids)
+        top_categories = set(await _reels_user_categories(user_id))
+        liked_creators = await _reels_liked_creators(user_id)
+        similar_reel_ids = await _reels_similar_user_reels(user_id)
+        session_categories = set(await _reels_session_categories(user_id))
+        active_hour_categories = set(await _reels_active_hour_categories(user_id))
+        active_tags = await db.trending_tags.find({"active": True}, {"_id": 0, "tag": 1, "boost": 1}).to_list(100)
+        tag_boosts = {str(row.get("tag")): float(row.get("boost") or 0) for row in active_tags if row.get("tag")}
+        ab_group = "A" if int(_hl.md5(user_id.encode()).hexdigest(), 16) % 2 == 0 else "B"
+        weights = _REELS_WEIGHTS[ab_group]
+        scored = []
+
+        for reel in filtered:
+            reel_id = reel.get("id")
+            if not reel_id:
+                continue
+            stats = live_stats.get(reel_id, {})
+            embedded_views = reel.get("views") if isinstance(reel.get("views"), list) else []
+            total_views = max(len(embedded_views), int(reel.get("view_count") or 0), int(stats.get("total_views") or 0), 1)
+            completion_sum = float(stats.get("completion_sum") or 0)
+            completion = completion_sum / max(int(stats.get("total_views") or 0), 1) if completion_sum else float(stats.get("avg_completion") or 0)
+            likes = len(reel.get("likes") or [])
+            comments = len(reel.get("comments") or [])
+            shares = len(reel.get("shares") or [])
+            engagement = (likes + comments * 2 + shares * 3) / total_views
+            hours_old = max(0.0, (now_utc - _reels_parse_datetime(reel.get("created_at"))).total_seconds() / 3600)
+            recency = 1.0 / (1.0 + hours_old)
+            category = _reels_category(reel)
+            affinity = 1 if reel.get("user_id") in liked_creators else 0
+            hourly_views = int(stats.get("views_1h") or 0)
+            velocity = hourly_views / max(total_views, 1)
+            is_viral = hourly_views >= REELS_ALGO_VIRAL_MIN_VIEWS_1H and velocity >= REELS_ALGO_VIRAL_RATIO
+            score = (
+                weights["completion_rate"] * completion
+                + weights["engagement_rate"] * engagement
+                + weights["recency"] * recency
+                + weights["affinity"] * affinity
+            )
+            if category in top_categories:
+                score += 50
+            if reel.get("user_id") in liked_creators:
+                score += 30
+            if reel_id in similar_reel_ids:
+                score += 40
+            if category in session_categories:
+                score += 35
+            if category in active_hour_categories:
+                score += 25
+            score += sum(tag_boosts.get(tag, 0) for tag in _reels_tags(reel))
+            if is_viral:
+                score += 1000
+            if category in negative["quick_skip_categories"]:
+                score -= 30
+            scored.append({**reel, "category": category, "score": score, "is_viral": is_viral})
+
+        viral = sorted([item for item in scored if item["is_viral"]], key=lambda item: item["score"], reverse=True)
+        normal = sorted([item for item in scored if not item["is_viral"]], key=lambda item: item["score"], reverse=True)
+        ordered = (viral[:3] + viral[3:] + normal) if page == 0 else (viral[3:] + normal)
+        exploration_count = max(1, int(limit * 0.15))
+        main_slot_count = max(1, limit - exploration_count)
+        start = page * main_slot_count
+        main_slice = ordered[start:start + main_slot_count]
+        main_ids = {item.get("id") for item in main_slice}
+        exploration = [
+            item for item in scored
+            if item.get("id") not in main_ids
+            and (max(len(item.get("views") or []), int(item.get("view_count") or 0)) < 10
+                 or (now_utc - _reels_parse_datetime(item.get("created_at"))).days <= 30)
+        ]
+        random.Random(f"{user_id}:{page}").shuffle(exploration)
+        combined = main_slice + exploration[:exploration_count]
+        final_items = _reels_diversify(combined, limit)
+        response_reels = []
+        for item in final_items:
+            shaped = _reel_to_feed_item(item)
+            shaped.update({
+                "category": item.get("category") or "general",
+                "score": round(float(item.get("score") or 0), 6),
+                "is_viral": bool(item.get("is_viral")),
+                "algorithm": "reels_v1",
+            })
+            response_reels.append(shaped)
+        return {
+            "page": page,
+            "limit": limit,
+            "reels": response_reels,
+            "has_more": start + main_slot_count < len(ordered),
+            "ab_group": ab_group,
+            "algorithm": "reels_v1",
+        }
+
+    @api.post("/reels/feedback")
+    async def submit_reels_feedback(body: dict, u=Depends(current_user)):
+        action = str(body.get("action") or "").strip().lower()
+        if action not in {"not_interested", "report", "hide_creator"}:
+            raise HTTPException(400, "action must be not_interested, report, or hide_creator")
+        reel_id = str(body.get("reel_id") or "").strip()
+        if not reel_id:
+            raise HTTPException(400, "reel_id is required")
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        await db.reel_feedback.update_one(
+            {"user_id": u["id"], "reel_id": reel_id, "action": action},
+            {"$set": {"user_id": u["id"], "reel_id": reel_id, "creator_id": reel.get("user_id"), "action": action, "created_at": now().isoformat()}},
+            upsert=True,
+        )
+        return {"status": "ok", "action": action}
+
+    @api.post("/reels/onboarding")
+    async def save_reels_onboarding(body: dict, u=Depends(current_user)):
+        raw_categories = body.get("categories") or []
+        if isinstance(raw_categories, str):
+            raw_categories = [raw_categories]
+        categories = list(dict.fromkeys(str(item).strip().lower()[:40] for item in raw_categories if str(item).strip()))[:20]
+        await db.users.update_one({"id": u["id"]}, {"$set": {"onboarding_categories": categories}})
+        return {"status": "ok", "categories": categories}
+
+    @api.post("/reels/ab-metric")
+    async def log_reels_ab_metric(body: dict, u=Depends(current_user)):
+        event = str(body.get("event") or "").strip().lower()[:60]
+        if not event:
+            raise HTTPException(400, "event is required")
+        group = str(body.get("group") or "A").strip().upper()
+        if group not in {"A", "B"}:
+            group = "A"
+        await db.ab_test_events.insert_one({"user_id": u["id"], "group": group, "event": event, "created_at": now().isoformat()})
+        return {"status": "ok"}
+
+    async def _refresh_reels_rank_stats():
+        rows = await db.reels.find(
+            {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
+            {"_id": 0, "id": 1, "views": 1, "view_count": 1, "likes": 1, "comments": 1, "shares": 1},
+        ).limit(2000).to_list(2000)
+        for reel in rows:
+            reel_id = reel.get("id")
+            if not reel_id:
+                continue
+            await db.reel_rank_stats.update_one(
+                {"reel_id": reel_id},
+                {"$set": {
+                    "reel_id": reel_id,
+                    "content_views": max(len(reel.get("views") or []), int(reel.get("view_count") or 0)),
+                    "likes": len(reel.get("likes") or []),
+                    "comments": len(reel.get("comments") or []),
+                    "shares": len(reel.get("shares") or []),
+                    "updated_at": now().isoformat(),
+                }},
+                upsert=True,
+            )
+
+    async def _reels_algorithm_worker():
+        while True:
+            try:
+                await _refresh_reels_rank_stats()
+            except Exception:
+                logging.exception("Reels rank refresh failed")
+            await asyncio.sleep(600)
+
+    @app.on_event("startup")
+    async def start_reels_algorithm_worker():
+        global REELS_ALGO_TASK
+        try:
+            await db.reel_view_events.create_index([("user_id", 1), ("event_at", -1)])
+            await db.reel_view_events.create_index([("reel_id", 1), ("event_at", -1)])
+            await db.reel_rank_stats.create_index("reel_id", unique=True)
+            await db.reel_feedback.create_index([("user_id", 1), ("reel_id", 1), ("action", 1)], unique=True)
+        except Exception:
+            logging.exception("Reels algorithm index setup failed")
+        if REELS_ALGO_TASK is None or REELS_ALGO_TASK.done():
+            REELS_ALGO_TASK = asyncio.create_task(_reels_algorithm_worker())
 
     # Register all routes
     app.include_router(api)
