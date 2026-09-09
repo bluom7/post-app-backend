@@ -3935,7 +3935,7 @@ postbluom.online"""
         caption        = (body.get("caption") or "").strip()
         audio_label    = (body.get("audio_label") or "Original Audio").strip()
         duration       = int(body.get("duration") or 0)
-        category       = (body.get("category") or u.get("category") or "general").strip().lower()[:40] or "general"
+        category       = (body.get("category") or "general").strip().lower()[:40] or "general"
         tags_input     = body.get("tags") or body.get("hashtags") or []
         if isinstance(tags_input, str):
             tags_input = tags_input.split()
@@ -4021,7 +4021,17 @@ postbluom.online"""
         blocked  = u.get("blocked_users", [])
         muted    = u.get("muted_users", [])
         excluded = list(set(blocked + muted))
-        query: dict = {}
+        following_ids = list(set(u.get("following", []) or []))
+        query: dict = {
+            "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
+            "$or": [
+                {"audience": {"$exists": False}},
+                {"audience": "public"},
+                {"user_id": u["id"]},
+                {"audience": "friends", "user_id": {"$in": following_ids}},
+                {"audience": "only_show", "audience_users": u["id"]},
+            ],
+        }
         if excluded:
             query["user_id"] = {"$nin": excluded}
         reels_list = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
@@ -4059,7 +4069,17 @@ postbluom.online"""
         blocked = u.get("blocked_users", [])
         muted   = u.get("muted_users", [])
         excluded = list(set(blocked + muted))
-        query = {}
+        following_ids = list(set(u.get("following", []) or []))
+        query = {
+            "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
+            "$or": [
+                {"audience": {"$exists": False}},
+                {"audience": "public"},
+                {"user_id": u["id"]},
+                {"audience": "friends", "user_id": {"$in": following_ids}},
+                {"audience": "only_show", "audience_users": u["id"]},
+            ],
+        }
         if excluded:
             query["user_id"] = {"$nin": excluded}
         if category and category.lower() != "all":
@@ -5172,14 +5192,7 @@ postbluom.online"""
             {"$sort": {"watch_seconds": -1}},
             {"$limit": limit},
         ]).to_list(length=limit)
-        learned = [row["_id"] for row in rows if row.get("_id")]
-        profile = await db.users.find_one({"id": user_id}, {"_id": 0, "onboarding_categories": 1})
-        onboarding = [
-            str(category).strip().lower()[:40]
-            for category in (profile or {}).get("onboarding_categories", [])
-            if str(category).strip()
-        ]
-        return list(dict.fromkeys(onboarding + learned))[:limit]
+        return [row["_id"] for row in rows if row.get("_id")]
 
     async def _reels_session_categories(user_id):
         since = (now() - timedelta(minutes=5)).isoformat()
@@ -5227,6 +5240,11 @@ postbluom.online"""
             "quick_skip_categories": {row["_id"] for row in quick_rows if row.get("_id")},
         }
 
+    async def _reels_positive_signals(user_id):
+        return set(await db.reel_feedback.distinct(
+            "reel_id", {"user_id": user_id, "action": "interested"}
+        ))
+
     async def _reels_liked_creators(user_id):
         liked_reels = await db.reels.find({"likes": user_id}, {"_id": 0, "user_id": 1}).to_list(100)
         return {row.get("user_id") for row in liked_reels if row.get("user_id")}
@@ -5256,22 +5274,6 @@ postbluom.online"""
         stored = await db.reel_rank_stats.find({"reel_id": {"$in": reel_ids}}, {"_id": 0}).to_list(len(reel_ids))
         for row in stored:
             stats[row["reel_id"]] = dict(row)
-        all_time = await db.reel_view_events.aggregate([
-            {"$match": {"reel_id": {"$in": reel_ids}}},
-            {"$group": {
-                "_id": "$reel_id",
-                "total_views": {"$sum": 1},
-                "completion_sum": {"$sum": "$completion_ratio"},
-                "watch_seconds_sum": {"$sum": "$watch_seconds"},
-            }},
-        ]).to_list(length=None)
-        for row in all_time:
-            reel_stats = stats.setdefault(row["_id"], {})
-            total_views = int(row.get("total_views") or 0)
-            reel_stats["total_views"] = max(int(reel_stats.get("total_views") or 0), total_views)
-            reel_stats["completion_sum"] = float(row.get("completion_sum") or 0)
-            reel_stats["watch_seconds_sum"] = float(row.get("watch_seconds_sum") or 0)
-            reel_stats["avg_completion"] = float(row.get("completion_sum") or 0) / max(total_views, 1)
         since = (now() - timedelta(hours=1)).isoformat()
         hourly = await db.reel_view_events.aggregate([
             {"$match": {"reel_id": {"$in": reel_ids}, "event_at": {"$gte": since}}},
@@ -5365,6 +5367,7 @@ postbluom.online"""
         top_categories = set(await _reels_user_categories(user_id))
         liked_creators = await _reels_liked_creators(user_id)
         similar_reel_ids = await _reels_similar_user_reels(user_id)
+        positive_reel_ids = await _reels_positive_signals(user_id)
         session_categories = set(await _reels_session_categories(user_id))
         active_hour_categories = set(await _reels_active_hour_categories(user_id))
         active_tags = await db.trending_tags.find({"active": True}, {"_id": 0, "tag": 1, "boost": 1}).to_list(100)
@@ -5405,6 +5408,8 @@ postbluom.online"""
                 score += 30
             if reel_id in similar_reel_ids:
                 score += 40
+            if reel_id in positive_reel_ids:
+                score += 20
             if category in session_categories:
                 score += 35
             if category in active_hour_categories:
@@ -5455,7 +5460,7 @@ postbluom.online"""
     @api.post("/reels/feedback")
     async def submit_reels_feedback(body: dict, u=Depends(current_user)):
         action = str(body.get("action") or "").strip().lower()
-        if action not in {"not_interested", "report", "hide_creator"}:
+        if action not in {"interested", "not_interested", "report", "hide_creator"}:
             raise HTTPException(400, "action must be not_interested, report, or hide_creator")
         reel_id = str(body.get("reel_id") or "").strip()
         if not reel_id:
