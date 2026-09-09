@@ -5302,15 +5302,25 @@ postbluom.online"""
             {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
             {"_id": 0},
         ).sort("created_at", -1).limit(2000).to_list(2000)
-        candidates = []
+
+        # Recency is a ranking signal, never an availability gate. The old
+        # hard cutoff made an otherwise healthy feed return [] as soon as a
+        # user's content was older than seven days. Keep recent reels first
+        # while retaining every eligible reel as a real fallback pool.
+        recent_candidates = []
+        older_candidates = []
         for reel in raw_candidates:
             created_at = _reels_parse_datetime(reel.get("created_at"))
             owner_id = str(reel.get("user_id") or "")
-            if created_at < cutoff or owner_id in excluded_users:
+            if owner_id in excluded_users:
                 continue
             if not _reels_user_can_see(reel, user_id, following_ids):
                 continue
-            candidates.append(reel)
+            if created_at >= cutoff:
+                recent_candidates.append(reel)
+            else:
+                older_candidates.append(reel)
+        candidates = recent_candidates + older_candidates
         if not candidates:
             return {"page": page, "limit": limit, "reels": [], "has_more": False, "ab_group": "A", "algorithm": "reels_v1"}
 
