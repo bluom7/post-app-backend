@@ -3935,7 +3935,7 @@ postbluom.online"""
         caption        = (body.get("caption") or "").strip()
         audio_label    = (body.get("audio_label") or "Original Audio").strip()
         duration       = int(body.get("duration") or 0)
-        category       = (body.get("category") or "general").strip().lower()[:40] or "general"
+        category       = (body.get("category") or u.get("category") or "general").strip().lower()[:40] or "general"
         tags_input     = body.get("tags") or body.get("hashtags") or []
         if isinstance(tags_input, str):
             tags_input = tags_input.split()
@@ -5192,7 +5192,14 @@ postbluom.online"""
             {"$sort": {"watch_seconds": -1}},
             {"$limit": limit},
         ]).to_list(length=limit)
-        return [row["_id"] for row in rows if row.get("_id")]
+        learned = [row["_id"] for row in rows if row.get("_id")]
+        profile = await db.users.find_one({"id": user_id}, {"_id": 0, "onboarding_categories": 1})
+        onboarding = [
+            str(category).strip().lower()[:40]
+            for category in (profile or {}).get("onboarding_categories", [])
+            if str(category).strip()
+        ]
+        return list(dict.fromkeys(onboarding + learned))[:limit]
 
     async def _reels_session_categories(user_id):
         since = (now() - timedelta(minutes=5)).isoformat()
@@ -5274,6 +5281,22 @@ postbluom.online"""
         stored = await db.reel_rank_stats.find({"reel_id": {"$in": reel_ids}}, {"_id": 0}).to_list(len(reel_ids))
         for row in stored:
             stats[row["reel_id"]] = dict(row)
+        all_time = await db.reel_view_events.aggregate([
+            {"$match": {"reel_id": {"$in": reel_ids}}},
+            {"$group": {
+                "_id": "$reel_id",
+                "total_views": {"$sum": 1},
+                "completion_sum": {"$sum": "$completion_ratio"},
+                "watch_seconds_sum": {"$sum": "$watch_seconds"},
+            }},
+        ]).to_list(length=None)
+        for row in all_time:
+            reel_stats = stats.setdefault(row["_id"], {})
+            total_views = int(row.get("total_views") or 0)
+            reel_stats["total_views"] = max(int(reel_stats.get("total_views") or 0), total_views)
+            reel_stats["completion_sum"] = float(row.get("completion_sum") or 0)
+            reel_stats["watch_seconds_sum"] = float(row.get("watch_seconds_sum") or 0)
+            reel_stats["avg_completion"] = float(row.get("completion_sum") or 0) / max(total_views, 1)
         since = (now() - timedelta(hours=1)).isoformat()
         hourly = await db.reel_view_events.aggregate([
             {"$match": {"reel_id": {"$in": reel_ids}, "event_at": {"$gte": since}}},
@@ -5461,7 +5484,7 @@ postbluom.online"""
     async def submit_reels_feedback(body: dict, u=Depends(current_user)):
         action = str(body.get("action") or "").strip().lower()
         if action not in {"interested", "not_interested", "report", "hide_creator"}:
-            raise HTTPException(400, "action must be not_interested, report, or hide_creator")
+            raise HTTPException(400, "action must be interested, not_interested, report, or hide_creator")
         reel_id = str(body.get("reel_id") or "").strip()
         if not reel_id:
             raise HTTPException(400, "reel_id is required")
