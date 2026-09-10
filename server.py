@@ -5349,6 +5349,13 @@ postbluom.online"""
         now_utc = now()
         cutoff = now_utc - timedelta(days=REELS_ALGO_LOOKBACK_DAYS)
         following_ids = set(u.get("following") or [])
+        pending_follow_ids = {
+            row["to_id"]
+            for row in await db.follow_requests.find(
+                {"from_id": u["id"], "status": "pending"},
+                {"_id": 0, "to_id": 1},
+            ).to_list(5000)
+        }
         excluded_users = set((u.get("blocked_users") or []) + (u.get("muted_users") or []))
         raw_candidates = await db.reels.find(
             {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
@@ -5469,6 +5476,9 @@ postbluom.online"""
         for item in final_items:
             shaped = _reel_to_feed_item(item)
             shaped.update({
+                # Keep the Reels tab relationship state identical to Home/Profile.
+                "is_following": item.get("user_id") in following_ids or item.get("user_id") == u["id"],
+                "is_follow_pending": item.get("user_id") in pending_follow_ids,
                 "category": item.get("category") or "general",
                 "score": round(float(item.get("score") or 0), 6),
                 "is_viral": bool(item.get("is_viral")),
