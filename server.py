@@ -3217,52 +3217,105 @@ postbluom.online"""
             return "Apologetic tone — expressing regret"
         return None
 
-    @api.post("/translate")
-    async def translate_endpoint(body: dict):
-        text         = (body.get("text") or "").strip()
-        target       = body.get("target", "en")
-        include_tone = body.get("tone", False)
-        if not text:
-            return {"translated": text, "tone_hint": None}
-        tl        = TRANSLATE_LANG_MAP.get(target, target)
-        cache_key = tl + "||" + text
-        cached    = _cache_get(cache_key)
-        if cached:
-            return {"translated": cached, "tone_hint": _detect_tone_hint(text) if include_tone else None}
+    async def _translate_plain_text(value: str, tl: str) -> str:
+        """Translate a caption segment while preserving its surrounding whitespace."""
+        if not value or not value.strip() or tl == "en":
+            return value
+        leading = value[:len(value) - len(value.lstrip())]
+        trailing = value[len(value.rstrip()):]
+        core = value.strip()
         translated = None
+
+        # MyMemory is fast when available.
         try:
             url = (
                 "https://api.mymemory.translated.world/get"
-                f"?q={urllib.parse.quote(text)}&langpair=autodetect|{tl}"
+                f"?q={urllib.parse.quote(core)}&langpair=autodetect|{tl}"
             )
             req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
-            def _fetch():
+            def _fetch_mymemory():
                 with urllib.request.urlopen(req, timeout=6) as resp:
                     return _json.loads(resp.read().decode())
-            data     = await asyncio.to_thread(_fetch)
-            t_result = (data.get("responseData") or {}).get("translatedText", "")
-            if t_result and "MYMEMORY WARNING" not in t_result and t_result != text:
-                translated = t_result
+            data = await asyncio.to_thread(_fetch_mymemory)
+            result = (data.get("responseData") or {}).get("translatedText", "")
+            if result and "MYMEMORY WARNING" not in result and result.strip() != core:
+                translated = result.strip()
         except Exception as e:
             logging.warning(f"MyMemory translation failed: {e}")
+
+        # LibreTranslate is the second fallback.
         if not translated:
             try:
-                lt_body = _json.dumps({"q": text, "source": "auto", "target": tl, "format": "text"}).encode()
-                lt_req  = urllib.request.Request(
+                lt_body = _json.dumps({"q": core, "source": "auto", "target": tl, "format": "text"}).encode()
+                lt_req = urllib.request.Request(
                     "https://libretranslate.com/translate", data=lt_body,
                     headers={"Content-Type": "application/json", "User-Agent": "PostApp/1.0"}, method="POST",
                 )
-                def _fetch_lt():
+                def _fetch_libretranslate():
                     with urllib.request.urlopen(lt_req, timeout=6) as resp:
                         return _json.loads(resp.read().decode())
-                lt_data  = await asyncio.to_thread(_fetch_lt)
-                t_result = lt_data.get("translatedText", "")
-                if t_result and t_result != text:
-                    translated = t_result
+                data = await asyncio.to_thread(_fetch_libretranslate)
+                result = data.get("translatedText", "")
+                if result and result.strip() != core:
+                    translated = result.strip()
             except Exception as e:
                 logging.warning(f"LibreTranslate fallback failed: {e}")
+
+        # Google Translate's public endpoint handles short prompts and non-Latin text
+        # when the two keyless services are unavailable.
         if not translated:
-            translated = text
+            try:
+                url = (
+                    "https://translate.googleapis.com/translate_a/single"
+                    f"?client=gtx&sl=auto&tl={urllib.parse.quote(tl)}&dt=t&q={urllib.parse.quote(core)}"
+                )
+                req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+                def _fetch_google():
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        return _json.loads(resp.read().decode())
+                data = await asyncio.to_thread(_fetch_google)
+                chunks = data[0] if isinstance(data, list) and data else []
+                result = "".join(
+                    str(chunk[0]) for chunk in chunks
+                    if isinstance(chunk, list) and chunk and chunk[0]
+                )
+                if result and result.strip() != core:
+                    translated = result.strip()
+            except Exception as e:
+                logging.warning(f"Google translation fallback failed: {e}")
+
+        return leading + (translated or core) + trailing
+
+    async def _translate_caption(text: str, tl: str) -> str:
+        # Translate hashtag words separately so providers cannot leave #tags untouched.
+        parts = re.split(r"(#[\w-]+)", text, flags=re.UNICODE)
+        if len(parts) == 1:
+            return await _translate_plain_text(text, tl)
+
+        async def translate_part(part: str) -> str:
+            if part.startswith("#") and len(part) > 1:
+                translated_tag = await _translate_plain_text(part[1:], tl)
+                translated_tag = re.sub(r"\s+", "_", translated_tag.strip()).lstrip("#")
+                return "#" + translated_tag if translated_tag else part
+            return await _translate_plain_text(part, tl)
+
+        translated_parts = await asyncio.gather(*(translate_part(part) for part in parts))
+        return "".join(translated_parts)
+
+    @api.post("/translate")
+    async def translate_endpoint(body: dict):
+        text = (body.get("text") or "").strip()
+        target = body.get("target", "en")
+        include_tone = body.get("tone", False)
+        if not text:
+            return {"translated": text, "tone_hint": None}
+        tl = TRANSLATE_LANG_MAP.get(target, target)
+        # Versioned key prevents an older untranslated result from masking this fix.
+        cache_key = "caption-v2|" + tl + "||" + text
+        cached = _cache_get(cache_key)
+        if cached:
+            return {"translated": cached, "tone_hint": _detect_tone_hint(text) if include_tone else None}
+        translated = await _translate_caption(text, tl)
         _cache_set(cache_key, translated)
         return {"translated": translated, "tone_hint": _detect_tone_hint(text) if include_tone else None}
 
