@@ -3199,6 +3199,8 @@ postbluom.online"""
         "zh": "zh-CN", "en": "en", "hi": "hi", "ur": "ur", "es": "es",
         "fr": "fr", "ar": "ar", "pt": "pt", "de": "de", "ja": "ja",
         "ru": "ru", "bn": "bn", "id": "id", "tr": "tr",
+        "mr": "mr", "ta": "ta", "te": "te", "gu": "gu", "pa": "pa",
+        "ko": "ko", "it": "it", "nl": "nl", "pl": "pl", "vi": "vi",
     }
 
     def _detect_tone_hint(text: str) -> Optional[str]:
