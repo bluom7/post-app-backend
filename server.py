@@ -1942,6 +1942,10 @@ postbluom.online"""
             "is_badge_verified": bool(r.get("is_badge_verified")),
             "verified_category": None,
             "content": r.get("caption") or "",
+            # Keep the reel API contract intact for the full-screen Reels viewer.
+            # The algorithm feed previously exposed this only as `content`, while
+            # the viewer reads `caption`, hiding hashtags and prompts after posting.
+            "caption": r.get("caption") or "",
             "accent": None,
             "location": None,
             # photo reels: pass photo_url so the home-feed card can render it.
