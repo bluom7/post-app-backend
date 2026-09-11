@@ -3219,7 +3219,7 @@ postbluom.online"""
 
     async def _translate_plain_text(value: str, tl: str) -> str:
         """Translate a caption segment while preserving its surrounding whitespace."""
-        if not value or not value.strip() or tl == "en":
+        if not value or not value.strip():
             return value
         leading = value[:len(value) - len(value.lstrip())]
         trailing = value[len(value.rstrip()):]
