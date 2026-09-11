@@ -1519,6 +1519,7 @@ postbluom.online"""
             "avatar_letter": user.get("avatar_letter"), "avatar_photo": user.get("avatar_photo"),
             "is_private": is_private, "account_type": user.get("account_type"),
             "is_badge_verified": user.get("is_badge_verified"), "category": user.get("category"),
+            "is_official": bool(OFFICIAL_ACCOUNT_ID and user_id == OFFICIAL_ACCOUNT_ID),
             "is_mutual": is_mutual, "is_following_you": is_following_you,
             "is_private_locked": is_private_locked, "has_pending_request": bool(pending_req),
             "stats": {"posts": posts_count, "followers": followers_count, "following": following_count},
@@ -1526,7 +1527,8 @@ postbluom.online"""
         if is_private_locked:
             return base
         return {
-            **user, "is_mutual": is_mutual, "is_following_you": is_following_you,
+            **user, "is_official": bool(OFFICIAL_ACCOUNT_ID and user_id == OFFICIAL_ACCOUNT_ID),
+            "is_mutual": is_mutual, "is_following_you": is_following_you,
             "is_private_locked": False, "has_pending_request": False,
             "stats": {"posts": posts_count, "followers": followers_count, "following": following_count},
         }
