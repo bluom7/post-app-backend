@@ -4119,6 +4119,58 @@ postbluom.online"""
         return {"reels": reels_list, "has_more": len(reels_list) == limit, "skip": skip, "limit": limit}
 
 
+
+    @api.get("/reels/{reel_id}/remixes")
+    async def list_reel_remixes(reel_id: str, u=Depends(current_user)):
+        """Return the source reel and public reels using the same audio."""
+        source = await db.reels.find_one({"id": reel_id}, {"_id": 0})
+        if not source:
+            raise HTTPException(404, "Reel not found")
+        excluded = set((u.get("blocked_users", []) or []) + (u.get("muted_users", []) or []))
+        if source.get("user_id") in excluded:
+            raise HTTPException(404, "Reel not found")
+        source_music_url = str(source.get("music_url") or "").strip()
+        source_title = str(source.get("music_title") or "").strip()
+        source_label = str(source.get("audio_label") or "").strip()
+        if source_music_url:
+            audio_match = {"music_url": source_music_url}
+        elif source_title:
+            audio_match = {"$or": [{"music_title": source_title}, {"audio_label": source_title}]}
+        elif source_label:
+            audio_match = {"$or": [{"audio_label": source_label}, {"music_title": source_label}]}
+        else:
+            audio_match = {"id": reel_id}
+        query = {
+            "$and": [
+                audio_match,
+                {"$or": [
+                    {"audience": {"$exists": False}},
+                    {"audience": "public"},
+                    {"user_id": u["id"]},
+                ]},
+            ],
+            "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
+        }
+        if excluded:
+            query["user_id"] = {"$nin": list(excluded)}
+        rows = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
+        if not any(str(row.get("id")) == str(reel_id) for row in rows):
+            rows.insert(0, source)
+        for row in rows:
+            embedded_views = row.get("views") if isinstance(row.get("views"), list) else []
+            row["view_count"] = max(len(embedded_views), int(row.get("view_count") or 0))
+            row.pop("likes", None)
+            row.pop("saves", None)
+            row.pop("comments", None)
+            row.pop("views", None)
+        source_view = next((row for row in rows if str(row.get("id")) == str(reel_id)), source)
+        return {
+            "source": source_view,
+            "reels": rows,
+            "total": len(rows),
+            "audio_title": source_title or source_label or "Original Audio",
+        }
+
     @api.get("/reels/discover")
     async def discover_reels(
         skip: int = 0,
