@@ -5451,6 +5451,7 @@ postbluom.online"""
     async def get_algorithmic_reels_feed(
         page: int = Query(0, ge=0),
         limit: int = Query(REELS_ALGO_PAGE_SIZE, ge=1, le=50),
+        q: str = Query("", max_length=200),
         u=Depends(current_user),
     ):
         user_id = u["id"]
@@ -5470,6 +5471,28 @@ postbluom.online"""
             {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
             {"_id": 0},
         ).sort("created_at", -1).limit(2000).to_list(2000)
+
+        # Search keeps the same eligibility and scoring model as the main feed,
+        # but narrows the candidate pool to the requested search term first.
+        search_term = str(q or "").strip().lower()
+        if search_term:
+            normalized_term = search_term.lstrip("#")
+            def _matches_search(reel):
+                text_fields = (
+                    reel.get("caption"),
+                    reel.get("audio_label"),
+                    reel.get("category"),
+                )
+                if any(search_term in str(value or "").lower() for value in text_fields):
+                    return True
+                raw_tags = reel.get("hashtags") or []
+                if isinstance(raw_tags, str):
+                    raw_tags = raw_tags.split()
+                return any(
+                    normalized_term and normalized_term in str(tag).strip().lower().lstrip("#")
+                    for tag in raw_tags
+                )
+            raw_candidates = [reel for reel in raw_candidates if _matches_search(reel)]
 
         # Recency is a ranking signal, never an availability gate. The old
         # hard cutoff made an otherwise healthy feed return [] as soon as a
