@@ -4199,6 +4199,11 @@ postbluom.online"""
             query["category"] = {"$regex": category, "$options": "i"}
         pool_limit = min(limit * 6, 300)
         reels_raw = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(0).limit(pool_limit).to_list(pool_limit)
+        mention_rows = await db.reel_mentions.aggregate([
+            {"$match": {"reel_id": {"$in": [r.get("id") for r in reels_raw if r.get("id")]}}},
+            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+        ]).to_list(length=None)
+        mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
         def _score(r):
             try:
                 created = r.get("created_at", "")
@@ -4216,9 +4221,14 @@ postbluom.online"""
             except Exception:
                 age_hours = 0
             _va=r.get("views",[]); views=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
-            likes    = len(r.get("likes", []))
-            comments = int(r.get("comment_count") or 0)
-            return views * 1 + likes * 3 + comments * 5 - age_hours * 0.5
+            likes = len(r.get("likes") or [])
+            comments = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
+            shares = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
+            saves = max(len(r.get("saves") or []), int(r.get("save_count") or 0))
+            mentions = mention_counts.get(r.get("id"), int(r.get("mention_count") or 0))
+            # Keep discovery consistent with the main Reels ranking signals.
+            return (views * 1 + likes * 3 + comments * 5 + mentions * 6
+                    + shares * 7 + saves * 8 - age_hours * 0.5)
         reels_raw.sort(key=_score, reverse=True)
         page = reels_raw[skip: skip + limit]
         following_ids = set(u.get("following", []))
@@ -4231,6 +4241,7 @@ postbluom.online"""
             r["is_saved"]     = u["id"] in saves
             r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
             r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
+            r["mention_count"] = mention_counts.get(r["id"], int(r.get("mention_count") or 0))
             r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
             _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
             r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
@@ -5538,6 +5549,11 @@ postbluom.online"""
         active_hour_categories = set(await _reels_active_hour_categories(user_id))
         active_tags = await db.trending_tags.find({"active": True}, {"_id": 0, "tag": 1, "boost": 1}).to_list(100)
         tag_boosts = {str(row.get("tag")): float(row.get("boost") or 0) for row in active_tags if row.get("tag")}
+        mention_rows = await db.reel_mentions.aggregate([
+            {"$match": {"reel_id": {"$in": reel_ids}}},
+            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+        ]).to_list(length=None)
+        mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
         ab_group = "A" if int(_hl.md5(user_id.encode()).hexdigest(), 16) % 2 == 0 else "B"
         weights = _REELS_WEIGHTS[ab_group]
         scored = []
@@ -5552,9 +5568,16 @@ postbluom.online"""
             completion_sum = float(stats.get("completion_sum") or 0)
             completion = completion_sum / max(int(stats.get("total_views") or 0), 1) if completion_sum else float(stats.get("avg_completion") or 0)
             likes = len(reel.get("likes") or [])
-            comments = len(reel.get("comments") or [])
-            shares = len(reel.get("shares") or [])
-            engagement = (likes + comments * 2 + shares * 3) / total_views
+            comments = max(len(reel.get("comments") or []), int(reel.get("comment_count") or 0))
+            shares = max(len(reel.get("shares") or []), int(reel.get("share_count") or 0))
+            saves = max(len(reel.get("saves") or []), int(reel.get("save_count") or 0))
+            mentions = mention_counts.get(reel_id, int(reel.get("mention_count") or 0))
+            # Explicit intent weights: like=1, comment=2, mention=2, share=3, save=4.
+            # These extend the existing engagement signal without changing the
+            # completion, recency, affinity, diversity, or exploration behavior.
+            engagement_points = (likes + comments * 2 + mentions * 2
+                                 + shares * 3 + saves * 4)
+            engagement = engagement_points / total_views
             hours_old = max(0.0, (now_utc - _reels_parse_datetime(reel.get("created_at"))).total_seconds() / 3600)
             recency = 1.0 / (1.0 + hours_old)
             category = _reels_category(reel)
@@ -5585,7 +5608,23 @@ postbluom.online"""
                 score += 1000
             if category in negative["quick_skip_categories"]:
                 score -= 30
-            scored.append({**reel, "category": category, "score": score, "is_viral": is_viral})
+            scored.append({
+                **reel,
+                "category": category,
+                "score": score,
+                "is_viral": is_viral,
+                "mention_count": mentions,
+                "ranking_signals": {
+                    "views": total_views,
+                    "likes": likes,
+                    "comments": comments,
+                    "mentions": mentions,
+                    "shares": shares,
+                    "saves": saves,
+                    "engagement_points": engagement_points,
+                    "engagement_rate": round(float(engagement), 6),
+                },
+            })
 
         viral = sorted([item for item in scored if item["is_viral"]], key=lambda item: item["score"], reverse=True)
         normal = sorted([item for item in scored if not item["is_viral"]], key=lambda item: item["score"], reverse=True)
@@ -5613,6 +5652,8 @@ postbluom.online"""
                 "is_follow_pending": item.get("user_id") in pending_follow_ids,
                 "category": item.get("category") or "general",
                 "score": round(float(item.get("score") or 0), 6),
+                "mention_count": int(item.get("mention_count") or 0),
+                "ranking_signals": item.get("ranking_signals") or {},
                 "is_viral": bool(item.get("is_viral")),
                 "algorithm": "reels_v1",
             })
@@ -5667,8 +5708,13 @@ postbluom.online"""
     async def _refresh_reels_rank_stats():
         rows = await db.reels.find(
             {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
-            {"_id": 0, "id": 1, "views": 1, "view_count": 1, "likes": 1, "comments": 1, "shares": 1},
+            {"_id": 0, "id": 1, "views": 1, "view_count": 1, "likes": 1, "comments": 1, "shares": 1, "saves": 1},
         ).limit(2000).to_list(2000)
+        mention_rows = await db.reel_mentions.aggregate([
+            {"$match": {"reel_id": {"$in": [r.get("id") for r in rows if r.get("id")]}}},
+            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+        ]).to_list(length=None)
+        mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
         for reel in rows:
             reel_id = reel.get("id")
             if not reel_id:
@@ -5681,6 +5727,8 @@ postbluom.online"""
                     "likes": len(reel.get("likes") or []),
                     "comments": len(reel.get("comments") or []),
                     "shares": len(reel.get("shares") or []),
+                    "saves": len(reel.get("saves") or []),
+                    "mentions": mention_counts.get(reel_id, int(reel.get("mention_count") or 0)),
                     "updated_at": now().isoformat(),
                 }},
                 upsert=True,
