@@ -4356,18 +4356,53 @@ postbluom.online"""
         return results
 
     @api.post("/reels/{reel_id}/like")
-    async def like_reel(reel_id: str, u=Depends(current_user)):
+    async def like_reel(reel_id: str, body: dict = None, u=Depends(current_user)):
+        """Apply an idempotent like state and return the authoritative count.
+
+        The client sends the desired state instead of asking the endpoint to
+        toggle. That makes safe retries possible when a mobile connection or a
+        cold-started backend drops the response after the write already landed.
+        Requests without a desired state retain the legacy toggle behavior.
+        """
         reel = await db.reels.find_one({"id": reel_id}, {"likes": 1, "_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        likes = reel.get("likes", [])
-        was_liked = u["id"] in likes
-        if was_liked:
-            await db.reels.update_one({"id": reel_id}, {"$pull": {"likes": u["id"]}})
-            next_count = max(0, len(likes) - 1)
-            return {"liked": False, "like_count": next_count}
-        await db.reels.update_one({"id": reel_id}, {"$addToSet": {"likes": u["id"]}})
-        return {"liked": True, "like_count": len(likes) + 1}
+
+        likes = reel.get("likes") or []
+        requested_state = body.get("liked") if isinstance(body, dict) else None
+        if not isinstance(requested_state, bool):
+            requested_state = u["id"] not in likes
+
+        if requested_state:
+            await db.reels.update_one(
+                {"id": reel_id},
+                {"$addToSet": {"likes": u["id"]}},
+            )
+        else:
+            await db.reels.update_one(
+                {"id": reel_id},
+                {"$pull": {"likes": u["id"]}},
+            )
+
+        # Read after the atomic write so concurrent users always receive the
+        # current source-of-truth count, not a count from a stale pre-read.
+        updated = await db.reels.find_one({"id": reel_id}, {"likes": 1, "_id": 0})
+        authoritative_likes = (updated or {}).get("likes") or []
+        like_count = len(authoritative_likes)
+
+        # Ranking already reads the source likes array. Keep the aggregate rank
+        # stats current as well, without allowing a stats-write problem to turn
+        # a successful like into a UI error.
+        try:
+            await db.reel_rank_stats.update_one(
+                {"reel_id": reel_id},
+                {"$set": {"reel_id": reel_id, "likes": like_count, "updated_at": now().isoformat()}},
+                upsert=True,
+            )
+        except Exception:
+            logging.exception("Could not refresh like rank stats for reel %s", reel_id)
+
+        return {"liked": u["id"] in authoritative_likes, "like_count": like_count}
 
     @api.post("/reels/{reel_id}/save")
     async def save_reel(reel_id: str, u=Depends(current_user)):
