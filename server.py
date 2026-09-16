@@ -4425,7 +4425,20 @@ postbluom.online"""
         reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        return {"comments": reel.get("comments", [])}
+        comments = reel.get("comments", []) or []
+        user_ids = {c.get("user_id") for c in comments if c.get("user_id")}
+        for comment in comments:
+            user_ids.update(r.get("user_id") for r in (comment.get("replies") or []) if r.get("user_id"))
+        verified_users = await db.users.find(
+            {"id": {"$in": list(user_ids)}},
+            {"_id": 0, "id": 1, "is_badge_verified": 1},
+        ).to_list(len(user_ids)) if user_ids else []
+        verified_map = {str(profile.get("id")): bool(profile.get("is_badge_verified")) for profile in verified_users}
+        for comment in comments:
+            comment["is_badge_verified"] = verified_map.get(str(comment.get("user_id")), bool(comment.get("is_badge_verified")))
+            for reply in comment.get("replies") or []:
+                reply["is_badge_verified"] = verified_map.get(str(reply.get("user_id")), bool(reply.get("is_badge_verified")))
+        return {"comments": comments}
 
     @api.post("/reels/{reel_id}/share")
     async def share_reel(reel_id: str, u=Depends(current_user)):
@@ -4455,6 +4468,7 @@ postbluom.online"""
             "avatar_bg":     u["avatar_bg"],
             "avatar_letter": u["avatar_letter"],
             "avatar_photo":  u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
             "text":          text,
             "gif_url":       gif_url,
             "created_at":    now().isoformat(),
@@ -4518,6 +4532,7 @@ postbluom.online"""
             "avatar_bg":     u["avatar_bg"],
             "avatar_letter": u["avatar_letter"],
             "avatar_photo":  u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
             "text":          text,
             "gif_url":       gif_url,
             "created_at":    now().isoformat(),
