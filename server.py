@@ -4498,24 +4498,27 @@ postbluom.online"""
 
     @api.post("/reels/{reel_id}/comments/{comment_id}/like")
     async def like_reel_comment(reel_id: str, comment_id: str, body: dict = None, u=Depends(current_user)):
-        """Persist the requested comment-like state and return the authoritative result."""
+        """Persist an explicit like/dislike state and return canonical likes."""
         reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        comment = next((c for c in reel.get("comments", []) if c.get("id") == comment_id), None)
+        comment = next((c for c in reel.get("comments", []) if str(c.get("id")) == str(comment_id)), None)
         if not comment:
             raise HTTPException(404, "Comment not found")
-        existing_likes = comment.get("likes") or []
+        user_id = str(u["id"])
+        existing_likes = [str(like_id) for like_id in (comment.get("likes") or [])]
         requested_state = body.get("liked") if isinstance(body, dict) else None
         if not isinstance(requested_state, bool):
-            requested_state = u["id"] not in existing_likes
-        update = {"$addToSet": {"comments.$.likes": u["id"]}} if requested_state else {"$pull": {"comments.$.likes": u["id"]}}
+            requested_state = user_id not in existing_likes
+        # $addToSet/$pull makes the operation idempotent, so retries cannot
+        # duplicate a like or remove another user's like.
+        update = {"$addToSet": {"comments.$.likes": user_id}} if requested_state else {"$pull": {"comments.$.likes": user_id}}
         await db.reels.update_one({"id": reel_id, "comments.id": comment_id}, update)
         updated = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
-        updated_comment = next((c for c in (updated or {}).get("comments", []) if c.get("id") == comment_id), None)
-        authoritative_likes = (updated_comment or {}).get("likes") or []
+        updated_comment = next((c for c in (updated or {}).get("comments", []) if str(c.get("id")) == str(comment_id)), None)
+        authoritative_likes = [str(like_id) for like_id in ((updated_comment or {}).get("likes") or [])]
         return {
-            "liked": u["id"] in authoritative_likes,
+            "liked": user_id in authoritative_likes,
             "like_count": len(authoritative_likes),
             "likes": authoritative_likes,
         }
