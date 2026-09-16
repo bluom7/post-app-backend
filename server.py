@@ -5581,8 +5581,10 @@ postbluom.online"""
         if not candidates:
             return {"page": page, "limit": limit, "reels": [], "has_more": False, "ab_group": "A", "algorithm": "reels_v1"}
 
-        seen_ids = await _reels_seen_ids(user_id)
-        negative = await _reels_negative_signals(user_id)
+        seen_ids, negative = await asyncio.gather(
+            _reels_seen_ids(user_id),
+            _reels_negative_signals(user_id),
+        )
         filtered = [
             reel for reel in candidates
             if reel.get("id") not in negative["not_interested_ids"]
@@ -5595,19 +5597,34 @@ postbluom.online"""
             filtered = candidates
 
         reel_ids = [reel.get("id") for reel in filtered if reel.get("id")]
-        live_stats = await _reels_live_stats(reel_ids)
-        top_categories = set(await _reels_user_categories(user_id))
-        liked_creators = await _reels_liked_creators(user_id)
-        similar_reel_ids = await _reels_similar_user_reels(user_id)
-        positive_reel_ids = await _reels_positive_signals(user_id)
-        session_categories = set(await _reels_session_categories(user_id))
-        active_hour_categories = set(await _reels_active_hour_categories(user_id))
-        active_tags = await db.trending_tags.find({"active": True}, {"_id": 0, "tag": 1, "boost": 1}).to_list(100)
+        (
+            live_stats,
+            top_category_rows,
+            liked_creators,
+            similar_reel_ids,
+            positive_reel_ids,
+            session_category_rows,
+            active_hour_category_rows,
+            active_tags,
+            mention_rows,
+        ) = await asyncio.gather(
+            _reels_live_stats(reel_ids),
+            _reels_user_categories(user_id),
+            _reels_liked_creators(user_id),
+            _reels_similar_user_reels(user_id),
+            _reels_positive_signals(user_id),
+            _reels_session_categories(user_id),
+            _reels_active_hour_categories(user_id),
+            db.trending_tags.find({"active": True}, {"_id": 0, "tag": 1, "boost": 1}).to_list(100),
+            db.reel_mentions.aggregate([
+                {"$match": {"reel_id": {"$in": reel_ids}}},
+                {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+            ]).to_list(length=None),
+        )
+        top_categories = set(top_category_rows)
+        session_categories = set(session_category_rows)
+        active_hour_categories = set(active_hour_category_rows)
         tag_boosts = {str(row.get("tag")): float(row.get("boost") or 0) for row in active_tags if row.get("tag")}
-        mention_rows = await db.reel_mentions.aggregate([
-            {"$match": {"reel_id": {"$in": reel_ids}}},
-            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
-        ]).to_list(length=None)
         mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
         ab_group = "A" if int(_hl.md5(user_id.encode()).hexdigest(), 16) % 2 == 0 else "B"
         weights = _REELS_WEIGHTS[ab_group]
