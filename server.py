@@ -4108,6 +4108,7 @@ postbluom.online"""
             shares = r.get("shares") or []
             r["is_liked"]     = u["id"] in likes
             r["like_count"]   = len(likes)
+            r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
             r["is_saved"]     = u["id"] in saves
             r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
             r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
@@ -4238,6 +4239,7 @@ postbluom.online"""
             shares = r.get("shares") or []
             r["is_liked"]     = u["id"] in likes
             r["like_count"]   = len(likes)
+            r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
             r["is_saved"]     = u["id"] in saves
             r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
             r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
@@ -4317,6 +4319,7 @@ postbluom.online"""
                 saves = r.get("saves") or []
                 r["is_liked"]     = u["id"] in likes
                 r["like_count"]   = len(likes)
+                r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
                 r["is_saved"]     = u["id"] in saves
                 r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
                 r["share_count"]  = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
@@ -5305,8 +5308,8 @@ postbluom.online"""
     REELS_ALGO_TASK = None
 
     _REELS_WEIGHTS = {
-        "A": {"completion_rate": 0.40, "engagement_rate": 0.30, "recency": 0.20, "affinity": 0.10},
-        "B": {"completion_rate": 0.30, "engagement_rate": 0.40, "recency": 0.20, "affinity": 0.10},
+        "A": {"completion_rate": 0.35, "engagement_rate": 0.30, "recency": 0.15, "affinity": 0.05, "velocity": 0.15},
+        "B": {"completion_rate": 0.30, "engagement_rate": 0.35, "recency": 0.15, "affinity": 0.05, "velocity": 0.15},
     }
 
     def _reels_parse_datetime(value):
@@ -5600,18 +5603,20 @@ postbluom.online"""
             stats = live_stats.get(reel_id, {})
             embedded_views = reel.get("views") if isinstance(reel.get("views"), list) else []
             total_views = max(len(embedded_views), int(reel.get("view_count") or 0), int(stats.get("total_views") or 0), 1)
+            observed_views = max(int(stats.get("total_views") or 0), 1)
             completion_sum = float(stats.get("completion_sum") or 0)
-            completion = completion_sum / max(int(stats.get("total_views") or 0), 1) if completion_sum else float(stats.get("avg_completion") or 0)
+            completion = completion_sum / observed_views if completion_sum else float(stats.get("avg_completion") or 0)
+            avg_watch_seconds = float(stats.get("watch_seconds_sum") or 0) / observed_views
+            duration_seconds = max(float(reel.get("duration") or 0), 1.0)
+            watch_time_score = min(1.0, avg_watch_seconds / duration_seconds) if reel.get("duration") else completion
+            completion_quality = max(0.0, min(1.0, completion * 0.70 + watch_time_score * 0.30))
             likes = len(reel.get("likes") or [])
             comments = max(len(reel.get("comments") or []), int(reel.get("comment_count") or 0))
             shares = max(len(reel.get("shares") or []), int(reel.get("share_count") or 0))
             saves = max(len(reel.get("saves") or []), int(reel.get("save_count") or 0))
             mentions = mention_counts.get(reel_id, int(reel.get("mention_count") or 0))
-            # Explicit intent weights: like=1, comment=2, mention=2, share=3, save=4.
-            # These extend the existing engagement signal without changing the
-            # completion, recency, affinity, diversity, or exploration behavior.
-            engagement_points = (likes + comments * 2 + mentions * 2
-                                 + shares * 3 + saves * 4)
+            # Documented intent order: share > save > comment > like.
+            engagement_points = likes + comments * 3 + mentions * 2 + shares * 5 + saves * 4
             engagement = engagement_points / total_views
             hours_old = max(0.0, (now_utc - _reels_parse_datetime(reel.get("created_at"))).total_seconds() / 3600)
             recency = 1.0 / (1.0 + hours_old)
@@ -5619,12 +5624,14 @@ postbluom.online"""
             affinity = 1 if reel.get("user_id") in liked_creators else 0
             hourly_views = int(stats.get("views_1h") or 0)
             velocity = hourly_views / max(total_views, 1)
+            velocity_score = min(1.0, velocity * 4.0)
             is_viral = hourly_views >= REELS_ALGO_VIRAL_MIN_VIEWS_1H and velocity >= REELS_ALGO_VIRAL_RATIO
             score = (
-                weights["completion_rate"] * completion
+                weights["completion_rate"] * completion_quality
                 + weights["engagement_rate"] * engagement
                 + weights["recency"] * recency
                 + weights["affinity"] * affinity
+                + weights["velocity"] * velocity_score
             )
             if category in top_categories:
                 score += 50
@@ -5658,6 +5665,9 @@ postbluom.online"""
                     "saves": saves,
                     "engagement_points": engagement_points,
                     "engagement_rate": round(float(engagement), 6),
+                    "completion_rate": round(float(completion_quality), 6),
+                    "avg_watch_seconds": round(float(avg_watch_seconds), 3),
+                    "velocity_1h": round(float(velocity), 6),
                 },
             })
 
@@ -5687,6 +5697,13 @@ postbluom.online"""
                 "is_follow_pending": item.get("user_id") in pending_follow_ids,
                 "category": item.get("category") or "general",
                 "score": round(float(item.get("score") or 0), 6),
+                "is_liked": user_id in (item.get("likes") or []),
+                "like_count": len(item.get("likes") or []),
+                "is_saved": user_id in (item.get("saves") or []),
+                "save_count": max(len(item.get("saves") or []), int(item.get("save_count") or 0)),
+                "comment_count": max(len(item.get("comments") or []), int(item.get("comment_count") or 0)),
+                "share_count": max(len(item.get("shares") or []), int(item.get("share_count") or 0)),
+                "view_count": max(len(item.get("views") or []), int(item.get("view_count") or 0)),
                 "mention_count": int(item.get("mention_count") or 0),
                 "ranking_signals": item.get("ranking_signals") or {},
                 "is_viral": bool(item.get("is_viral")),
