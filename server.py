@@ -4497,26 +4497,28 @@ postbluom.online"""
 
 
     @api.post("/reels/{reel_id}/comments/{comment_id}/like")
-    async def like_reel_comment(reel_id: str, comment_id: str, u=Depends(current_user)):
+    async def like_reel_comment(reel_id: str, comment_id: str, body: dict = None, u=Depends(current_user)):
+        """Persist the requested comment-like state and return the authoritative result."""
         reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
-        comment = next((c for c in reel.get("comments", []) if c["id"] == comment_id), None)
+        comment = next((c for c in reel.get("comments", []) if c.get("id") == comment_id), None)
         if not comment:
             raise HTTPException(404, "Comment not found")
-        likes = comment.get("likes", [])
-        if u["id"] in likes:
-            await db.reels.update_one(
-                {"id": reel_id, "comments.id": comment_id},
-                {"$pull": {"comments.$.likes": u["id"]}}
-            )
-            return {"liked": False, "like_count": max(0, len(likes) - 1)}
-        else:
-            await db.reels.update_one(
-                {"id": reel_id, "comments.id": comment_id},
-                {"$addToSet": {"comments.$.likes": u["id"]}}
-            )
-            return {"liked": True, "like_count": len(likes) + 1}
+        existing_likes = comment.get("likes") or []
+        requested_state = body.get("liked") if isinstance(body, dict) else None
+        if not isinstance(requested_state, bool):
+            requested_state = u["id"] not in existing_likes
+        update = {"$addToSet": {"comments.$.likes": u["id"]}} if requested_state else {"$pull": {"comments.$.likes": u["id"]}}
+        await db.reels.update_one({"id": reel_id, "comments.id": comment_id}, update)
+        updated = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        updated_comment = next((c for c in (updated or {}).get("comments", []) if c.get("id") == comment_id), None)
+        authoritative_likes = (updated_comment or {}).get("likes") or []
+        return {
+            "liked": u["id"] in authoritative_likes,
+            "like_count": len(authoritative_likes),
+            "likes": authoritative_likes,
+        }
 
     @api.post("/reels/{reel_id}/comments/{comment_id}/replies")
     async def add_reel_comment_reply(reel_id: str, comment_id: str, body: dict, u=Depends(current_user)):
@@ -5627,11 +5629,12 @@ postbluom.online"""
             completion_quality = max(0.0, min(1.0, completion * 0.70 + watch_time_score * 0.30))
             likes = len(reel.get("likes") or [])
             comments = max(len(reel.get("comments") or []), int(reel.get("comment_count") or 0))
+            comment_likes = sum(len(comment.get("likes") or []) for comment in (reel.get("comments") or []))
             shares = max(len(reel.get("shares") or []), int(reel.get("share_count") or 0))
             saves = max(len(reel.get("saves") or []), int(reel.get("save_count") or 0))
             mentions = mention_counts.get(reel_id, int(reel.get("mention_count") or 0))
-            # Documented intent order: share > save > comment > like.
-            engagement_points = likes + comments * 3 + mentions * 2 + shares * 5 + saves * 4
+            # Documented intent order: share > save > comment > comment-like > like.
+            engagement_points = likes + comments * 3 + comment_likes + mentions * 2 + shares * 5 + saves * 4
             engagement = engagement_points / total_views
             hours_old = max(0.0, (now_utc - _reels_parse_datetime(reel.get("created_at"))).total_seconds() / 3600)
             recency = 1.0 / (1.0 + hours_old)
@@ -5675,6 +5678,7 @@ postbluom.online"""
                     "views": total_views,
                     "likes": likes,
                     "comments": comments,
+                    "comment_likes": comment_likes,
                     "mentions": mentions,
                     "shares": shares,
                     "saves": saves,
@@ -5793,6 +5797,7 @@ postbluom.online"""
                     "content_views": max(len(reel.get("views") or []), int(reel.get("view_count") or 0)),
                     "likes": len(reel.get("likes") or []),
                     "comments": len(reel.get("comments") or []),
+                    "comment_likes": sum(len(comment.get("likes") or []) for comment in (reel.get("comments") or [])),
                     "shares": len(reel.get("shares") or []),
                     "saves": len(reel.get("saves") or []),
                     "mentions": mention_counts.get(reel_id, int(reel.get("mention_count") or 0)),
