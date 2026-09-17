@@ -2149,7 +2149,7 @@ postbluom.online"""
                 doc["reel_id"]: doc
                 async for doc in db.reel_mentions.find(
                     {"target_user_id": mention_target_id},
-                    {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "created_at": 1},
+                    {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
                 )
             }
         merged_reels = []
@@ -2160,7 +2160,7 @@ postbluom.online"""
             seen_reel_ids.add(reel["id"])
             mention = mention_docs.get(reel["id"])
             mentioned_by = (
-                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle")}
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
                 if mention else None
             )
             feed_item = _reel_to_feed_item(reel, bool(mention), mentioned_by)
@@ -2489,6 +2489,9 @@ postbluom.online"""
             "source_user_id": u["id"],
             "source_user_name": u.get("name"),
             "source_user_handle": u.get("handle"),
+            "source_user_avatar": u.get("avatar_photo"),
+            "source_user_bg": u.get("avatar_bg"),
+            "source_user_letter": u.get("avatar_letter"),
             "created_at": now().isoformat(),
         }
         existing_mention = await db.reel_mentions.find_one(
@@ -5746,9 +5749,24 @@ postbluom.online"""
         random.Random(f"{user_id}:{page}").shuffle(exploration)
         combined = main_slice + exploration[:exploration_count]
         final_items = _reels_diversify(combined, limit)
+        final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
+        mention_docs = {}
+        if final_reel_ids:
+            mention_docs = {
+                doc["reel_id"]: doc
+                async for doc in db.reel_mentions.find(
+                    {"target_user_id": user_id, "reel_id": {"$in": final_reel_ids}},
+                    {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1},
+                )
+            }
         response_reels = []
         for item in final_items:
-            shaped = _reel_to_feed_item(item)
+            mention = mention_docs.get(item.get("id"))
+            mentioned_by = (
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
+                if mention else None
+            )
+            shaped = _reel_to_feed_item(item, bool(mention), mentioned_by)
             shaped.update({
                 # Keep the Reels tab relationship state identical to Home/Profile.
                 "is_following": item.get("user_id") in following_ids or item.get("user_id") == u["id"],
