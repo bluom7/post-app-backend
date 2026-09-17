@@ -2472,6 +2472,16 @@ postbluom.online"""
         if blocked_by_target:
             raise HTTPException(403, "Action not allowed")
 
+        async def sync_mention_rank_stats(mention_count: int):
+            try:
+                await db.reel_rank_stats.update_one(
+                    {"reel_id": reel_id},
+                    {"$set": {"reel_id": reel_id, "mentions": mention_count, "updated_at": now().isoformat()}},
+                    upsert=True,
+                )
+            except Exception:
+                logging.exception("Could not refresh mention rank stats for reel %s", reel_id)
+
         mention = {
             "id": str(uuid.uuid4()),
             "reel_id": reel_id,
@@ -2500,8 +2510,10 @@ postbluom.online"""
                     "from_user_id": u["id"],
                 })
                 mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+                await sync_mention_rank_stats(mention_count)
                 return {"ok": True, "mentioned": False, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
             mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+            await sync_mention_rank_stats(mention_count)
             return {"ok": True, "mentioned": True, "already": True, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
 
         await db.reel_mentions.insert_one(mention)
@@ -2528,6 +2540,7 @@ postbluom.online"""
             if target_prefs.get("mentions", True):
                 asyncio.create_task(send_push(target_user_id, "Mention", u.get("name", "Someone") + " mentioned you in a reel"))
         mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+        await sync_mention_rank_stats(mention_count)
         return {"ok": True, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
 
     @api.delete("/reels/{reel_id}/mention/{target_user_id}")
@@ -2541,7 +2554,13 @@ postbluom.online"""
             raise HTTPException(403, "Only the reel owner can remove a mention")
         await db.reel_mentions.delete_one({"reel_id": reel_id, "target_user_id": target_user_id})
         await db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id, "user_id": target_user_id})
-        return {"ok": True}
+        mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+        await db.reel_rank_stats.update_one(
+            {"reel_id": reel_id},
+            {"$set": {"reel_id": reel_id, "mentions": mention_count, "updated_at": now().isoformat()}},
+            upsert=True,
+        )
+        return {"ok": True, "mention_count": mention_count}
 
 
     @api.post("/posts/{pid}/report")
