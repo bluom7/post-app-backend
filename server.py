@@ -2110,7 +2110,7 @@ postbluom.online"""
         posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         if include_reels:
             # Mention visibility is private to the signed-in viewer, never the profile target.
-        mention_target_id = u["id"]
+            mention_target_id = u["id"]
             mentioned_ids = list(set(await db.reel_mentions.distinct(
                 "reel_id", {"target_user_id": mention_target_id}
             )))
@@ -2143,7 +2143,8 @@ postbluom.online"""
             async def _no_reels(): return []
             reels_task = _no_reels()
         posts_raw, reels_raw = await asyncio.gather(posts_task, reels_task)
-        mention_target_id = user_id if user_id else u["id"]
+        # Mention visibility is private to the signed-in viewer, never the profile target.
+        mention_target_id = u["id"]
         mention_docs = {}
         if include_reels:
             mention_docs = {
