@@ -2109,7 +2109,8 @@ postbluom.online"""
         fetch_n = skip + limit
         posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         if include_reels:
-            mention_target_id = user_id if user_id else u["id"]
+            # Mention visibility is private to the signed-in viewer, never the profile target.
+        mention_target_id = u["id"]
             mentioned_ids = list(set(await db.reel_mentions.distinct(
                 "reel_id", {"target_user_id": mention_target_id}
             )))
@@ -4123,11 +4124,26 @@ postbluom.online"""
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
         ]).to_list(None) if reels_list else []
         mention_counts = {row["_id"]: row["count"] for row in mention_rows}
+        mention_docs = {
+            doc["reel_id"]: doc
+            async for doc in db.reel_mentions.find(
+                {"target_user_id": u["id"], "reel_id": {"$in": [r["id"] for r in reels_list]}},
+                
+                {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1}
+            )
+        } if reels_list else {}
         following_ids = set(u.get("following", []))
         for r in reels_list:
             likes = r.get("likes") or []
             saves = r.get("saves") or []
             shares = r.get("shares") or []
+
+            mention = mention_docs.get(r["id"])
+            r["is_mentioned"] = bool(mention)
+            r["mentioned_by"] = (
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
+                if mention else None
+            )
             r["is_liked"]     = u["id"] in likes
             r["like_count"]   = len(likes)
             r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
@@ -4254,11 +4270,26 @@ postbluom.online"""
                     + shares * 7 + saves * 8 - age_hours * 0.5)
         reels_raw.sort(key=_score, reverse=True)
         page = reels_raw[skip: skip + limit]
+        mention_docs = {
+            doc["reel_id"]: doc
+            async for doc in db.reel_mentions.find(
+                {"target_user_id": u["id"], "reel_id": {"$in": [r["id"] for r in page]}},
+                
+                {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1}
+            )
+        } if page else {}
         following_ids = set(u.get("following", []))
         for r in page:
             likes = r.get("likes") or []
             saves = r.get("saves") or []
             shares = r.get("shares") or []
+
+            mention = mention_docs.get(r["id"])
+            r["is_mentioned"] = bool(mention)
+            r["mentioned_by"] = (
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
+                if mention else None
+            )
             r["is_liked"]     = u["id"] in likes
             r["like_count"]   = len(likes)
             r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
