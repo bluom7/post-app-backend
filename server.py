@@ -1540,6 +1540,17 @@ postbluom.online"""
         except Exception:
             logging.exception("Failed to persist follow notification")
 
+    async def _persist_user_activity_notification(recipient_id, actor, notification_type, **extra):
+        notification = {
+            "id": str(uuid.uuid4()), "user_id": recipient_id,
+            "from_user_id": actor.get("id"), "from_user_name": actor.get("name", ""),
+            "from_user_avatar": actor.get("avatar_photo"),
+            "from_user_bg": actor.get("avatar_bg"), "from_user_letter": actor.get("avatar_letter"),
+            "type": notification_type, "created_at": now().isoformat(), "read": False,
+        }
+        notification.update(extra)
+        await db.notifications.insert_one(notification)
+
     @api.post("/users/{user_id}/follow")
     async def follow_user(user_id: str, u=Depends(current_user)):
         if user_id == u["id"]: raise HTTPException(400, "Can't follow yourself")
@@ -2425,6 +2436,9 @@ postbluom.online"""
             "message_id": message_id,
             "created_at": message["created_at"],
         })
+        await _persist_user_activity_notification(
+            friend_id, u, "message", message="Shared a post with you", message_id=message_id, post_id=pid
+        )
         await _ws_push(friend_id, {"type": "new_message", "message": message})
         asyncio.create_task(send_push(
             friend_id, "Post shared", u["name"] + " shared a post with you", "message"
@@ -2982,6 +2996,18 @@ postbluom.online"""
         }
         await db.messages.insert_one(m.copy())
         m.pop("_id", None)
+
+        # Keep direct messages in the same user-activity notification stream
+        # as likes, comments, follows, tags, and mentions.
+        message_preview = p.text.strip() if p.text and p.text.strip() else (
+            "📷 Photo" if p.photo_url else
+            ("GIF" if p.gif_url else
+            ("📎 Post" if p.shared_post_id or p.shared_reel_id else
+            ("🎤 Voice" if p.audio_url else "Message")))
+        )
+        await _persist_user_activity_notification(
+            p.to_user_id, u, "message", message=message_preview[:120], message_id=m["id"]
+        )
 
         # ── Push to receiver via WebSocket ────────────────────────
         # Receiver client will reply with a "delivered" ACK that upgrades
@@ -4841,7 +4867,10 @@ postbluom.online"""
         last_text = p.text.strip() or ("🎤 Voice" if p.audio_url else ("📷 Photo" if p.photo_url else ("GIF" if p.gif_url else ("📎 Post" if p.shared_post_id else ""))))
         await db.groups.update_one({"id": group_id}, {"$set": {"last_message": last_text, "last_message_at": now().isoformat(), "last_from_name": u["name"]}})
         for mid in [m for m in g.get("members", []) if m != u["id"]]:
-            await db.notifications.insert_one({"id": str(uuid.uuid4()), "user_id": mid, "type": "group_message", "from_id": u["id"], "from_name": u["name"], "group_id": group_id, "group_name": g.get("name","Group"), "message": last_text[:80], "read": False, "created_at": now().isoformat()})
+            await _persist_user_activity_notification(
+                mid, u, "group_message", from_id=u["id"], from_name=u["name"],
+                group_id=group_id, group_name=g.get("name", "Group"), message=last_text[:80]
+            )
         return doc
 
     # ── Group – leave / clear chat / invite link ──────────────────
