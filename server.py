@@ -2088,19 +2088,17 @@ postbluom.online"""
                 exclusion_filter = {"user_id": {"$nin": list(excluded_user_ids)}}
                 query = {"$and": [query, exclusion_filter]} if query else exclusion_filter
 
-        # Never pull legacy base64 media into the home/profile response. Older
-        # uploads can be multiple megabytes per document and were making the
-        # feed request consume RAM and remain stuck behind a spinner. This is a
-        # read-time guard only; the original records remain available for the
-        # Cloudinary migration endpoint.
+        # Older Compose versions stored photo/video data URLs directly in posts.
+        # They are valid historical media and must remain visible in home/profile;
+        # the frontend now uploads new photos to hosted URLs before creating posts.
+        # Keep the filter for the separate reels query below, but never apply it
+        # to regular posts or old posts disappear from both screens.
         legacy_media_filter = {"$nor": [
             {"video_url": {"$regex": "^data:"}},
             {"photo_url": {"$regex": "^data:"}},
             {"photo_urls": {"$elemMatch": {"$regex": "^data:"}}},
         ]}
         feed_user_filter = query.get("user_id")
-        if feed or user_id:
-            query = {"$and": [query, legacy_media_filter]} if query else legacy_media_filter
 
         # Reels get merged into the home feed and profile grid (but not search)
         # so a shared reel shows up for followers/following, and stays on the
