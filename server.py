@@ -2680,6 +2680,20 @@ postbluom.online"""
             result.append(p)
         return {"posts": result}
 
+    @api.get("/users/{target_user_id}/saved-posts")
+    async def get_user_saved_posts(target_user_id: str, u=Depends(current_user)):
+        target = await db.users.find_one({"id": target_user_id}, {"_id": 0, "id": 1, "is_private": 1, "followers": 1})
+        if not target:
+            raise HTTPException(404, "User not found")
+        if target.get("is_private") and target_user_id != u["id"] and u["id"] not in (target.get("followers") or []):
+            return {"posts": [], "private_locked": True}
+        posts_cursor = db.posts.find({"saves": target_user_id}).sort("created_at", -1).limit(50)
+        result = []
+        async for p in posts_cursor:
+            p.pop("_id", None)
+            result.append(p)
+        return {"posts": result}
+
     # ── Friends ───────────────────────────────────────────────────
     @api.post("/friends/request")
     async def friend_request(p: FriendIn, u=Depends(current_user)):
