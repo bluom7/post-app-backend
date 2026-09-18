@@ -1549,7 +1549,10 @@ postbluom.online"""
             "type": notification_type, "created_at": now().isoformat(), "read": False,
         }
         notification.update(extra)
-        await db.notifications.insert_one(notification)
+        try:
+            await db.notifications.insert_one(notification)
+        except Exception:
+            logging.exception("Failed to persist user activity notification")
 
     @api.post("/users/{user_id}/follow")
     async def follow_user(user_id: str, u=Depends(current_user)):
@@ -3165,6 +3168,25 @@ postbluom.online"""
         notifs = await db.notifications.find(
             {"user_id": u["id"]}, {"_id": 0}
         ).sort("created_at", -1).limit(100).to_list(100)
+        actor_ids = {
+            str(n.get("from_user_id") or n.get("from_id"))
+            for n in notifs
+            if n.get("from_user_id") or n.get("from_id")
+        }
+        if actor_ids:
+            actors = await db.users.find(
+                {"id": {"$in": list(actor_ids)}},
+                {"_id": 0, "id": 1, "name": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1},
+            ).to_list(len(actor_ids))
+            actor_map = {str(actor.get("id")): actor for actor in actors}
+            for notification in notifs:
+                actor_id = str(notification.get("from_user_id") or notification.get("from_id") or "")
+                actor = actor_map.get(actor_id)
+                if actor:
+                    notification["from_user_name"] = actor.get("name", notification.get("from_user_name", ""))
+                    notification["from_user_avatar"] = actor.get("avatar_photo")
+                    notification["from_user_bg"] = actor.get("avatar_bg")
+                    notification["from_user_letter"] = actor.get("avatar_letter")
         unread_count = await db.notifications.count_documents({"user_id": u["id"], "read": False})
         return {"notifications": notifs, "unread_count": unread_count}
 
@@ -4445,7 +4467,7 @@ postbluom.online"""
         cold-started backend drops the response after the write already landed.
         Requests without a desired state retain the legacy toggle behavior.
         """
-        reel = await db.reels.find_one({"id": reel_id}, {"likes": 1, "_id": 0})
+        reel = await db.reels.find_one({"id": reel_id}, {"likes": 1, "user_id": 1, "_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
 
@@ -4482,6 +4504,10 @@ postbluom.online"""
             )
         except Exception:
             logging.exception("Could not refresh like rank stats for reel %s", reel_id)
+        if requested_state and reel.get("user_id") != u["id"]:
+            await _persist_user_activity_notification(
+                reel["user_id"], u, "like", reel_id=reel_id
+            )
 
         return {"liked": u["id"] in authoritative_likes, "like_count": like_count}
 
@@ -4538,6 +4564,9 @@ postbluom.online"""
         gif_url = (body.get("gif_url") or "").strip() or None
         if not text and not gif_url:
             raise HTTPException(400, "Empty comment")
+        reel = await db.reels.find_one({"id": reel_id}, {"user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
         comment = {
             "id":            str(uuid.uuid4()),
             "user_id":       u["id"],
@@ -4555,6 +4584,10 @@ postbluom.online"""
             {"id": reel_id},
             {"$push": {"comments": comment}, "$inc": {"comment_count": 1}}
         )
+        if reel.get("user_id") != u["id"]:
+            await _persist_user_activity_notification(
+                reel["user_id"], u, "comment", reel_id=reel_id
+            )
         return comment
 
     @api.delete("/reels/{reel_id}/comments/{comment_id}")
@@ -4595,6 +4628,10 @@ postbluom.online"""
         updated = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
         updated_comment = next((c for c in (updated or {}).get("comments", []) if str(c.get("id")) == str(comment_id)), None)
         authoritative_likes = [str(like_id) for like_id in ((updated_comment or {}).get("likes") or [])]
+        if requested_state and comment.get("user_id") != u["id"]:
+            await _persist_user_activity_notification(
+                comment["user_id"], u, "like", reel_id=reel_id, comment_id=comment_id
+            )
         return {
             "liked": user_id in authoritative_likes,
             "like_count": len(authoritative_likes),
@@ -4607,6 +4644,12 @@ postbluom.online"""
         gif_url = (body.get("gif_url") or "").strip() or None
         if not text and not gif_url:
             raise HTTPException(400, "Empty reply")
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        parent_comment = next((c for c in reel.get("comments", []) if str(c.get("id")) == str(comment_id)), None)
+        if not parent_comment:
+            raise HTTPException(404, "Comment not found")
         reply = {
             "id":            str(uuid.uuid4()),
             "user_id":       u["id"],
@@ -4624,6 +4667,10 @@ postbluom.online"""
             {"id": reel_id, "comments.id": comment_id},
             {"$push": {"comments.$.replies": reply}}
         )
+        if parent_comment.get("user_id") != u["id"]:
+            await _persist_user_activity_notification(
+                parent_comment["user_id"], u, "comment", reel_id=reel_id, comment_id=comment_id
+            )
         return reply
 
     @api.delete("/reels/{reel_id}/comments/{comment_id}/replies/{reply_id}")
