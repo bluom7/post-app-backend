@@ -201,8 +201,14 @@ try:
         return {"status": "ok", "service": "post-app-backend"}
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"], allow_credentials=True,
-        allow_methods=["*"], allow_headers=["*"],
+        allow_origins=[
+            "https://postbluom.online",
+            "https://www.postbluom.online",
+            "https://post-app-frontend-fynq.onrender.com",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     logging.basicConfig(level=logging.INFO)
 
