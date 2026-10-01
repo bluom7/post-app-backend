@@ -1323,13 +1323,13 @@ postbluom.online"""
         safe = dict(profile)
         raw_dob = profile.get("dob")
         is_self = str(profile.get("id") or "") == str(viewer_id or "")
-        month_day_audience = profile.get("dob_month_day_visibility") or "mutuals"
-        year_audience = profile.get("dob_year_visibility") or "only_you"
+        month_day_audience = profile.get("dob_month_day_visibility") or "public"
+        year_audience = profile.get("dob_year_visibility") or "public"
         for key in ("dob_month_day", "dob_year"):
             safe.pop(key, None)
         if is_self:
-            safe["dob_month_day_visibility"] = month_day_audience if month_day_audience in _DOB_VISIBILITY_OPTIONS else "mutuals"
-            safe["dob_year_visibility"] = year_audience if year_audience in _DOB_VISIBILITY_OPTIONS else "only_you"
+            safe["dob_month_day_visibility"] = month_day_audience if month_day_audience in _DOB_VISIBILITY_OPTIONS else "public"
+            safe["dob_year_visibility"] = year_audience if year_audience in _DOB_VISIBILITY_OPTIONS else "public"
         else:
             safe.pop("dob", None)
             safe.pop("dob_month_day_visibility", None)
@@ -1340,8 +1340,8 @@ postbluom.online"""
             parsed_dob = datetime.strptime(str(raw_dob)[:10], "%Y-%m-%d")
         except (ValueError, TypeError):
             return safe
-        can_see_month_day = _dob_audience_allows(profile, viewer_id, month_day_audience, "mutuals")
-        can_see_year = _dob_audience_allows(profile, viewer_id, year_audience, "only_you")
+        can_see_month_day = _dob_audience_allows(profile, viewer_id, month_day_audience, "public")
+        can_see_year = _dob_audience_allows(profile, viewer_id, year_audience, "public")
         if is_self or can_see_month_day:
             safe["dob_month_day"] = parsed_dob.strftime("%m-%d")
         if is_self or can_see_year:
