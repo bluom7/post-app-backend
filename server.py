@@ -709,6 +709,8 @@ postbluom.online"""
         category_visible: Optional[bool] = None
         gender: Optional[str] = None
         dob: Optional[str] = None
+        dob_month_day_visibility: Optional[str] = None
+        dob_year_visibility: Optional[str] = None
         is_private: Optional[bool] = None
         theme: Optional[str] = None
         chat_translation_enabled: Optional[bool] = None
@@ -1291,10 +1293,70 @@ postbluom.online"""
             "days_left": max(0, (deadline - now()).days),
         }
 
+    _DOB_VISIBILITY_OPTIONS = {"public", "followers", "following", "mutuals", "only_you"}
+
+    def _dob_audience_allows(profile, viewer_id, audience, default):
+        viewer = str(viewer_id or "")
+        owner = str(profile.get("id") or "")
+        if viewer and viewer == owner:
+            return True
+        if not viewer or not owner:
+            return False
+        audience = audience or default
+        if audience not in _DOB_VISIBILITY_OPTIONS:
+            return False
+        followers = {str(value) for value in (profile.get("followers") or [])}
+        following = {str(value) for value in (profile.get("following") or [])}
+        if audience == "public":
+            return True
+        if audience == "followers":
+            return viewer in followers
+        if audience == "following":
+            return viewer in following
+        if audience == "mutuals":
+            return viewer in followers and viewer in following
+        return False
+
+    def _apply_dob_visibility(profile, viewer_id):
+        if not profile:
+            return profile
+        safe = dict(profile)
+        raw_dob = profile.get("dob")
+        is_self = str(profile.get("id") or "") == str(viewer_id or "")
+        month_day_audience = profile.get("dob_month_day_visibility") or "mutuals"
+        year_audience = profile.get("dob_year_visibility") or "only_you"
+        for key in ("dob_month_day", "dob_year"):
+            safe.pop(key, None)
+        if is_self:
+            safe["dob_month_day_visibility"] = month_day_audience if month_day_audience in _DOB_VISIBILITY_OPTIONS else "mutuals"
+            safe["dob_year_visibility"] = year_audience if year_audience in _DOB_VISIBILITY_OPTIONS else "only_you"
+        else:
+            safe.pop("dob", None)
+            safe.pop("dob_month_day_visibility", None)
+            safe.pop("dob_year_visibility", None)
+        if not raw_dob:
+            return safe
+        try:
+            parsed_dob = datetime.strptime(str(raw_dob)[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            return safe
+        can_see_month_day = _dob_audience_allows(profile, viewer_id, month_day_audience, "mutuals")
+        can_see_year = _dob_audience_allows(profile, viewer_id, year_audience, "only_you")
+        if is_self or can_see_month_day:
+            safe["dob_month_day"] = parsed_dob.strftime("%m-%d")
+        if is_self or can_see_year:
+            safe["dob_year"] = parsed_dob.strftime("%Y")
+        if not is_self and can_see_month_day and can_see_year:
+            safe["dob"] = raw_dob
+        return safe
+
     # ── Profile ───────────────────────────────────────────────────
     @api.patch("/profile")
     async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
         upd = {k: v for k, v in p.model_dump().items() if v is not None}
+        for field in ("dob_month_day_visibility", "dob_year_visibility"):
+            if field in upd and upd[field] not in _DOB_VISIBILITY_OPTIONS:
+                raise HTTPException(400, "Invalid birthday visibility")
         if "username" in upd:
             if u.get("username_locked") and upd["username"] != u.get("username"):
                 raise HTTPException(400, "Verified accounts cannot change their username")
@@ -1445,9 +1507,10 @@ postbluom.online"""
     async def get_blocked_users(u=Depends(current_user)):
         ids = u.get("blocked_users", [])
         if not ids: return []
-        return await db.users.find(
+        users = await db.users.find(
             {"id": {"$in": ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}
         ).to_list(len(ids))
+        return [_apply_dob_visibility(profile, u["id"]) for profile in users]
 
     @api.get("/users/me/follow-requests")
     async def my_follow_requests(u=Depends(current_user)):
@@ -1496,7 +1559,7 @@ postbluom.online"""
             query, {"_id": 0, "password_hash": 0, "otp_hash": 0}
         ).skip(skip).limit(limit).to_list(limit)
         total = await db.users.count_documents(query)
-        return {"users": users, "total": total, "skip": skip, "limit": limit}
+        return {"users": [_apply_dob_visibility(profile, u["id"]) for profile in users], "total": total, "skip": skip, "limit": limit}
 
     @api.get("/users/{user_id}")
     async def get_user(user_id: str, u=Depends(current_user)):
@@ -1534,8 +1597,9 @@ postbluom.online"""
         }
         if is_private_locked:
             return base
+        safe_user = _apply_dob_visibility(user, u["id"])
         return {
-            **user, "is_official": bool(OFFICIAL_ACCOUNT_ID and user_id == OFFICIAL_ACCOUNT_ID),
+            **safe_user, "is_official": bool(OFFICIAL_ACCOUNT_ID and user_id == OFFICIAL_ACCOUNT_ID),
             "is_mutual": is_mutual, "is_following_you": is_following_you,
             "is_private_locked": False, "has_pending_request": False,
             "stats": {"posts": posts_count, "followers": followers_count, "following": following_count},
@@ -1589,19 +1653,21 @@ postbluom.online"""
     async def get_followers(user_id: str, u=Depends(current_user)):
         user = await db.users.find_one({"id": user_id})
         if not user: raise HTTPException(404, "User not found")
-        return await db.users.find(
+        profiles = await db.users.find(
             {"id": {"$in": user.get("followers", [])}},
             {"_id": 0, "password_hash": 0, "otp_hash": 0},
         ).to_list(500)
+        return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
 
     @api.get("/users/{user_id}/following")
     async def get_following(user_id: str, u=Depends(current_user)):
         user = await db.users.find_one({"id": user_id})
         if not user: raise HTTPException(404, "User not found")
-        return await db.users.find(
+        profiles = await db.users.find(
             {"id": {"$in": user.get("following", [])}},
             {"_id": 0, "password_hash": 0, "otp_hash": 0},
         ).to_list(500)
+        return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
 
     # ── Follow Requests (private accounts) ───────────────────────
     @api.post("/users/{user_id}/follow-request/cancel")
@@ -4464,7 +4530,7 @@ postbluom.online"""
             following_ids = set(u.get("following", []))
             for usr in users_found:
                 usr["is_following"] = usr["id"] in following_ids
-            results["users"] = users_found
+            results["users"] = [_apply_dob_visibility(profile, u["id"]) for profile in users_found]
 
         if search_type in ("all", "hashtags"):
             pipeline = [
