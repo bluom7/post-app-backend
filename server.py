@@ -1541,8 +1541,8 @@ postbluom.online"""
 
     @api.get("/users")
     async def list_users(
-        continent: Optional[str] = None, q: Optional[str] = None,
-        skip: int = 0, limit: int = 50, u=Depends(current_user),
+        continent: Optional[str] = None, q: Optional[str] = Query(None, max_length=100),
+        skip: int = Query(0, ge=0, le=10000), limit: int = Query(50, ge=1, le=100), u=Depends(current_user),
     ):
         excluded_ids = list(set([u["id"]] + (u.get("following") or [])))
         query: dict = {"id": {"$nin": excluded_ids}, "is_verified": True, "deleted_at": None}
@@ -2093,12 +2093,13 @@ postbluom.online"""
 
     @api.get("/posts")
     async def list_posts(
-        q: Optional[str] = None, user_id: Optional[str] = None,
-        skip: int = 0, limit: int = 20, feed: bool = False,
+        q: Optional[str] = Query(None, max_length=200), user_id: Optional[str] = None,
+        skip: int = Query(0, ge=0, le=500), limit: int = Query(20, ge=1, le=50), feed: bool = False,
         following_only: bool = False,
         u=Depends(current_user),
     ):
         query: dict = {}
+        filter_public_authors = False
         following_ids = u.get("following", [])
         excluded_user_ids = set(
             (u.get("blocked_users") or []) + (u.get("muted_users") or [])
@@ -2151,13 +2152,7 @@ postbluom.online"""
                     {"user_name": {"$regex": q, "$options": "i"}},
                     {"location": {"$regex": q, "$options": "i"}},
                 ]
-            viewer_can_see = set(following_ids + [u["id"]])
-            priv_docs = await db.users.find(
-                {"is_private": True, "id": {"$nin": list(viewer_can_see)}}, {"id": 1, "_id": 0}
-            ).to_list(None)
-            private_ids = [p["id"] for p in priv_docs]
-            if private_ids:
-                query["user_id"] = {"$nin": private_ids}
+            filter_public_authors = True
         if q and user_id:
             query["$or"] = [
                 {"content": {"$regex": q, "$options": "i"}},
@@ -2193,13 +2188,25 @@ postbluom.online"""
         # poster's own profile — reusing the same user_id filter built above.
         include_reels = (feed or bool(user_id)) and not q and feed_user_filter is not None
         fetch_n = skip + limit
-        posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+        if filter_public_authors:
+            posts_task = db.posts.aggregate([
+                {"$match": query},
+                {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
+                {"$match": {"$or": [{"user_id": u["id"]}, {"_author.is_private": {"$ne": True}}]}},
+                {"$sort": {"created_at": -1}},
+                {"$limit": fetch_n},
+                {"$project": {"_id": 0, "_author": 0}},
+            ]).to_list(fetch_n)
+        else:
+            posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         if include_reels:
             # Mention visibility is private to the signed-in viewer, never the profile target.
             mention_target_id = u["id"]
-            mentioned_ids = list(set(await db.reel_mentions.distinct(
-                "reel_id", {"target_user_id": mention_target_id}
-            )))
+            viewer_mentions = await db.reel_mentions.find(
+                {"target_user_id": mention_target_id},
+                {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
+            ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            mentioned_ids = list(dict.fromkeys(doc["reel_id"] for doc in viewer_mentions if doc.get("reel_id")))
 
             async def _load_feed_reels():
                 # Fetch normal feed reels and mentioned/reposted reels separately.
@@ -2230,16 +2237,9 @@ postbluom.online"""
             reels_task = _no_reels()
         posts_raw, reels_raw = await asyncio.gather(posts_task, reels_task)
         # Mention visibility is private to the signed-in viewer, never the profile target.
-        mention_target_id = u["id"]
         mention_docs = {}
         if include_reels:
-            mention_docs = {
-                doc["reel_id"]: doc
-                async for doc in db.reel_mentions.find(
-                    {"target_user_id": mention_target_id},
-                    {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
-                )
-            }
+            mention_docs = {doc["reel_id"]: doc for doc in viewer_mentions if doc.get("reel_id")}
         merged_reels = []
         seen_reel_ids = set()
         for reel in reels_raw:
@@ -3176,7 +3176,7 @@ postbluom.online"""
 
     @api.get("/messages")
     async def list_messages(
-        with_user: Optional[str] = None, skip: int = 0, limit: int = 50,
+        with_user: Optional[str] = Query(None, max_length=64), skip: int = Query(0, ge=0, le=100000), limit: int = Query(50, ge=1, le=100),
         u=Depends(current_user),
     ):
         if with_user:
@@ -3464,8 +3464,16 @@ postbluom.online"""
 
     @api.post("/translate")
     async def translate_endpoint(body: dict):
-        text = (body.get("text") or "").strip()
+        raw_text = body.get("text") or ""
+        if not isinstance(raw_text, str):
+            raise HTTPException(status_code=400, detail="Text must be a string.")
+        text = raw_text.strip()
+        if len(text) > 5000:
+            raise HTTPException(status_code=413, detail="Text is too long to translate.")
         target = body.get("target", "en")
+        if not isinstance(target, str):
+            raise HTTPException(status_code=400, detail="Target language must be a string.")
+        target = target[:20]
         include_tone = body.get("tone", False)
         if not text:
             return {"translated": text, "tone_hint": None}
@@ -3541,7 +3549,7 @@ postbluom.online"""
         return {"status": req["status"], "category": req.get("category"), "reject_reason": req.get("reject_reason"), "submitted_at": req.get("submitted_at")}
 
     @api.get("/admin/verification/requests")
-    async def admin_list_requests(status: Optional[str] = "pending", skip: int = 0, limit: int = 100, admin=Depends(_is_admin)):
+    async def admin_list_requests(status: Optional[str] = "pending", skip: int = Query(0, ge=0, le=10000), limit: int = Query(100, ge=1, le=200), admin=Depends(_is_admin)):
         query = {} if status == "all" else {"status": status}
         reqs = await db.verification_requests.find(query, {"_id": 0}).sort("submitted_at", -1).skip(skip).limit(limit).to_list(limit)
         total = await db.verification_requests.count_documents(query)
@@ -3633,7 +3641,7 @@ postbluom.online"""
         return {"ok": True}
 
     @api.get("/admin/users")
-    async def admin_list_users(q: Optional[str] = None, skip: int = 0, limit: int = 50, admin=Depends(_is_admin)):
+    async def admin_list_users(q: Optional[str] = Query(None, max_length=100), skip: int = Query(0, ge=0, le=10000), limit: int = Query(50, ge=1, le=100), admin=Depends(_is_admin)):
         query: dict = {}
         if q:
             query["$or"] = [
@@ -3971,8 +3979,8 @@ postbluom.online"""
     @api.get("/world/reports")
     async def world_reports_list(
         location_type: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20,
+        skip: int = Query(0, ge=0, le=10000),
+        limit: int = Query(20, ge=1, le=100),
         u=Depends(current_user),
     ):
         query: dict = {"is_flagged": {"$ne": True}}
@@ -4236,7 +4244,7 @@ postbluom.online"""
         return doc
 
     @api.get("/reels")
-    async def list_reels(skip: int = 0, limit: int = 10, u=Depends(current_user)):
+    async def list_reels(skip: int = Query(0, ge=0, le=10000), limit: int = Query(10, ge=1, le=50), u=Depends(current_user)):
         blocked  = u.get("blocked_users", [])
         muted    = u.get("muted_users", [])
         excluded = list(set(blocked + muted))
@@ -4347,8 +4355,8 @@ postbluom.online"""
 
     @api.get("/reels/discover")
     async def discover_reels(
-        skip: int = 0,
-        limit: int = 21,
+        skip: int = Query(0, ge=0, le=10000),
+        limit: int = Query(21, ge=1, le=50),
         category: Optional[str] = None,
         u=Depends(current_user),
     ):
@@ -4475,10 +4483,10 @@ postbluom.online"""
 
     @api.get("/search")
     async def unified_search(
-        q: str = "",
-        type: str = "all",
-        skip: int = 0,
-        limit: int = 20,
+        q: str = Query("", max_length=200),
+        type: str = Query("all", max_length=20),
+        skip: int = Query(0, ge=0, le=10000),
+        limit: int = Query(20, ge=1, le=50),
         u=Depends(current_user),
     ):
         """Unified search: reels (by caption/hashtag/audio), users, hashtags."""
@@ -4957,7 +4965,7 @@ postbluom.online"""
         return {"ok": True}
 
     @api.get("/groups/{group_id}/messages")
-    async def get_group_messages(group_id: str, skip: int = 0, limit: int = 40, u=Depends(current_user)):
+    async def get_group_messages(group_id: str, skip: int = Query(0, ge=0, le=100000), limit: int = Query(40, ge=1, le=100), u=Depends(current_user)):
         g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
@@ -5083,6 +5091,48 @@ postbluom.online"""
 
     # ── Call Signaling (WebRTC polling) ───────────────────────────
     _call_state: dict = {}
+    _CALL_STATE_MAX = 200
+    _CALL_SIGNAL_MAX_COUNT = 200
+    _CALL_SIGNAL_MAX_BYTES = 256 * 1024
+    _CALL_SIGNAL_MAX_ONE_BYTES = 32 * 1024
+
+    def _prune_call_state():
+        current = now()
+        for call_id, call in list(_call_state.items()):
+            status = call.get("status")
+            ttl = 300 if status in ("ended", "declined") else 120 if status == "ringing" else 4 * 60 * 60 if status == "active" else 600
+            try:
+                age = (current - datetime.fromisoformat(call["created_at"])).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                age = float("inf")
+            if age > ttl:
+                _call_state.pop(call_id, None)
+        if len(_call_state) >= _CALL_STATE_MAX:
+            closed = sorted(
+                (item for item in _call_state.items() if item[1].get("status") in ("ended", "declined")),
+                key=lambda item: item[1].get("created_at", ""),
+            )
+            for call_id, _ in closed:
+                if len(_call_state) < _CALL_STATE_MAX:
+                    break
+                _call_state.pop(call_id, None)
+
+    def _public_call(call):
+        return {
+            key: ([{name: value for name, value in signal.items() if name != "_bytes"} for signal in value]
+                  if key == "signals" else value)
+            for key, value in call.items() if key != "_signal_bytes"
+        }
+
+    async def _require_call_participant(call, user_id: str):
+        if user_id in (call.get("from_id"), call.get("to_user_id")):
+            return
+        group_id = call.get("group_id")
+        if group_id:
+            group = await db.groups.find_one({"id": group_id, "members": user_id}, {"_id": 1})
+            if group:
+                return
+        raise HTTPException(status_code=403, detail="Not a participant in this call.")
 
     @api.get("/calls/ice-servers")
     async def get_ice_servers(u=Depends(current_user)):
@@ -5107,35 +5157,60 @@ postbluom.online"""
         call_type = body.get("call_type", "voice")
         group_id = body.get("group_id")
         if not to_user_id and not group_id: raise HTTPException(400, "to_user_id or group_id required")
+        if group_id:
+            group = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
+            if not group or u["id"] not in group.get("members", []):
+                raise HTTPException(status_code=403, detail="Not a member of this group.")
+        _prune_call_state()
+        if len(_call_state) >= _CALL_STATE_MAX:
+            raise HTTPException(status_code=503, detail="Call capacity is temporarily full. Try again shortly.")
         call_id = str(uuid.uuid4())
-        _call_state[call_id] = {"id": call_id, "from_id": u["id"], "from_name": u["name"], "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"), "to_user_id": to_user_id, "group_id": group_id, "call_type": call_type, "status": "ringing", "signals": [], "created_at": now().isoformat(), "ended_at": None}
+        _call_state[call_id] = {"id": call_id, "from_id": u["id"], "from_name": u["name"], "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"), "to_user_id": to_user_id, "group_id": group_id, "call_type": call_type, "status": "ringing", "signals": [], "_signal_bytes": 0, "created_at": now().isoformat(), "ended_at": None}
         return {"call_id": call_id, "status": "ringing"}
 
     @api.get("/calls/{call_id}")
     async def get_call_state(call_id: str, u=Depends(current_user)):
         call = _call_state.get(call_id)
         if not call: raise HTTPException(404, "Call not found")
-        return call
+        await _require_call_participant(call, u["id"])
+        return _public_call(call)
 
     @api.post("/calls/{call_id}/signal")
     async def add_call_signal(call_id: str, body: dict, u=Depends(current_user)):
         call = _call_state.get(call_id)
         if not call: raise HTTPException(404, "Call not found")
-        call["signals"].append({"from_id": u["id"], "type": body.get("type"), "data": body.get("data"), "ts": now().isoformat()})
-        if len(call["signals"]) > 200: call["signals"] = call["signals"][-200:]
+        await _require_call_participant(call, u["id"])
+        signal_type = str(body.get("type") or "")[:50]
+        signal_data = body.get("data")
+        try:
+            signal_size = len(_json.dumps(signal_data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) + len(signal_type.encode("utf-8"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid call signal.")
+        if signal_size > _CALL_SIGNAL_MAX_ONE_BYTES:
+            raise HTTPException(status_code=413, detail="Call signal is too large.")
+        call["signals"].append({"from_id": u["id"], "type": signal_type, "data": signal_data, "ts": now().isoformat(), "_bytes": signal_size})
+        call["_signal_bytes"] = call.get("_signal_bytes", 0) + signal_size
+        while len(call["signals"]) > _CALL_SIGNAL_MAX_COUNT or call["_signal_bytes"] > _CALL_SIGNAL_MAX_BYTES:
+            removed = call["signals"].pop(0)
+            call["_signal_bytes"] = max(0, call["_signal_bytes"] - removed.get("_bytes", 0))
         return {"ok": True}
 
     @api.get("/calls/{call_id}/signals")
-    async def get_call_signals(call_id: str, since: int = 0, u=Depends(current_user)):
+    async def get_call_signals(call_id: str, since: int = Query(0, ge=0, le=200), u=Depends(current_user)):
         call = _call_state.get(call_id)
         if not call: raise HTTPException(404, "Call not found")
-        my_signals = [s for s in call["signals"][since:] if s["from_id"] != u["id"]]
+        await _require_call_participant(call, u["id"])
+        my_signals = [
+            {key: value for key, value in signal.items() if key != "_bytes"}
+            for signal in call["signals"][since:] if signal["from_id"] != u["id"]
+        ]
         return {"signals": my_signals, "total": len(call["signals"])}
 
     @api.post("/calls/{call_id}/answer")
     async def answer_call(call_id: str, u=Depends(current_user)):
         call = _call_state.get(call_id)
         if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
         call["status"] = "active"
         return {"ok": True}
 
@@ -5143,6 +5218,7 @@ postbluom.online"""
     async def end_call(call_id: str, u=Depends(current_user)):
         call = _call_state.get(call_id)
         if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
         call["status"] = "ended"
         call["ended_at"] = now().isoformat()
         return {"ok": True}
@@ -5151,22 +5227,26 @@ postbluom.online"""
     async def decline_call(call_id: str, u=Depends(current_user)):
         call = _call_state.get(call_id)
         if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
         call["status"] = "declined"
         return {"ok": True}
 
     @api.get("/calls/incoming/check")
     async def check_incoming_call(u=Depends(current_user)):
+        _prune_call_state()
         for call_id, call in list(_call_state.items()):
             if call["to_user_id"] == u["id"] and call["status"] == "ringing":
                 age = (now() - datetime.fromisoformat(call["created_at"])).total_seconds()
-                if age > 60: call["status"] = "ended"
-                else: return {"call": call}
+                if age > 60:
+                    call["status"] = "ended"
+                    call["ended_at"] = now().isoformat()
+                else: return {"call": _public_call(call)}
         return {"call": None}
 
 
     # ── GIF proxy (Giphy) ─────────────────────────────────────────────────────
     @api.get("/gifs")
-    async def gif_proxy(q: str = "", limit: int = 30):
+    async def gif_proxy(q: str = Query("", max_length=200), limit: int = Query(30, ge=1, le=50)):
         import httpx
         GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
         if not GIPHY_KEY:
@@ -5203,7 +5283,7 @@ postbluom.online"""
 
     # ── Stickers proxy (Giphy) ────────────────────────────────────────────────
     @api.get("/stickers")
-    async def sticker_proxy(q: str = "", limit: int = 30):
+    async def sticker_proxy(q: str = Query("", max_length=200), limit: int = Query(30, ge=1, le=50)):
         import httpx
         GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
         if not GIPHY_KEY:

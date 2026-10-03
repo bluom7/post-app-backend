@@ -49,12 +49,13 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional
-from collections import defaultdict, deque
+from collections import deque
+from threading import Lock as _Lock
 
 import jwt
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Header
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Header, Request, Depends
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import anthropic
 
 try:
@@ -166,14 +167,24 @@ MAX_TOKENS = 3072
 MAX_HISTORY_MESSAGES = 20       # trim to keep token usage sane on free tier
 MAX_MESSAGE_CHARS = 4000
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_AUDIO_BYTES = 12 * 1024 * 1024
 MAX_LIBRARY_FILE_BYTES = 20 * 1024 * 1024
 MAX_RECENTS = 50
 
-# very small in-memory rate limit: N requests per user per window.
-# Fine for a single Render instance; swap for Redis if you scale to >1 worker.
+# Bound both per-source requests and the number of source keys retained in RAM.
 RATE_LIMIT_MAX = 15
 RATE_LIMIT_WINDOW_SEC = 60
-_rate_buckets: dict = defaultdict(deque)
+RATE_BUCKET_MAX_KEYS = 5000
+_rate_buckets: dict = {}
+_rate_bucket_lock = _Lock()
+_last_rate_bucket_cleanup = 0.0
+
+# Keep memory-heavy media work from running without a concurrency ceiling.
+_MEDIA_REQUESTS = asyncio.Semaphore(2)
+
+async def _limit_media_requests():
+    async with _MEDIA_REQUESTS:
+        yield
 
 SYSTEM_PROMPT = (
       "You are POST AI, a capable and thoughtful assistant speaking directly to the user. "
@@ -190,13 +201,14 @@ SYSTEM_PROMPT = (
 # ---- Schemas ------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str  # "user" | "assistant"
-    content: str
+    content: str = Field(max_length=MAX_MESSAGE_CHARS)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: Optional[List[ChatMessage]] = []
-    user_id: Optional[str] = "anon"
+    message: str = Field(max_length=MAX_MESSAGE_CHARS)
+    history: Optional[List[ChatMessage]] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
+    # Retained for old clients; identity is always taken from the signed JWT.
+    user_id: Optional[str] = None
     conversation_id: Optional[str] = None
     model: Optional[str] = "gemma"
 
@@ -257,6 +269,17 @@ def _decode_token(authorization: Optional[str]) -> str:
     return user_id
 
 
+def _optional_actor_id(authorization: Optional[str]) -> Optional[str]:
+    return _decode_token(authorization) if authorization else None
+
+
+def _rate_limit_key(actor_id: Optional[str], request: Request) -> str:
+    if actor_id:
+        return "user:" + actor_id
+    client = getattr(request, "client", None)
+    return "ip:" + str(getattr(client, "host", None) or "unknown")
+
+
 # ---- Chat helpers --------------------------------------------------------
 def _require_client():
     if client is None and not GEMINI_API_KEY:
@@ -266,17 +289,34 @@ def _require_client():
         )
 
 
-def _check_rate_limit(user_id: str):
-    now = time.time()
-    bucket = _rate_buckets[user_id]
-    while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SEC:
-        bucket.popleft()
-    if len(bucket) >= RATE_LIMIT_MAX:
-        raise HTTPException(
-            status_code=429,
-            detail="Slow down a little — try again in a bit.",
-        )
-    bucket.append(now)
+def _prune_rate_buckets(now: float):
+    global _last_rate_bucket_cleanup
+    for key, bucket in list(_rate_buckets.items()):
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SEC:
+            bucket.popleft()
+        if not bucket:
+            _rate_buckets.pop(key, None)
+    _last_rate_bucket_cleanup = now
+
+
+def _check_rate_limit(key: str):
+    now = time.monotonic()
+    with _rate_bucket_lock:
+        if now - _last_rate_bucket_cleanup >= RATE_LIMIT_WINDOW_SEC or len(_rate_buckets) >= RATE_BUCKET_MAX_KEYS:
+            _prune_rate_buckets(now)
+        bucket = _rate_buckets.get(key)
+        if bucket is None:
+            if len(_rate_buckets) >= RATE_BUCKET_MAX_KEYS:
+                raise HTTPException(status_code=429, detail="Too many active request sources. Try again in a minute.")
+            bucket = _rate_buckets[key] = deque()
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SEC:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Slow down a little — try again in a bit.",
+            )
+        bucket.append(now)
 
 
 def _build_messages(history: List[ChatMessage], new_user_content):
@@ -533,10 +573,9 @@ def _serialize_conversation(doc, include_messages=False):
     return out
 
 
-def _get_or_create_conversation(conversation_id: Optional[str], user_id: str, first_text: str):
-    """Returns a Mongo ObjectId to use for this turn, or None if history storage
-    isn't configured (in which case chat still works, it just isn't saved)."""
-    if _conversations is None:
+def _get_or_create_conversation(conversation_id: Optional[str], user_id: Optional[str], first_text: str):
+    """Save history only for an authenticated user with history storage configured."""
+    if _conversations is None or not user_id:
         return None
 
     if conversation_id:
@@ -577,7 +616,8 @@ def _append_turn(oid, user_text: str, assistant_text: str):
                         "$each": [
                             {"role": "user", "content": user_text, "time": now.isoformat()},
                             {"role": "assistant", "content": assistant_text, "time": now.isoformat()},
-                        ]
+                        ],
+                        "$slice": -(MAX_HISTORY_MESSAGES * 2),
                     }
                 },
                 "$set": {"updated_at": now},
@@ -589,15 +629,22 @@ def _append_turn(oid, user_text: str, assistant_text: str):
 
 # ---- AI Agent routes ------------------------------------------------------
 @ai_router.post("/transcribe")
-async def transcribe_audio(audio: UploadFile = File(...)):
+async def transcribe_audio(
+    request: Request,
+    audio: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+    _media_slot: None = Depends(_limit_media_requests),
+):
     """Transcribe a real microphone recording using Gemini audio understanding."""
+    actor_id = _optional_actor_id(authorization)
+    _check_rate_limit(_rate_limit_key(actor_id, request))
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="Voice transcription is not configured.")
-    audio_bytes = await audio.read()
+    audio_bytes = await audio.read(MAX_AUDIO_BYTES + 1)
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="Recording is too large.")
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Recording is empty.")
-    if len(audio_bytes) > 12 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Recording is too large.")
     mime_type = (audio.content_type or "audio/webm").split(";")[0]
     messages = [{"role": "user", "content": [
         {"type": "text", "text": "Transcribe this voice recording exactly. Return only the spoken words, with no commentary, labels, or quotation marks."},
@@ -616,10 +663,11 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
 
 @ai_router.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, request: Request, authorization: Optional[str] = Header(None)):
     """Non-streaming text chat (fallback for clients that can't read SSE)."""
     _require_client()
-    _check_rate_limit(req.user_id or "anon")
+    actor_id = _optional_actor_id(authorization)
+    _check_rate_limit(_rate_limit_key(actor_id, request))
 
     text = req.message.strip()
     if not text:
@@ -638,18 +686,19 @@ def chat(req: ChatRequest):
     reply, used_search = _extract_reply_and_search_flag(response, text)
     reply = reply or "I didn't quite catch that, please try again."
 
-    oid = _get_or_create_conversation(req.conversation_id, req.user_id or "anon", text)
+    oid = _get_or_create_conversation(req.conversation_id, actor_id, text)
     _append_turn(oid, text, reply)
 
-    return ChatResponse(reply=reply, used_search=used_search, conversation_id=str(oid) if oid else req.conversation_id)
+    return ChatResponse(reply=reply, used_search=used_search, conversation_id=str(oid) if oid else None)
 
 
 @ai_router.post("/chat/stream")
-def chat_stream(req: ChatRequest):
+def chat_stream(req: ChatRequest, request: Request, authorization: Optional[str] = Header(None)):
     """Streaming text chat over SSE — sends token deltas as they arrive,
     then a final 'done' event with whether web search was used."""
     _require_client()
-    _check_rate_limit(req.user_id or "anon")
+    actor_id = _optional_actor_id(authorization)
+    _check_rate_limit(_rate_limit_key(actor_id, request))
 
     text = req.message.strip()
     if not text:
@@ -658,7 +707,7 @@ def chat_stream(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Message is too long, please shorten it.")
 
     messages = _build_messages(req.history, text)
-    oid = _get_or_create_conversation(req.conversation_id, req.user_id or "anon", text)
+    oid = _get_or_create_conversation(req.conversation_id, actor_id, text)
 
     def event_gen():
         if GEMINI_API_KEY:
@@ -725,16 +774,19 @@ def chat_stream(req: ChatRequest):
 
 @ai_router.post("/chat-with-image", response_model=ChatResponse)
 async def chat_with_image(
+    request: Request,
     message: str = Form(""),
     image: UploadFile = File(...),
-    user_id: str = Form("anon"),
     conversation_id: str = Form(""),
     model: str = Form("gemma"),
+    authorization: Optional[str] = Header(None),
+    _media_slot: None = Depends(_limit_media_requests),
 ):
     """Photo + optional caption. Agent identifies/explains the image,
     and can still search the web for current info about what it sees."""
     _require_client()
-    _check_rate_limit(user_id)
+    actor_id = _optional_actor_id(authorization)
+    _check_rate_limit(_rate_limit_key(actor_id, request))
 
     if image.content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg"):
         raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP, or GIF images are supported.")
@@ -743,9 +795,9 @@ async def chat_with_image(
     # "image/jpeg" — Claude's API only accepts the standard MIME type, so normalize it.
     media_type = "image/jpeg" if image.content_type == "image/jpg" else image.content_type
 
-    raw = await image.read()
+    raw = await image.read(MAX_IMAGE_BYTES + 1)
     if len(raw) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail="Image is too large (max 5MB).")
+        raise HTTPException(status_code=413, detail="Image is too large (max 5MB).")
     if not raw:
         raise HTTPException(status_code=400, detail="Image is empty.")
 
@@ -774,20 +826,20 @@ async def chat_with_image(
     reply = reply or "I couldn't understand the image, please try again."
 
     oid = await asyncio.to_thread(
-        _get_or_create_conversation, conversation_id or None, user_id, user_text_for_history
+        _get_or_create_conversation, conversation_id or None, actor_id, user_text_for_history
     )
     await asyncio.to_thread(_append_turn, oid, user_text_for_history, reply)
     # Keep camera/photo messages in Library > Images as real GridFS files.
-    if _library is not None and _fs is not None:
+    if actor_id and _library is not None and _fs is not None:
         try:
             file_id = await asyncio.to_thread(
                 _fs.upload_from_stream,
                 image.filename or "camera-image",
                 raw,
-                metadata={"user_id": user_id, "content_type": media_type, "source": "camera"},
+                metadata={"user_id": actor_id, "content_type": media_type, "source": "camera"},
             )
             await asyncio.to_thread(_library.insert_one, {
-                "user_id": user_id,
+                "user_id": actor_id,
                 "name": image.filename or "Camera image",
                 "type": "image",
                 "mime_type": media_type,
@@ -800,7 +852,7 @@ async def chat_with_image(
             logger.exception("Could not save camera image to library")
 
     return ChatResponse(
-        reply=reply, used_search=used_search, conversation_id=str(oid) if oid else (conversation_id or None)
+        reply=reply, used_search=used_search, conversation_id=str(oid) if oid else None
     )
 
 
@@ -835,25 +887,28 @@ def _extract_gemini_image(response_data: dict):
 
 @ai_router.post("/edit-image", response_model=PhotoEditResponse)
 async def edit_image(
+    request: Request,
     instruction: str = Form(...),
     image: UploadFile = File(...),
-    user_id: str = Form("anon"),
     conversation_id: str = Form(""),
     model: str = Form("gemma"),
+    authorization: Optional[str] = Header(None),
+    _media_slot: None = Depends(_limit_media_requests),
 ):
     """Apply a natural-language edit to an uploaded photo using Gemini image output."""
-    _check_rate_limit(user_id)
+    actor_id = _optional_actor_id(authorization)
+    _check_rate_limit(_rate_limit_key(actor_id, request))
     instruction = (instruction or "").strip()[:MAX_MESSAGE_CHARS]
     if not instruction:
         raise HTTPException(status_code=400, detail="Tell BluOm AI what to change in the photo.")
     if image.content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg"):
         raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP, or GIF images are supported.")
     media_type = "image/jpeg" if image.content_type == "image/jpg" else image.content_type
-    raw = await image.read()
+    raw = await image.read(MAX_IMAGE_BYTES + 1)
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image is too large (max 5MB).")
     if not raw:
         raise HTTPException(status_code=400, detail="Image is empty.")
-    if len(raw) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail="Image is too large (max 5MB).")
     if not GEMINI_IMAGE_API_KEY:
         raise HTTPException(status_code=503, detail="Photo editing is not configured yet. Add GEMINI_IMAGE_API_KEY on the backend.")
 
@@ -909,13 +964,13 @@ async def edit_image(
         raise HTTPException(status_code=502, detail="Photo editing failed: " + safe_error)
 
     reply = "Done — I edited the photo as requested. You can send another change for this conversation."
-    oid = await asyncio.to_thread(_get_or_create_conversation, conversation_id or None, user_id, instruction)
+    oid = await asyncio.to_thread(_get_or_create_conversation, conversation_id or None, actor_id, instruction)
     await asyncio.to_thread(_append_turn, oid, instruction, reply)
     return PhotoEditResponse(
         image_data_url=f"data:{output_type};base64,{image_b64}",
         mime_type=output_type,
         reply=reply,
-        conversation_id=str(oid) if oid else (conversation_id or None),
+        conversation_id=str(oid) if oid else None,
         model=model,
     )
 
@@ -930,11 +985,14 @@ def _require_db():
 
 
 @ai_router.get("/conversations", response_model=List[ConversationSummary])
-def list_conversations(user_id: str):
+def list_conversations(authorization: Optional[str] = Header(None)):
+    actor_id = _optional_actor_id(authorization)
+    if not actor_id:
+        return []
     _require_db()
     try:
         docs = (
-            _conversations.find({"user_id": user_id})
+            _conversations.find({"user_id": actor_id})
             .sort("updated_at", -1)
             .limit(MAX_RECENTS)
         )
@@ -945,13 +1003,14 @@ def list_conversations(user_id: str):
 
 
 @ai_router.get("/conversations/{conversation_id}", response_model=ConversationDetail)
-def get_conversation(conversation_id: str, user_id: str):
+def get_conversation(conversation_id: str, authorization: Optional[str] = Header(None)):
+    actor_id = _decode_token(authorization)
     _require_db()
     oid = _to_object_id(conversation_id)
     if not oid:
         raise HTTPException(status_code=400, detail="Invalid conversation id.")
     try:
-        doc = _conversations.find_one({"_id": oid, "user_id": user_id})
+        doc = _conversations.find_one({"_id": oid, "user_id": actor_id})
     except PyMongoError:
         logger.exception("Could not load conversation")
         raise HTTPException(status_code=502, detail="Couldn't load that chat, please try again.")
@@ -961,13 +1020,14 @@ def get_conversation(conversation_id: str, user_id: str):
 
 
 @ai_router.delete("/conversations/{conversation_id}")
-def delete_conversation(conversation_id: str, user_id: str):
+def delete_conversation(conversation_id: str, authorization: Optional[str] = Header(None)):
+    actor_id = _decode_token(authorization)
     _require_db()
     oid = _to_object_id(conversation_id)
     if not oid:
         raise HTTPException(status_code=400, detail="Invalid conversation id.")
     try:
-        result = _conversations.delete_one({"_id": oid, "user_id": user_id})
+        result = _conversations.delete_one({"_id": oid, "user_id": actor_id})
     except PyMongoError:
         logger.exception("Could not delete conversation")
         raise HTTPException(status_code=502, detail="Couldn't delete that chat, please try again.")
@@ -1089,14 +1149,15 @@ def list_library_items(
 async def upload_library_file(
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(None),
+    _media_slot: None = Depends(_limit_media_requests),
 ):
     _require_library()
     user_id = _decode_token(authorization)
-    raw = await file.read()
+    raw = await file.read(MAX_LIBRARY_FILE_BYTES + 1)
+    if len(raw) > MAX_LIBRARY_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="File is too large (max 20MB).")
     if not raw:
         raise HTTPException(status_code=400, detail="File is empty.")
-    if len(raw) > MAX_LIBRARY_FILE_BYTES:
-        raise HTTPException(status_code=400, detail="File is too large (max 20MB).")
 
     item_type = "image" if (file.content_type or "").startswith("image/") else "file"
 
