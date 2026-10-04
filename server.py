@@ -29,7 +29,9 @@ try:
 
     MONGO_URL      = os.environ["MONGO_URL"].strip()
     DB_NAME        = os.environ.get("DB_NAME", "postapp")
-    JWT_SECRET     = os.environ.get("JWT_SECRET", "change-me-in-production")
+    JWT_SECRET     = os.environ.get("JWT_SECRET", "").strip()
+    if not JWT_SECRET or JWT_SECRET == "change-me-in-production":
+        raise RuntimeError("JWT_SECRET must be set to a unique production secret before the API can start")
 
     # ── Cloudinary (video/photo hosting — enables smooth streaming) ──
     import cloudinary
@@ -405,19 +407,25 @@ try:
     # ── Translation cache (in-memory, TTL 1 h) — defined early so translate endpoint can use it
     _trans_cache: dict = {}
     _TRANS_TTL = 3600
+    _TRANS_CACHE_MAX_ENTRIES = 256
 
     def _cache_get(key):
         entry = _trans_cache.get(key)
         if entry and (_time.monotonic() - entry[1]) < _TRANS_TTL:
             return entry[0]
+        _trans_cache.pop(key, None)
         return None
 
     def _cache_set(key, value):
-        if len(_trans_cache) > 2000:
-            oldest = sorted(_trans_cache, key=lambda k: _trans_cache[k][1])[:500]
-            for k in oldest:
-                del _trans_cache[k]
-        _trans_cache[key] = (value, _time.monotonic())
+        if not isinstance(value, str) or len(value) > 10000:
+            return
+        current_time = _time.monotonic()
+        for stale_key, (_, timestamp) in list(_trans_cache.items()):
+            if current_time - timestamp >= _TRANS_TTL:
+                _trans_cache.pop(stale_key, None)
+        if key not in _trans_cache and len(_trans_cache) >= _TRANS_CACHE_MAX_ENTRIES:
+            _trans_cache.pop(next(iter(_trans_cache)))
+        _trans_cache[key] = (value, current_time)
 
     # ── Auth helpers ─────────────────────────────────────────────
     async def raw_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
@@ -472,8 +480,8 @@ try:
     # ── Email / SMS senders ───────────────────────────────────────
     def send_otp_email(email, code):
         if DEMO_MODE:
-            logging.info(f"[DEMO] Email OTP for {email}: {code}")
-            return True
+            logging.warning("Email OTP delivery is unavailable: RESEND_API_KEY is not configured")
+            return False
         try:
             import resend
             resend.api_key = RESEND_API_KEY
@@ -562,7 +570,7 @@ postbluom.online"""
     def send_otp_sms(phone, code):
         if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_PHONE:
             missing = [k for k,v in {"TWILIO_SID": TWILIO_SID, "TWILIO_TOKEN": TWILIO_TOKEN, "TWILIO_PHONE": TWILIO_PHONE}.items() if not v]
-            logging.warning(f"[SMS] Missing env vars: {missing}. OTP for {phone}: {code}")
+            logging.warning(f"[SMS] Missing env vars: {missing}")
             return None  # None = not configured
         try:
             from twilio.rest import Client
@@ -575,8 +583,8 @@ postbluom.online"""
             logging.info(f"[SMS] Sent to {phone}")
             return True
         except Exception as e:
-            logging.error(f"[SMS] FAILED to {phone}: {e}")
-            return str(e)  # Return error string so callers can surface it
+            logging.error(f"[SMS] Delivery failed ({type(e).__name__})")
+            return False
 
     # ── Misc helpers ──────────────────────────────────────────────
     async def ensure_username_unique(username: str, exclude_uid: Optional[str] = None):
@@ -876,8 +884,10 @@ postbluom.online"""
             await db.users.update_one({"id": uid}, {"$set": doc})
         else:
             await db.users.insert_one(doc)
-        asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
-        return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
+        email_sent = await run_in_bg(send_otp_email, p.email, code)
+        if not email_sent:
+            raise HTTPException(503, "Email verification is unavailable. Please try again later.")
+        return {"message": "OTP sent"}
 
     @api.post("/auth/verify-otp")
     async def verify_otp(request: Request, p: OtpIn):
@@ -927,8 +937,10 @@ postbluom.online"""
             {"id": u["id"]},
             {"$set": {"otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10)}},
         )
-        asyncio.create_task(run_in_bg(send_otp_email, u["email"], code))
-        return {"message": "Resent", "demo_otp": code if DEMO_MODE else None}
+        email_sent = await run_in_bg(send_otp_email, u["email"], code)
+        if not email_sent:
+            raise HTTPException(503, "Email verification is unavailable. Please try again later.")
+        return {"message": "Resent"}
 
     # ── Forgot Password ───────────────────────────────────────────
     @api.post("/auth/forgot-password-init")
@@ -955,7 +967,6 @@ postbluom.online"""
             if (now() - _sa).total_seconds() < 45:
                 return {
                     "message": "OTP recently sent",
-                    "demo_otp": _existing.get("_plain"),
                     "method": "email" if is_email else "sms",
                 }
         code = f"{secrets.randbelow(1000000):06d}"
@@ -965,21 +976,23 @@ postbluom.online"""
                 "identifier": identifier, "user_id": user["id"],
                 "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
-                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
-            }},
+                "otp_sent_at": now(),
+            }, "$unset": {"_plain": ""}},
             upsert=True,
         )
         if is_email:
             # Await send so we can detect and report failure; never leak OTP in response
             email_sent = await run_in_bg(send_otp_email, identifier, code)
-            if not email_sent and not DEMO_MODE:
+            if not email_sent:
+                await db.reset_otps.delete_one({"identifier": identifier})
                 raise HTTPException(503, "Failed to send verification email. Please try again in a moment.")
-            return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email"}
+            return {"message": "OTP sent", "method": "email"}
         else:
             sms_result = await run_in_bg(send_otp_sms, identifier, code)
-            sms_ok = sms_result is True
-            sms_err = sms_result if isinstance(sms_result, str) else None
-            return {"message": "OTP sent", "demo_otp": code if not sms_ok else None, "method": "sms", "sms_error": sms_err}
+            if sms_result is not True:
+                await db.reset_otps.delete_one({"identifier": identifier})
+                raise HTTPException(503, "SMS verification is unavailable. Please try again later.")
+            return {"message": "OTP sent", "method": "sms"}
 
     @api.post("/auth/forgot-password-verify")
     async def forgot_password_verify(p: ForgotPasswordVerifyIn):
@@ -1015,19 +1028,22 @@ postbluom.online"""
         if _r and _r.get("otp_sent_at"):
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
-                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
+                return {"message": "OTP recently sent"}
         code = f"{secrets.randbelow(1000000):06d}"
         await db.email_otps.update_one(
             {"email": p.email},
             {"$set": {
                 "email": p.email, "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
-                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
-            }},
+                "otp_sent_at": now(),
+            }, "$unset": {"_plain": ""}},
             upsert=True,
         )
-        asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
-        return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
+        email_sent = await run_in_bg(send_otp_email, p.email, code)
+        if not email_sent:
+            await db.email_otps.delete_one({"email": p.email})
+            raise HTTPException(503, "Email verification is unavailable. Please try again later.")
+        return {"message": "OTP sent"}
 
     @api.post("/auth/email-verify-init")
     async def email_verify_init(p: EmailVerifyIn):
@@ -1079,23 +1095,22 @@ postbluom.online"""
         if _r and _r.get("otp_sent_at"):
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
-                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
+                return {"message": "OTP recently sent"}
         code = f"{secrets.randbelow(1000000):06d}"
         await db.phone_otps.update_one(
             {"phone": p.phone},
             {"$set": {
                 "phone": p.phone, "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
-                "otp_sent_at": now(), "_plain": None,
-            }},
+                "otp_sent_at": now(),
+            }, "$unset": {"_plain": ""}},
             upsert=True,
         )
         sms_result = await run_in_bg(send_otp_sms, p.phone, code)
-        sms_ok = sms_result is True
-        sms_err = sms_result if isinstance(sms_result, str) else None
-        demo = code if not sms_ok else None
-        if demo: await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"_plain": demo}})
-        return {"message": "OTP sent", "demo_otp": demo, "sms_error": sms_err}
+        if sms_result is not True:
+            await db.phone_otps.delete_one({"phone": p.phone})
+            raise HTTPException(503, "SMS verification is unavailable. Please try again later.")
+        return {"message": "OTP sent"}
 
     @api.post("/auth/phone-verify-init")
     async def phone_verify_init(p: PhoneVerifyIn):
@@ -1182,23 +1197,22 @@ postbluom.online"""
         if _r and _r.get("otp_sent_at"):
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
-                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
+                return {"message": "OTP recently sent"}
         code = f"{secrets.randbelow(1000000):06d}"
         await db.phone_otps.update_one(
             {"phone": p.phone},
             {"$set": {
                 "phone": p.phone, "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"],
-                "otp_sent_at": now(), "_plain": None,
-            }},
+                "otp_sent_at": now(),
+            }, "$unset": {"_plain": ""}},
             upsert=True,
         )
         sms_result = await run_in_bg(send_otp_sms, p.phone, code)
-        sms_ok = sms_result is True
-        sms_err = sms_result if isinstance(sms_result, str) else None
-        demo = code if not sms_ok else None
-        if demo: await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"_plain": demo}})
-        return {"message": "OTP sent", "demo_otp": demo, "sms_error": sms_err}
+        if sms_result is not True:
+            await db.phone_otps.delete_one({"phone": p.phone})
+            raise HTTPException(503, "SMS verification is unavailable. Please try again later.")
+        return {"message": "OTP sent"}
 
     @api.post("/auth/add-phone-verify")
     async def add_phone_verify(request: Request, p: AddPhoneVerifyIn, u=Depends(raw_user)):
@@ -1224,19 +1238,22 @@ postbluom.online"""
         if _r and _r.get("otp_sent_at"):
             _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
             if (now() - _sa).total_seconds() < 60:
-                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
+                return {"message": "OTP recently sent"}
         code = f"{secrets.randbelow(1000000):06d}"
         await db.email_otps.update_one(
             {"email": p.email},
             {"$set": {
                 "email": p.email, "otp_hash": await hashpw(code),
                 "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"],
-                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
-            }},
+                "otp_sent_at": now(),
+            }, "$unset": {"_plain": ""}},
             upsert=True,
         )
-        asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
-        return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
+        email_sent = await run_in_bg(send_otp_email, p.email, code)
+        if not email_sent:
+            await db.email_otps.delete_one({"email": p.email})
+            raise HTTPException(503, "Email verification is unavailable. Please try again later.")
+        return {"message": "OTP sent"}
 
     @api.post("/auth/add-email-verify")
     async def add_email_verify(request: Request, p: AddEmailVerifyIn, u=Depends(raw_user)):
@@ -1411,42 +1428,94 @@ postbluom.online"""
 
     @api.get("/data/activity-log")
     async def get_activity_log(u=Depends(current_user)):
-        """Return the signed-in user's recent posts and comments with safe display metadata."""
+        """Return the signed-in user's recent posts and a bounded page of comments and likes."""
         def public_profile(profile):
             if not profile: return None
             return {"id":profile.get("id"),"name":profile.get("name"),"handle":profile.get("handle"),"username":profile.get("username"),"avatar_photo":profile.get("avatar_photo"),"avatar_bg":profile.get("avatar_bg"),"avatar_letter":profile.get("avatar_letter"),"is_badge_verified":bool(profile.get("is_badge_verified"))}
         actor = public_profile(u)
         posts = []
-        async for post in db.posts.find({"user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"photo_url":1,"photo_urls":1,"video_url":1}).sort("created_at",-1).limit(50):
-            posts.append({"id":post.get("id"),"type":"post","content":post.get("content") or "(media post)","created_at":post.get("created_at"),"author":actor,"has_media":bool(post.get("photo_url") or post.get("photo_urls") or post.get("video_url")),"media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
-        comments=[]; owner_ids=set()
-        async for post in db.posts.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"comments":1,"photo_url":1,"photo_urls":1}):
-            owner_id=post.get("user_id")
+        own_posts = await db.posts.aggregate([
+            {"$match": {"user_id": u["id"]}},
+            {"$sort": {"created_at": -1}},
+            {"$limit": 50},
+            {"$project": {
+                "_id": 0, "id": 1, "content": 1, "created_at": 1,
+                "media_url": {"$ifNull": [
+                    {"$arrayElemAt": [{"$cond": [{"$isArray": "$photo_urls"}, "$photo_urls", []]}, 0]},
+                    "$photo_url",
+                ]},
+                "has_media": {"$or": [
+                    {"$ne": [{"$ifNull": ["$photo_url", ""]}, ""]},
+                    {"$gt": [{"$size": {"$cond": [{"$isArray": "$photo_urls"}, "$photo_urls", []]}}, 0]},
+                    {"$ne": [{"$ifNull": ["$video_url", ""]}, ""]},
+                ]},
+            }},
+        ]).to_list(50)
+        for post in own_posts:
+            posts.append({"id":post.get("id"),"type":"post","content":post.get("content") or "(media post)","created_at":post.get("created_at"),"author":actor,"has_media":bool(post.get("has_media")),"media_url":post.get("media_url")})
+
+        post_comment_rows = await db.posts.aggregate([
+            {"$match": {"comments.user_id": u["id"]}},
+            {"$unwind": "$comments"},
+            {"$match": {"comments.user_id": u["id"]}},
+            {"$sort": {"comments.created_at": -1}},
+            {"$limit": 50},
+            {"$project": {
+                "_id": 0, "target_id": "$id", "target_content": "$content",
+                "target_created_at": "$created_at", "target_user_id": "$user_id",
+                "target_media_url": {"$ifNull": [
+                    {"$arrayElemAt": [{"$cond": [{"$isArray": "$photo_urls"}, "$photo_urls", []]}, 0]},
+                    "$photo_url",
+                ]},
+                "comment_id": "$comments.id", "comment_text": "$comments.text",
+                "comment_created_at": "$comments.created_at",
+            }},
+        ]).to_list(50)
+        reel_comment_rows = await db.reels.aggregate([
+            {"$match": {"comments.user_id": u["id"]}},
+            {"$unwind": "$comments"},
+            {"$match": {"comments.user_id": u["id"]}},
+            {"$sort": {"comments.created_at": -1}},
+            {"$limit": 50},
+            {"$project": {
+                "_id": 0, "target_id": "$id", "target_content": "$caption",
+                "target_created_at": "$created_at", "target_user_id": "$user_id",
+                "target_media_url": "$photo_url",
+                "comment_id": "$comments.id", "comment_text": "$comments.text",
+                "comment_created_at": "$comments.created_at",
+            }},
+        ]).to_list(50)
+        comments = []
+        owner_ids = set()
+        for row, target_type in [(row, "post") for row in post_comment_rows] + [(row, "reel") for row in reel_comment_rows]:
+            owner_id = row.get("target_user_id")
             if owner_id: owner_ids.add(owner_id)
-            for comment in post.get("comments",[]):
-                if comment.get("user_id")==u["id"]:
-                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id,"target_media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
-        async for reel in db.reels.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"comments":1,"photo_url":1}):
-            owner_id=reel.get("user_id")
-            if owner_id: owner_ids.add(owner_id)
-            for comment in reel.get("comments",[]):
-                if comment.get("user_id")==u["id"]:
-                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
-        like_items=[]
-        async for post in db.posts.find({"likes.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"photo_url":1,"photo_urls":1}):
-            owner_id=post.get("user_id")
+            comments.append({"id":row.get("comment_id"),"type":"comment","comment":row.get("comment_text") or "","created_at":row.get("comment_created_at"),"actor":actor,"target_type":target_type,"target_id":row.get("target_id"),"target_content":row.get("target_content") or ("(reel)" if target_type == "reel" else "(media post)"),"target_created_at":row.get("target_created_at"),"target_user_id":owner_id,"target_media_url":row.get("target_media_url")})
+
+        like_items = []
+        async for post in db.posts.find(
+            {"likes.user_id": u["id"]},
+            {"_id": 0, "id": 1, "content": 1, "created_at": 1, "user_id": 1, "photo_url": 1, "photo_urls": 1},
+        ).sort("created_at", -1).limit(50):
+            owner_id = post.get("user_id")
             if owner_id: owner_ids.add(owner_id)
             like_items.append({"id":"post:"+post.get("id"),"type":"like","actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id,"target_media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
-        async for reel in db.reels.find({"likes":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"photo_url":1}):
-            owner_id=reel.get("user_id")
+        async for reel in db.reels.find(
+            {"likes": u["id"]},
+            {"_id": 0, "id": 1, "caption": 1, "created_at": 1, "user_id": 1, "photo_url": 1},
+        ).sort("created_at", -1).limit(50):
+            owner_id = reel.get("user_id")
             if owner_id: owner_ids.add(owner_id)
             like_items.append({"id":"reel:"+reel.get("id"),"type":"like","actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
-        owners=await db.users.find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1,"is_badge_verified":1}).to_list(len(owner_ids)) if owner_ids else []
-        owner_map={profile.get("id"):public_profile(profile) for profile in owners}
-        for item in comments: item["target_author"]=owner_map.get(item.get("target_user_id"))
-        comments.sort(key=lambda item:item.get("created_at") or "",reverse=True)
-        for item in like_items: item["target_author"]=owner_map.get(item.get("target_user_id"))
-        like_items.sort(key=lambda item:item.get("target_created_at") or "",reverse=True)
+        owners = await db.users.find(
+            {"id": {"$in": list(owner_ids)}},
+            {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1, "is_badge_verified": 1},
+        ).to_list(200) if owner_ids else []
+        owner_map = {profile.get("id"): public_profile(profile) for profile in owners}
+        for item in comments: item["target_author"] = owner_map.get(item.get("target_user_id"))
+        comments.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        for item in like_items: item["target_author"] = owner_map.get(item.get("target_user_id"))
+        like_items.sort(key=lambda item: str(item.get("target_created_at") or ""), reverse=True)
         return {"actor":actor,"posts":posts,"comments":comments[:50],"likes":like_items[:50]}
 
     @api.delete("/data/activity-log/{activity_type}/{activity_id}")
@@ -2091,6 +2160,22 @@ postbluom.online"""
             "video_effect":     r.get("video_effect"),
         }
 
+    async def _post_is_visible_to_user(post: dict, viewer: dict) -> bool:
+        owner_id = post.get("user_id")
+        viewer_id = viewer.get("id")
+        if owner_id == viewer_id:
+            return True
+        following_ids = set(viewer.get("following") or [])
+        audience = post.get("audience") or "public"
+        if audience not in {"public", "followers"}:
+            return False
+        if audience == "followers" and owner_id not in following_ids:
+            return False
+        owner = await db.users.find_one({"id": owner_id}, {"_id": 0, "is_private": 1}) if owner_id else None
+        if owner and owner.get("is_private") and owner_id not in following_ids:
+            return False
+        return True
+
     @api.get("/posts")
     async def list_posts(
         q: Optional[str] = Query(None, max_length=200), user_id: Optional[str] = None,
@@ -2100,10 +2185,8 @@ postbluom.online"""
     ):
         query: dict = {}
         filter_public_authors = False
-        following_ids = u.get("following", [])
-        excluded_user_ids = set(
-            (u.get("blocked_users") or []) + (u.get("muted_users") or [])
-        )
+        following_ids = list(u.get("following", []) or [])
+        excluded_user_ids = set((u.get("blocked_users") or []) + (u.get("muted_users") or []))
         if user_id and user_id != u["id"] and user_id in excluded_user_ids:
             return {"posts": [], "total": 0, "skip": skip, "limit": limit}
 
@@ -2118,10 +2201,7 @@ postbluom.online"""
             query["user_id"] = user_id
         elif feed:
             followers_ids = u.get("followers", [])
-            # Users we already have read access to (following + self)
-            can_see_ids = set(following_ids + [u["id"]])
-            can_see_list = list(can_see_ids)
-            # Run both user-set queries in PARALLEL for speed
+            can_see_list = list(set(following_ids + [u["id"]]))
             async def _empty_list():
                 return []
             follower_query = (
@@ -2163,31 +2243,26 @@ postbluom.online"""
         if excluded_user_ids:
             current_user_filter = query.get("user_id")
             if feed and isinstance(current_user_filter, dict) and "$in" in current_user_filter:
-                current_user_filter["$in"] = [
-                    item_id for item_id in current_user_filter["$in"]
-                    if item_id not in excluded_user_ids
-                ]
+                current_user_filter["$in"] = [item_id for item_id in current_user_filter["$in"] if item_id not in excluded_user_ids]
             elif not user_id:
-                exclusion_filter = {"user_id": {"$nin": list(excluded_user_ids)}}
-                query = {"$and": [query, exclusion_filter]} if query else exclusion_filter
+                query = {"$and": [query, {"user_id": {"$nin": list(excluded_user_ids)}}]} if query else {"user_id": {"$nin": list(excluded_user_ids)}}
 
-        # Older Compose versions stored photo/video data URLs directly in posts.
-        # They are valid historical media and must remain visible in home/profile;
-        # the frontend now uploads new photos to hosted URLs before creating posts.
-        # Keep the filter for the separate reels query below, but never apply it
-        # to regular posts or old posts disappear from both screens.
+        feed_user_filter = query.get("user_id")
+        audience_filter = {"$or": [
+            {"audience": {"$exists": False}},
+            {"audience": "public"},
+            {"user_id": u["id"]},
+            {"$and": [{"audience": "followers"}, {"user_id": {"$in": following_ids}}]},
+        ]}
+        query = {"$and": [query, audience_filter]} if query else audience_filter
         legacy_media_filter = {"$nor": [
             {"video_url": {"$regex": "^data:"}},
             {"photo_url": {"$regex": "^data:"}},
             {"photo_urls": {"$elemMatch": {"$regex": "^data:"}}},
         ]}
-        feed_user_filter = query.get("user_id")
-
-        # Reels get merged into the home feed and profile grid (but not search)
-        # so a shared reel shows up for followers/following, and stays on the
-        # poster's own profile — reusing the same user_id filter built above.
         include_reels = (feed or bool(user_id)) and not q and feed_user_filter is not None
         fetch_n = skip + limit
+        post_metadata = {"_id": 0, "id": 1, "user_id": 1, "created_at": 1}
         if filter_public_authors:
             posts_task = db.posts.aggregate([
                 {"$match": query},
@@ -2195,80 +2270,111 @@ postbluom.online"""
                 {"$match": {"$or": [{"user_id": u["id"]}, {"_author.is_private": {"$ne": True}}]}},
                 {"$sort": {"created_at": -1}},
                 {"$limit": fetch_n},
-                {"$project": {"_id": 0, "_author": 0}},
+                {"$project": {"_id": 0, "id": 1, "user_id": 1, "created_at": 1}},
             ]).to_list(fetch_n)
         else:
-            posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            posts_task = db.posts.find(query, post_metadata).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+
+        viewer_mentions = []
         if include_reels:
-            # Mention visibility is private to the signed-in viewer, never the profile target.
-            mention_target_id = u["id"]
             viewer_mentions = await db.reel_mentions.find(
-                {"target_user_id": mention_target_id},
+                {"target_user_id": u["id"]},
                 {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
             ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
             mentioned_ids = list(dict.fromkeys(doc["reel_id"] for doc in viewer_mentions if doc.get("reel_id")))
-
-            async def _load_feed_reels():
-                # Fetch normal feed reels and mentioned/reposted reels separately.
-                # Applying limit() to one combined query can drop an old reel
-                # before the mention/repost is merged into the Home feed.
-                normal_task = db.reels.find(
-                    {"$and": [{"user_id": feed_user_filter}, legacy_media_filter]}, {"_id": 0}
-                ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
-                mentioned_task = (
-                    db.reels.find(
-                        {"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter]}, {"_id": 0}
-                    ).sort("created_at", -1).to_list(len(mentioned_ids))
-                    if mentioned_ids else _empty_list()
-                )
-                normal_reels, mentioned_reels = await asyncio.gather(normal_task, mentioned_task)
-                merged_by_id = {}
-                for item in normal_reels + mentioned_reels:
-                    merged_by_id[item["id"]] = item
-                return sorted(
-                    merged_by_id.values(),
-                    key=lambda item: item.get("created_at") or "",
-                    reverse=True,
-                )[:fetch_n]
-
-            reels_task = _load_feed_reels()
-        else:
-            async def _no_reels(): return []
-            reels_task = _no_reels()
-        posts_raw, reels_raw = await asyncio.gather(posts_task, reels_task)
-        # Mention visibility is private to the signed-in viewer, never the profile target.
-        mention_docs = {}
-        if include_reels:
-            mention_docs = {doc["reel_id"]: doc for doc in viewer_mentions if doc.get("reel_id")}
-        merged_reels = []
-        seen_reel_ids = set()
-        for reel in reels_raw:
-            if reel["id"] in seen_reel_ids:
-                continue
-            seen_reel_ids.add(reel["id"])
-            mention = mention_docs.get(reel["id"])
-            mentioned_by = (
-                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
-                if mention else None
+            reel_audience_filter = {"$or": [
+                {"audience": {"$exists": False}}, {"audience": "public"},
+                {"user_id": u["id"]},
+                {"audience": "friends", "user_id": {"$in": following_ids}},
+                {"audience": "only_show", "audience_users": u["id"]},
+            ]}
+            normal_query = {"$and": [{"user_id": feed_user_filter}, legacy_media_filter, reel_audience_filter]}
+            normal_task = db.reels.find(normal_query, post_metadata).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            mentioned_task = (
+                db.reels.find({"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter, reel_audience_filter]}, post_metadata)
+                .sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+                if mentioned_ids else asyncio.sleep(0, result=[])
             )
-            feed_item = _reel_to_feed_item(reel, bool(mention), mentioned_by)
-            if mention and mention.get("created_at"):
-                # A repost is a new feed event. Sort it by repost time rather
-                # than the original reel upload time.
-                feed_item["original_created_at"] = feed_item.get("created_at")
-                feed_item["created_at"] = mention["created_at"]
-            merged_reels.append(feed_item)
-        merged = posts_raw + merged_reels
-        merged.sort(key=lambda d: d.get("created_at") or "", reverse=True)
-        posts = merged[skip:skip + limit]
-        unviewed_ids = [p["id"] for p in posts if not p.get("is_reel") and u["id"] not in p.get("views", [])]
+            normal_reels, mentioned_reels = await asyncio.gather(normal_task, mentioned_task)
+            mention_docs = {doc["reel_id"]: doc for doc in viewer_mentions if doc.get("reel_id")}
+            merged_by_id = {item["id"]: item for item in normal_reels + mentioned_reels if item.get("id")}
+            reel_candidates = list(merged_by_id.values())
+            reel_owner_ids = list({item.get("user_id") for item in reel_candidates if item.get("user_id")})
+            private_owners = await db.users.find(
+                {"id": {"$in": reel_owner_ids}, "is_private": True}, {"_id": 0, "id": 1}
+            ).to_list(len(reel_owner_ids)) if reel_owner_ids else []
+            private_owner_ids = {owner["id"] for owner in private_owners}
+            reel_candidates = [
+                item for item in reel_candidates
+                if item.get("user_id") not in private_owner_ids or item.get("user_id") in following_ids or item.get("user_id") == u["id"]
+            ]
+        else:
+            reel_candidates = []
+            mention_docs = {}
+
+        events = [{"id": item.get("id"), "user_id": item.get("user_id"), "created_at": item.get("created_at"), "is_reel": False}
+                  for item in (await posts_task)]
+        for item in reel_candidates:
+            mention = mention_docs.get(item.get("id"))
+            event_time = mention.get("created_at") if mention and mention.get("created_at") else item.get("created_at")
+            events.append({"id": item.get("id"), "user_id": item.get("user_id"), "created_at": event_time, "original_created_at": item.get("created_at"), "is_reel": True})
+        events.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+        page_events = events[skip:skip + limit]
+        selected_post_ids = [item["id"] for item in page_events if not item["is_reel"] and item.get("id")]
+        selected_reel_ids = [item["id"] for item in page_events if item["is_reel"] and item.get("id")]
+
+        if selected_post_ids and filter_public_authors:
+            full_posts = await db.posts.aggregate([
+                {"$match": {"$and": [query, {"id": {"$in": selected_post_ids}}]}},
+                {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
+                {"$match": {"$or": [{"user_id": u["id"]}, {"_author.is_private": {"$ne": True}}]}},
+                {"$project": {"_id": 0, "_author": 0}},
+            ]).to_list(len(selected_post_ids))
+        elif selected_post_ids:
+            full_posts = await db.posts.find(
+                {"$and": [query, {"id": {"$in": selected_post_ids}}]}, {"_id": 0}
+            ).to_list(len(selected_post_ids))
+        else:
+            full_posts = []
+        posts_by_id = {post.get("id"): post for post in full_posts if post.get("id")}
+
+        full_reels = []
+        if selected_reel_ids:
+            full_reels = await db.reels.find(
+                {"$and": [{"id": {"$in": selected_reel_ids}}, legacy_media_filter, reel_audience_filter]}, {"_id": 0}
+            ).to_list(len(selected_reel_ids))
+        reels_by_id = {reel.get("id"): reel for reel in full_reels if reel.get("id")}
+        full_private_owners = await db.users.find(
+            {"id": {"$in": list({reel.get("user_id") for reel in full_reels if reel.get("user_id")})}, "is_private": True},
+            {"_id": 0, "id": 1},
+        ).to_list(len(full_reels)) if full_reels else []
+        full_private_owner_ids = {owner["id"] for owner in full_private_owners}
+        posts = []
+        for event in page_events:
+            item_id = event.get("id")
+            if event.get("is_reel"):
+                reel = reels_by_id.get(item_id)
+                if not reel or (reel.get("user_id") in full_private_owner_ids and reel.get("user_id") not in following_ids and reel.get("user_id") != u["id"]):
+                    continue
+                mention = mention_docs.get(item_id)
+                mentioned_by = (
+                    {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
+                    if mention else None
+                )
+                feed_item = _reel_to_feed_item(reel, bool(mention), mentioned_by)
+                if mention and mention.get("created_at"):
+                    feed_item["original_created_at"] = feed_item.get("created_at")
+                    feed_item["created_at"] = mention["created_at"]
+                posts.append(feed_item)
+            else:
+                post = posts_by_id.get(item_id)
+                if post:
+                    posts.append(post)
+        unviewed_ids = [post["id"] for post in posts if not post.get("is_reel") and u["id"] not in post.get("views", [])]
         if unviewed_ids:
-            # Fire-and-forget: don't block the response for view tracking
             async def _mark_viewed():
                 try:
-                    await db.posts.update_many(
-                        {"id": {"$in": unviewed_ids}}, {"$addToSet": {"views": u["id"]}}
-                    )
+                    await db.posts.update_many({"id": {"$in": unviewed_ids}}, {"$addToSet": {"views": u["id"]}})
                 except Exception:
                     pass
             asyncio.create_task(_mark_viewed())
@@ -2277,7 +2383,8 @@ postbluom.online"""
     @api.get("/posts/{pid}")
     async def get_post(pid: str, u=Depends(current_user)):
         post = await db.posts.find_one({"id": pid}, {"_id": 0})
-        if not post: raise HTTPException(404, "Post not found")
+        if not post or not await _post_is_visible_to_user(post, u):
+            raise HTTPException(404, "Post not found")
         if u["id"] not in post.get("views", []):
             await db.posts.update_one({"id": pid}, {"$addToSet": {"views": u["id"]}})
             post["views"] = post.get("views", []) + [u["id"]]
@@ -3479,7 +3586,7 @@ postbluom.online"""
             return {"translated": text, "tone_hint": None}
         tl = TRANSLATE_LANG_MAP.get(target, target)
         # Versioned key prevents an older untranslated result from masking this fix.
-        cache_key = "caption-v2|" + tl + "||" + text
+        cache_key = "caption-v2|" + tl + "||" + _hl.sha256(text.encode("utf-8")).hexdigest()
         cached = _cache_get(cache_key)
         if cached:
             return {"translated": cached, "tone_hint": _detect_tone_hint(text) if include_tone else None}
@@ -3871,14 +3978,23 @@ postbluom.online"""
     _news_cache: dict = {}
     _NEWS_CACHE_TTL = 180  # 3 minutes
 
+    _NEWS_CACHE_MAX_ENTRIES = 64
+
     def _news_cache_get(key):
         entry = _news_cache.get(key)
         if entry and (_time.monotonic() - entry[1]) < _NEWS_CACHE_TTL:
             return entry[0]
+        _news_cache.pop(key, None)
         return None
 
     def _news_cache_set(key, value):
-        _news_cache[key] = (value, _time.monotonic())
+        current_time = _time.monotonic()
+        for stale_key, (_, timestamp) in list(_news_cache.items()):
+            if current_time - timestamp >= _NEWS_CACHE_TTL:
+                _news_cache.pop(stale_key, None)
+        if key not in _news_cache and len(_news_cache) >= _NEWS_CACHE_MAX_ENTRIES:
+            _news_cache.pop(next(iter(_news_cache)))
+        _news_cache[key] = (value, current_time)
 
     async def _fetch_news_articles(category: str, country: Optional[str], page_size: int = 20) -> list:
         if not NEWS_API_KEY:
@@ -3925,11 +4041,13 @@ postbluom.online"""
 
     @api.get("/world/news")
     async def world_news(
-        category: str = "top",
-        country: Optional[str] = None,
+        category: str = Query("top", max_length=40),
+        country: Optional[str] = Query(None, max_length=2),
         u=Depends(current_user),
     ):
-        cache_key = f"news:{(category or 'top').lower()}:{(country or 'world').lower()}"
+        category = str(category or "top").strip().lower()[:40] or "top"
+        country = str(country).strip().lower()[:2] if country else None
+        cache_key = f"news:{category}:{country or 'world'}"
         cached = _news_cache_get(cache_key)
         if cached:
             return cached
@@ -3937,12 +4055,12 @@ postbluom.online"""
         result = {
             "articles": [
                 {
-                    "title": a.get("title", ""),
-                    "description": a.get("description") or "",
-                    "url": a.get("url", ""),
-                    "image": a.get("urlToImage", ""),
-                    "source": (a.get("source") or {}).get("name", "Unknown"),
-                    "published_at": a.get("publishedAt", ""),
+                    "title": str(a.get("title") or "")[:300],
+                    "description": str(a.get("description") or "")[:2000],
+                    "url": str(a.get("url") or "")[:2000],
+                    "image": str(a.get("urlToImage") or "")[:2000],
+                    "source": str((a.get("source") or {}).get("name") or "Unknown")[:100],
+                    "published_at": str(a.get("publishedAt") or "")[:40],
                 }
                 for a in articles
             ],
@@ -4243,6 +4361,15 @@ postbluom.online"""
         doc["is_following"] = False
         return doc
 
+    async def _private_reel_owner_ids(reels):
+        owner_ids = list({str(reel.get("user_id")) for reel in reels if reel.get("user_id")})
+        if not owner_ids:
+            return set()
+        private_owners = await db.users.find(
+            {"id": {"$in": owner_ids}, "is_private": True}, {"_id": 0, "id": 1}
+        ).to_list(len(owner_ids))
+        return {owner.get("id") for owner in private_owners if owner.get("id")}
+
     @api.get("/reels")
     async def list_reels(skip: int = Query(0, ge=0, le=10000), limit: int = Query(10, ge=1, le=50), u=Depends(current_user)):
         blocked  = u.get("blocked_users", [])
@@ -4262,6 +4389,8 @@ postbluom.online"""
         if excluded:
             query["user_id"] = {"$nin": excluded}
         reels_list = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        private_owner_ids = await _private_reel_owner_ids(reels_list)
+        reels_list = [r for r in reels_list if r.get("user_id") not in private_owner_ids or r.get("user_id") in following_ids or r.get("user_id") == u["id"]]
         mention_rows = await db.reel_mentions.aggregate([
             {"$match": {"reel_id": {"$in": [r["id"] for r in reels_list]}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
@@ -4381,6 +4510,8 @@ postbluom.online"""
             query["category"] = {"$regex": category, "$options": "i"}
         pool_limit = min(limit * 6, 300)
         reels_raw = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(0).limit(pool_limit).to_list(pool_limit)
+        private_owner_ids = await _private_reel_owner_ids(reels_raw)
+        reels_raw = [r for r in reels_raw if r.get("user_id") not in private_owner_ids or r.get("user_id") in following_ids or r.get("user_id") == u["id"]]
         mention_rows = await db.reel_mentions.aggregate([
             {"$match": {"reel_id": {"$in": [r.get("id") for r in reels_raw if r.get("id")]}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
@@ -5376,6 +5507,7 @@ postbluom.online"""
     _PLANET_UA = f"PostApp-OurPlanet/1.0 ({_PLANET_CONTACT_EMAIL})"
     _PLANET_CACHE = {}
     _PLANET_CACHE_TTL = 1800
+    _PLANET_CACHE_MAX_ENTRIES = 64
     _PLANET_NOMINATIM_LOCK = _threading.Lock()
     _PLANET_NOMINATIM_LAST = 0.0
     _PLANET_NOMINATIM = "https://nominatim.openstreetmap.org/search"
@@ -5558,8 +5690,11 @@ postbluom.online"""
     def _planet_profile(query):
         key = " ".join(query.strip().lower().split())
         cached_profile = _PLANET_CACHE.get(key)
-        if cached_profile and _time.time() - cached_profile[0] < _PLANET_CACHE_TTL:
+        current_time = _time.time()
+        if cached_profile and current_time - cached_profile[0] < _PLANET_CACHE_TTL:
             return cached_profile[1]
+        if cached_profile:
+            _PLANET_CACHE.pop(key, None)
         geo_data = _planet_geo(query)
         bio = _planet_bio(query)
         wiki_data = _planet_wiki(query)
@@ -5594,7 +5729,14 @@ postbluom.online"""
             "source": "Wikipedia + Wikimedia Commons + OpenStreetMap + GBIF + Esri World Imagery" + (" + NASA Earthdata" if nasa.get("satellite_desc") else "") + addons.get("source_suffix", ""),
             "source_url": wiki_data.get("page_url") or nasa.get("source_url"),
         }
-        _PLANET_CACHE[key] = (_time.time(), result)
+        for stale_key, (timestamp, _) in list(_PLANET_CACHE.items()):
+            if current_time - timestamp >= _PLANET_CACHE_TTL:
+                _PLANET_CACHE.pop(stale_key, None)
+        if key not in _PLANET_CACHE and len(_PLANET_CACHE) >= _PLANET_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(_PLANET_CACHE), None)
+            if oldest_key is not None:
+                _PLANET_CACHE.pop(oldest_key, None)
+        _PLANET_CACHE[key] = (current_time, result)
         return result
 
     @api.get("/our-planet/search")
@@ -5824,18 +5966,47 @@ postbluom.online"""
         now_utc = now()
         cutoff = now_utc - timedelta(days=REELS_ALGO_LOOKBACK_DAYS)
         following_ids = set(u.get("following") or [])
-        pending_follow_ids = {
-            row["to_id"]
-            for row in await db.follow_requests.find(
-                {"from_id": u["id"], "status": "pending"},
-                {"_id": 0, "to_id": 1},
-            ).to_list(5000)
-        }
+        pending_follow_ids = set()
         excluded_users = set((u.get("blocked_users") or []) + (u.get("muted_users") or []))
-        raw_candidates = await db.reels.find(
-            {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
-            {"_id": 0},
-        ).sort("created_at", -1).limit(2000).to_list(2000)
+        candidate_projection = {
+            "_id": 0, "id": 1, "user_id": 1, "audience": 1, "audience_users": 1,
+            "caption": 1, "audio_label": 1, "category": 1, "hashtags": 1, "tags": 1,
+            "created_at": 1, "duration": 1,
+            "_views_count": {"$max": [
+                {"$cond": [{"$isArray": "$views"}, {"$size": "$views"}, 0]},
+                {"$convert": {"input": "$view_count", "to": "int", "onError": 0, "onNull": 0}},
+            ]},
+            "_likes_count": {"$max": [
+                {"$cond": [{"$isArray": "$likes"}, {"$size": "$likes"}, 0]},
+                {"$convert": {"input": "$like_count", "to": "int", "onError": 0, "onNull": 0}},
+            ]},
+            "_comments_count": {"$max": [
+                {"$cond": [{"$isArray": "$comments"}, {"$size": "$comments"}, 0]},
+                {"$convert": {"input": "$comment_count", "to": "int", "onError": 0, "onNull": 0}},
+            ]},
+            "_comment_likes_count": {"$sum": {"$map": {
+                "input": {"$cond": [{"$isArray": "$comments"}, "$comments", []]},
+                "as": "comment",
+                "in": {"$size": {"$cond": [{"$isArray": "$comment.likes"}, "$comment.likes", []]}},
+            }}},
+            "_shares_count": {"$max": [
+                {"$cond": [{"$isArray": "$shares"}, {"$size": "$shares"}, 0]},
+                {"$convert": {"input": "$share_count", "to": "int", "onError": 0, "onNull": 0}},
+            ]},
+            "_saves_count": {"$max": [
+                {"$cond": [{"$isArray": "$saves"}, {"$size": "$saves"}, 0]},
+                {"$convert": {"input": "$save_count", "to": "int", "onError": 0, "onNull": 0}},
+            ]},
+            "_viewer_liked": {"$in": [user_id, {"$cond": [{"$isArray": "$likes"}, "$likes", []]}]},
+            "_viewer_saved": {"$in": [user_id, {"$cond": [{"$isArray": "$saves"}, "$saves", []]}]},
+        }
+        raw_candidates = await db.reels.aggregate([
+            {"$match": {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}}},
+            {"$sort": {"created_at": -1}},
+            {"$limit": 2000},
+            {"$project": candidate_projection},
+        ]).to_list(2000)
+        private_owner_ids = await _private_reel_owner_ids(raw_candidates)
 
         # Search keeps the same eligibility and scoring model as the main feed,
         # but narrows the candidate pool to the requested search term first.
@@ -5869,6 +6040,8 @@ postbluom.online"""
             created_at = _reels_parse_datetime(reel.get("created_at"))
             owner_id = str(reel.get("user_id") or "")
             if owner_id in excluded_users:
+                continue
+            if owner_id in private_owner_ids and owner_id not in following_ids and owner_id != user_id:
                 continue
             if not _reels_user_can_see(reel, user_id, following_ids):
                 continue
@@ -5934,8 +6107,8 @@ postbluom.online"""
             if not reel_id:
                 continue
             stats = live_stats.get(reel_id, {})
-            embedded_views = reel.get("views") if isinstance(reel.get("views"), list) else []
-            total_views = max(len(embedded_views), int(reel.get("view_count") or 0), int(stats.get("total_views") or 0), 1)
+            embedded_views = int(reel.get("_views_count") or 0)
+            total_views = max(embedded_views, int(stats.get("total_views") or 0), 1)
             observed_views = max(int(stats.get("total_views") or 0), 1)
             completion_sum = float(stats.get("completion_sum") or 0)
             completion = completion_sum / observed_views if completion_sum else float(stats.get("avg_completion") or 0)
@@ -5943,11 +6116,11 @@ postbluom.online"""
             duration_seconds = max(float(reel.get("duration") or 0), 1.0)
             watch_time_score = min(1.0, avg_watch_seconds / duration_seconds) if reel.get("duration") else completion
             completion_quality = max(0.0, min(1.0, completion * 0.70 + watch_time_score * 0.30))
-            likes = len(reel.get("likes") or [])
-            comments = max(len(reel.get("comments") or []), int(reel.get("comment_count") or 0))
-            comment_likes = sum(len(comment.get("likes") or []) for comment in (reel.get("comments") or []))
-            shares = max(len(reel.get("shares") or []), int(reel.get("share_count") or 0))
-            saves = max(len(reel.get("saves") or []), int(reel.get("save_count") or 0))
+            likes = int(reel.get("_likes_count") or 0)
+            comments = int(reel.get("_comments_count") or 0)
+            comment_likes = int(reel.get("_comment_likes_count") or 0)
+            shares = int(reel.get("_shares_count") or 0)
+            saves = int(reel.get("_saves_count") or 0)
             mentions = mention_counts.get(reel_id, int(reel.get("mention_count") or 0))
             # Documented intent order: share > save > comment > comment-like > like.
             engagement_points = likes + comments * 3 + comment_likes + mentions * 2 + shares * 5 + saves * 4
@@ -6017,13 +6190,24 @@ postbluom.online"""
         exploration = [
             item for item in scored
             if item.get("id") not in main_ids
-            and (max(len(item.get("views") or []), int(item.get("view_count") or 0)) < 10
+            and (int(item.get("_views_count") or 0) < 10
                  or (now_utc - _reels_parse_datetime(item.get("created_at"))).days <= 30)
         ]
         random.Random(f"{user_id}:{page}").shuffle(exploration)
         combined = main_slice + exploration[:exploration_count]
         final_items = _reels_diversify(combined, limit)
         final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
+        full_reel_rows = await db.reels.find(
+            {"id": {"$in": final_reel_ids}}, {"_id": 0}
+        ).to_list(len(final_reel_ids)) if final_reel_ids else []
+        full_reel_by_id = {row.get("id"): row for row in full_reel_rows if row.get("id")}
+        final_owner_ids = list({item.get("user_id") for item in final_items if item.get("user_id")})
+        if final_owner_ids:
+            pending_rows = await db.follow_requests.find(
+                {"from_id": user_id, "status": "pending", "to_id": {"$in": final_owner_ids}},
+                {"_id": 0, "to_id": 1},
+            ).to_list(len(final_owner_ids))
+            pending_follow_ids = {row["to_id"] for row in pending_rows if row.get("to_id")}
         mention_docs = {}
         if final_reel_ids:
             mention_docs = {
@@ -6035,25 +6219,29 @@ postbluom.online"""
             }
         response_reels = []
         for item in final_items:
+            reel_data = full_reel_by_id.get(item.get("id"))
+            if not reel_data:
+                continue
+            reel = {**reel_data, **item}
             mention = mention_docs.get(item.get("id"))
             mentioned_by = (
                 {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
                 if mention else None
             )
-            shaped = _reel_to_feed_item(item, bool(mention), mentioned_by)
+            shaped = _reel_to_feed_item(reel, bool(mention), mentioned_by)
             shaped.update({
                 # Keep the Reels tab relationship state identical to Home/Profile.
                 "is_following": item.get("user_id") in following_ids or item.get("user_id") == u["id"],
                 "is_follow_pending": item.get("user_id") in pending_follow_ids,
                 "category": item.get("category") or "general",
                 "score": round(float(item.get("score") or 0), 6),
-                "is_liked": user_id in (item.get("likes") or []),
-                "like_count": len(item.get("likes") or []),
-                "is_saved": user_id in (item.get("saves") or []),
-                "save_count": max(len(item.get("saves") or []), int(item.get("save_count") or 0)),
-                "comment_count": max(len(item.get("comments") or []), int(item.get("comment_count") or 0)),
-                "share_count": max(len(item.get("shares") or []), int(item.get("share_count") or 0)),
-                "view_count": max(len(item.get("views") or []), int(item.get("view_count") or 0)),
+                "is_liked": bool(item.get("_viewer_liked")),
+                "like_count": int(item.get("_likes_count") or 0),
+                "is_saved": bool(item.get("_viewer_saved")),
+                "save_count": int(item.get("_saves_count") or 0),
+                "comment_count": int(item.get("_comments_count") or 0),
+                "share_count": int(item.get("_shares_count") or 0),
+                "view_count": int(item.get("_views_count") or 0),
                 "mention_count": int(item.get("mention_count") or 0),
                 "ranking_signals": item.get("ranking_signals") or {},
                 "is_viral": bool(item.get("is_viral")),
