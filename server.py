@@ -31,7 +31,7 @@ try:
     DB_NAME        = os.environ.get("DB_NAME", "postapp")
     JWT_SECRET     = os.environ.get("JWT_SECRET", "change-me-in-production")
 
-    # ── Cloudinary (video/photo hosting — enables smooth streaming) ──
+    # ââ Cloudinary (video/photo hosting â enables smooth streaming) ââ
     import cloudinary
     import cloudinary.uploader
     CLOUDINARY_URL        = os.environ.get("CLOUDINARY_URL", "").strip()
@@ -110,7 +110,7 @@ try:
             shared = sender_key.exchange(ECDH(), recv_pub)
             # HKDF pseudorandom key
             import hmac as _hmac2, hashlib
-            # RFC 8291: two-step HKDF — Step1 PRK, Step2 IKM
+            # RFC 8291: two-step HKDF â Step1 PRK, Step2 IKM
             prk_key = _hmac2.new(auth_secret, shared, hashlib.sha256).digest()
             ikm = _hmac2.new(prk_key, b"WebPush: info\x00" + sub_pub + sender_pub + b"\x01", hashlib.sha256).digest()
             salt = os.urandom(16)
@@ -215,7 +215,7 @@ try:
     def now():
         return datetime.now(timezone.utc)
 
-    # ── Password hashing (PBKDF2-HMAC-SHA256) ────────────────────
+    # ââ Password hashing (PBKDF2-HMAC-SHA256) ââââââââââââââââââââ
     _PBKDF2_ITER   = 32_000
     _PBKDF2_PREFIX = "$pbkdf2$"
 
@@ -252,11 +252,11 @@ try:
                         return False
                     salt, stored = parts[3], parts[4]
                 elif len(parts) == 4:
-                    # Legacy format: ["", "pbkdf2", salt, digest] — always 260k
+                    # Legacy format: ["", "pbkdf2", salt, digest] â always 260k
                     iters  = _PBKDF2_ITER_LEGACY
                     salt, stored = parts[2], parts[3]
                 else:
-                    return False  # malformed — reject
+                    return False  # malformed â reject
                 computed = await _run_sync(lambda: _pbkdf2_hash(p, salt, iters))
                 return _hmac.compare_digest(computed, stored)
             except Exception:
@@ -402,7 +402,7 @@ try:
 
     USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
 
-    # ── Translation cache (in-memory, TTL 1 h) — defined early so translate endpoint can use it
+    # ââ Translation cache (in-memory, TTL 1 h) â defined early so translate endpoint can use it
     _trans_cache: dict = {}
     _TRANS_TTL = 3600
 
@@ -419,7 +419,7 @@ try:
                 del _trans_cache[k]
         _trans_cache[key] = (value, _time.monotonic())
 
-    # ── Auth helpers ─────────────────────────────────────────────
+    # ââ Auth helpers âââââââââââââââââââââââââââââââââââââââââââââ
     async def raw_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
         if not creds:
             raise HTTPException(401, "Missing token")
@@ -447,7 +447,7 @@ try:
         u = await raw_user(creds)
         return u
 
-    # ── One-time reset: force old accounts to new theme/notification defaults ──
+    # ââ One-time reset: force old accounts to new theme/notification defaults ââ
     async def _migrate_prefs_defaults(u: dict):
         if u.get("prefs_migrated"):
             return
@@ -460,16 +460,16 @@ try:
             }},
         )
 
-    # ── Background hash migration helper ─────────────────────────
+    # ââ Background hash migration helper âââââââââââââââââââââââââ
     async def _migrate_hash(uid: str, password: str):
         try:
             new_hash = await hashpw(password)
             await db.users.update_one({"id": uid}, {"$set": {"password_hash": new_hash}})
-            logging.info(f"✅ Migrated password hash for {uid}")
+            logging.info(f"â Migrated password hash for {uid}")
         except Exception as e:
             logging.warning(f"Hash migration failed for {uid}: {e}")
 
-    # ── Email / SMS senders ───────────────────────────────────────
+    # ââ Email / SMS senders âââââââââââââââââââââââââââââââââââââââ
     def send_otp_email(email, code):
         if DEMO_MODE:
             logging.info(f"[DEMO] Email OTP for {email}: {code}")
@@ -553,7 +553,7 @@ postbluom.online"""
                 "reply_to": "support@postbluom.online",
                 "headers": {"X-Entity-Ref-ID": str(uuid.uuid4())},
             })
-            logging.info(f"✅ OTP email sent to {email}")
+            logging.info(f"â OTP email sent to {email}")
             return True
         except Exception as e:
             logging.warning(f"Email failed: {e}")
@@ -578,7 +578,7 @@ postbluom.online"""
             logging.error(f"[SMS] FAILED to {phone}: {e}")
             return str(e)  # Return error string so callers can surface it
 
-    # ── Misc helpers ──────────────────────────────────────────────
+    # ââ Misc helpers ââââââââââââââââââââââââââââââââââââââââââââââ
     async def ensure_username_unique(username: str, exclude_uid: Optional[str] = None):
         count = await db.users.count_documents({"username": username})
         if count > 0:
@@ -629,7 +629,7 @@ postbluom.online"""
                         f"{cooldown_until.strftime('%d %b %Y')}.",
                     )
 
-    # ── Pydantic models ───────────────────────────────────────────
+    # ââ Pydantic models âââââââââââââââââââââââââââââââââââââââââââ
     class SignupIn(BaseModel):
         email: EmailStr; password: str; name: str; username: str
 
@@ -775,7 +775,7 @@ postbluom.online"""
         photo_urls: Optional[List[str]] = None  # up to 5 photos
         video_url: Optional[str] = None         # base64 data URI, max 30s (mutually exclusive with photos)
         video_duration: Optional[float] = None  # seconds, must be <= 30
-        feeling: Optional[str] = None           # e.g. "😊 Happy"
+        feeling: Optional[str] = None           # e.g. "ð Happy"
         tagged_users: Optional[List[str]] = None  # list of @handles
         audience: Optional[str] = "public"       # public | followers
         comments_enabled: Optional[bool] = True  # False = comments turned off for this post
@@ -845,7 +845,7 @@ postbluom.online"""
     class AdminRejectIn(BaseModel):
         reason: Optional[str] = "Does not meet verification criteria"
 
-    # ── Auth Email ────────────────────────────────────────────────
+    # ââ Auth Email ââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.post("/auth/signup")
     async def signup(p: SignupIn):
         existing = await db.users.find_one({"email": p.email})
@@ -903,8 +903,8 @@ postbluom.online"""
         pw_hash = u.get("password_hash", "")
         if not await verifypw(p.password, pw_hash): raise HTTPException(401, "Wrong password")
         if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
-            asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
-        asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
+            asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k â 100k
+        asyncio.create_task(_migrate_prefs_defaults(u))  # background â don't block login
         client_location = p.client_location.model_dump() if p.client_location else None
         token = await issue_token(u["id"], request, client_location)
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
@@ -930,7 +930,7 @@ postbluom.online"""
         asyncio.create_task(run_in_bg(send_otp_email, u["email"], code))
         return {"message": "Resent", "demo_otp": code if DEMO_MODE else None}
 
-    # ── Forgot Password ───────────────────────────────────────────
+    # ââ Forgot Password âââââââââââââââââââââââââââââââââââââââââââ
     @api.post("/auth/forgot-password-init")
     async def forgot_password_init(p: ForgotPasswordInitIn):
         identifier = p.identifier.strip()
@@ -941,12 +941,12 @@ postbluom.online"""
             if identifier.startswith("+91") and len(identifier) == 13: _ph_v.append(identifier[3:])
             elif not identifier.startswith("+") and len(identifier) == 10: _ph_v.append("+91" + identifier)
             user = await db.users.find_one({"phone": {"$in": _ph_v}})
-            # Do NOT change identifier — keep frontend-sent value so verify/reset calls match
+            # Do NOT change identifier â keep frontend-sent value so verify/reset calls match
         if not user or not user.get("is_verified"):
             raise HTTPException(400, "No account found with this email or phone number")
         is_email = "@" in identifier
         # Cooldown: if a valid OTP was already sent recently, don't invalidate it with a
-        # fresh one — this previously caused "OTP arrived but verify fails" for email,
+        # fresh one â this previously caused "OTP arrived but verify fails" for email,
         # since a slow-arriving email could be invalidated by an impatient resend.
         _existing = await db.reset_otps.find_one({"identifier": identifier})
         if _existing and _existing.get("otp_sent_at") and not _existing.get("verified"):
@@ -1004,7 +1004,7 @@ postbluom.online"""
         await db.reset_otps.delete_one({"identifier": p.identifier.strip()})
         return {"message": "Password reset successfully! Please log in."}
 
-    # ── Auth Email (OTP-first flow) ───────────────────────────────
+    # ââ Auth Email (OTP-first flow) âââââââââââââââââââââââââââââââ
     @api.post("/auth/email-signup-init")
     async def email_signup_init(p: EmailInitIn):
         await purge_expired_deleted_account("email", p.email)
@@ -1070,7 +1070,7 @@ postbluom.online"""
         await db.email_otps.delete_one({"email": p.email})
         return {"token": await issue_token(uid, request), "user_id": uid, "requires_phone": True}
 
-    # ── Auth Phone ────────────────────────────────────────────────
+    # ââ Auth Phone ââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.post("/auth/phone-signup-init")
     async def phone_signup_init(p: PhoneInitIn):
         await purge_expired_deleted_account("phone", p.phone)
@@ -1151,9 +1151,9 @@ postbluom.online"""
         if not await verifypw(p.password, pw_hash_p):
             raise HTTPException(401, "Wrong password")
         if u and (_is_bcrypt(pw_hash_p) or (pw_hash_p.startswith(_PBKDF2_PREFIX) and len(pw_hash_p.split("$")) == 4)):
-            asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
+            asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k â 100k
         if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
-        asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
+        asyncio.create_task(_migrate_prefs_defaults(u))  # background â don't block login
         client_location = p.client_location.model_dump() if p.client_location else None
         token = await issue_token(u["id"], request, client_location)
         user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
@@ -1171,7 +1171,7 @@ postbluom.online"""
     async def me(u=Depends(current_user)):
         return u
 
-    # ── Add Secondary Contact ─────────────────────────────────────
+    # ââ Add Secondary Contact âââââââââââââââââââââââââââââââââââââ
     @api.post("/auth/add-phone-init")
     async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
         if u.get("signup_method") != "email": raise HTTPException(403, "Only for email-registered accounts")
@@ -1252,7 +1252,7 @@ postbluom.online"""
         await db.email_otps.delete_one({"email": p.email})
         return {"message": "Email verified successfully", "token": await issue_token(u["id"], request)}
 
-    # ── Account deletion / restore ────────────────────────────────
+    # ââ Account deletion / restore ââââââââââââââââââââââââââââââââ
     @api.post("/account/delete-request")
     async def request_account_delete(u=Depends(current_user)):
         if u.get("deleted_at"):
@@ -1350,7 +1350,7 @@ postbluom.online"""
             safe["dob"] = raw_dob
         return safe
 
-    # ── Profile ───────────────────────────────────────────────────
+    # ââ Profile âââââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.patch("/profile")
     async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
         upd = {k: v for k, v in p.model_dump().items() if v is not None}
@@ -1502,7 +1502,7 @@ postbluom.online"""
         )
         return {"ok": True}
 
-    # ── Users ─────────────────────────────────────────────────────
+    # ââ Users âââââââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.get("/users/me/blocked")
     async def get_blocked_users(u=Depends(current_user)):
         ids = u.get("blocked_users", [])
@@ -1605,7 +1605,7 @@ postbluom.online"""
             "stats": {"posts": posts_count, "followers": followers_count, "following": following_count},
         }
 
-    # ── Follow / Unfollow ─────────────────────────────────────────
+    # ââ Follow / Unfollow âââââââââââââââââââââââââââââââââââââââââ
     async def _persist_follow_notification(notification):
         try:
             await db.notifications.insert_one(notification)
@@ -1669,7 +1669,7 @@ postbluom.online"""
         ).to_list(500)
         return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
 
-    # ── Follow Requests (private accounts) ───────────────────────
+    # ââ Follow Requests (private accounts) âââââââââââââââââââââââ
     @api.post("/users/{user_id}/follow-request/cancel")
     async def cancel_follow_request(user_id: str, u=Depends(current_user)):
         await db.follow_requests.delete_one({"from_id": u["id"], "to_id": user_id})
@@ -1703,7 +1703,7 @@ postbluom.online"""
         )
         return {"ok": True}
 
-    # ── Block / Unblock ───────────────────────────────────────────
+    # ââ Block / Unblock âââââââââââââââââââââââââââââââââââââââââââ
     @api.post("/users/{user_id}/block")
     async def block_user(user_id: str, u=Depends(current_user)):
         if user_id == u["id"]: raise HTTPException(400, "Can't block yourself")
@@ -1732,7 +1732,7 @@ postbluom.online"""
         return {"ok": True}
 
 
-    # ── Posts ─────────────────────────────────────────────────────
+    # ââ Posts âââââââââââââââââââââââââââââââââââââââââââââââââââââ
     MAX_POST_VIDEO_SECONDS = 30
     MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024  # 100MB raw file, uploaded straight to Cloudinary (no base64 inflation)
 
@@ -1752,13 +1752,13 @@ postbluom.online"""
         """Raises HTTPException if the given video URL is missing/invalid or too long.
 
         Videos are now hosted on Cloudinary (real files, streamed with HTTP range
-        support) instead of being embedded as base64 data URIs — that's what used
+        support) instead of being embedded as base64 data URIs â that's what used
         to make playback stall/buffer since a data URI can't be streamed or seeked.
         """
         if not video_url:
             return
         if not (video_url.startswith("https://") or video_url.startswith("http://")):
-            raise HTTPException(400, "Invalid video URL — please upload the video again")
+            raise HTTPException(400, "Invalid video URL â please upload the video again")
         if video_duration is not None and video_duration > MAX_POST_VIDEO_SECONDS + 0.5:
             raise HTTPException(400, f"Videos must be {MAX_POST_VIDEO_SECONDS} seconds or less")
 
@@ -1821,13 +1821,13 @@ postbluom.online"""
         """Uploads a raw video file to Cloudinary and returns its streamable URL.
 
         Cloudinary serves videos over HTTP with byte-range support, so playback
-        can start immediately and seek/buffer smoothly — unlike a base64 data URI,
+        can start immediately and seek/buffer smoothly â unlike a base64 data URI,
         which forces the browser to download the entire clip up front before it
         can play anything. The original file is uploaded as-is, so quality is
         unchanged (no re-encoding/transcoding) unless a trim window is given.
 
         If start_offset/end_offset are given (seconds), the clip is cut down to
-        that window during upload — this lets users pick up to a 1-minute video
+        that window during upload â this lets users pick up to a 1-minute video
         and trim it to the 30s max before it's ever stored, keeping the same
         resolution/bitrate (only the length changes).
         """
@@ -1859,7 +1859,7 @@ postbluom.online"""
         try:
             result = await asyncio.to_thread(cloudinary.uploader.upload, file.file, **upload_kwargs)
         except Exception as e:
-            # Log the full Cloudinary error server-side only — it can include
+            # Log the full Cloudinary error server-side only â it can include
             # internal signing details ("String to sign - ...") that must never
             # be shown to end users.
             logging.exception("Cloudinary video upload failed")
@@ -1876,12 +1876,12 @@ postbluom.online"""
             "video_height": result.get("height"),  # natural video height (px) from Cloudinary
         }
 
-    # ── One-time migration: move old base64 videos to Cloudinary ────
+    # ââ One-time migration: move old base64 videos to Cloudinary ââââ
     # Posts/profile/cover videos created before the Cloudinary upload was
     # added are still stored as huge base64 "data:video/..." strings, so
     # they still stutter/buffer for existing users. This endpoint finds
     # every one of those, re-uploads the bytes to Cloudinary, and rewrites
-    # the field to the new streamable URL. Safe to call more than once —
+    # the field to the new streamable URL. Safe to call more than once â
     # already-migrated (http/https) values are skipped.
     MIGRATION_SECRET = os.environ.get("MIGRATION_SECRET", "").strip()
 
@@ -2003,24 +2003,30 @@ postbluom.online"""
                     })
                     tag_prefs = tagged_user.get("notifications_prefs", {})
                     if tag_prefs.get("tags", True):
-                        asyncio.create_task(send_push(tagged_user["id"], "Tag 🏷️", u["name"] + " tagged you in a post"))
+                        asyncio.create_task(send_push(tagged_user["id"], "Tag ð·ï¸", u["name"] + " tagged you in a post"))
             except Exception:
                 pass
         return doc
 
+    def _reel_unique_view_count(r: dict) -> int:
+        """Count distinct viewer IDs; use the stored scalar only for legacy documents without a list."""
+        raw_views = r.get("views")
+        if isinstance(raw_views, list):
+            return len({str(viewer) for viewer in raw_views if viewer is not None and str(viewer).strip()})
+        try:
+            return max(0, int(r.get("view_count") or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def _reel_to_feed_item(r: dict, mentioned: bool = False, mentioned_by: Optional[dict] = None) -> dict:
         """Shapes a raw `reels` doc so it can sit alongside `posts` docs in the
-        home feed / profile grid — same field names the frontend post card and
+        home feed / profile grid â same field names the frontend post card and
         PostMedia component already know how to render (video_url, content,
         likes as [{user_id,color}], etc). `is_reel` lets the frontend route
         interactions (like/comment/save/delete/open) to the /reels/* endpoints.
         """
         likes_ids = r.get("likes", [])
-        views_raw = r.get("views", [])
-        view_count = max(
-            len(views_raw) if isinstance(views_raw, list) else 0,
-            int(r.get("view_count") or 0),
-        )
+        view_count = _reel_unique_view_count(r)
         return {
             "id": r["id"],
             "user_id": r["user_id"],
@@ -2046,7 +2052,7 @@ postbluom.online"""
             "video_duration": r.get("duration"),
             "photo_width": None, "photo_height": None,
             # aspect_ratio: only meaningful for video reels (default 9/16).
-            # For photo reels leave None — frontend uses natural img dimensions.
+            # For photo reels leave None â frontend uses natural img dimensions.
             "aspect_ratio": (
                 r.get("aspect_ratio")
                 or (
@@ -2083,7 +2089,7 @@ postbluom.online"""
             "music_title":      r.get("music_title"),
             "music_artist":     r.get("music_artist"),
             "music_artwork":    r.get("music_artwork"),
-            # Editing overlays — must be forwarded so the home-feed card renders
+            # Editing overlays â must be forwarded so the home-feed card renders
             # stickers, text, emoji and filter identically to the full-screen viewer.
             "sticker_overlays": r.get("sticker_overlays") or [],
             "text_overlays":    r.get("text_overlays")    or [],
@@ -2185,7 +2191,7 @@ postbluom.online"""
 
         # Reels get merged into the home feed and profile grid (but not search)
         # so a shared reel shows up for followers/following, and stays on the
-        # poster's own profile — reusing the same user_id filter built above.
+        # poster's own profile â reusing the same user_id filter built above.
         include_reels = (feed or bool(user_id)) and not q and feed_user_filter is not None
         fetch_n = skip + limit
         if filter_public_authors:
@@ -2333,7 +2339,7 @@ postbluom.online"""
                 "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
                 "type": "like", "post_id": pid, "created_at": now().isoformat(), "read": False,
             })
-            asyncio.create_task(send_push(post["user_id"], "New like ♥️", u["name"] + " liked your post"))
+            asyncio.create_task(send_push(post["user_id"], "New like â¥ï¸", u["name"] + " liked your post"))
         return {"likes": likes, "total": len(likes)}
 
     @api.post("/posts/{pid}/comments")
@@ -2355,7 +2361,7 @@ postbluom.online"""
                 "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
                 "type": "comment", "post_id": pid, "created_at": now().isoformat(), "read": False,
             })
-            asyncio.create_task(send_push(post["user_id"], "New comment 💬", u["name"] + " commented on your post"))
+            asyncio.create_task(send_push(post["user_id"], "New comment ð¬", u["name"] + " commented on your post"))
         return c
 
     @api.delete("/posts/{pid}/comments/{cid}")
@@ -2536,7 +2542,7 @@ postbluom.online"""
         })
         target_prefs = target.get("notifications_prefs", {})
         if target_prefs.get("mentions", True):
-            asyncio.create_task(send_push(target["id"], "Mention 📢", u["name"] + " mentioned you in a post"))
+            asyncio.create_task(send_push(target["id"], "Mention ð¢", u["name"] + " mentioned you in a post"))
         return {"ok": True}
 
     @api.post("/reels/{reel_id}/mention")
@@ -2768,7 +2774,7 @@ postbluom.online"""
             result.append(p)
         return {"posts": result}
 
-    # ── Friends ───────────────────────────────────────────────────
+    # ââ Friends âââââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.post("/friends/request")
     async def friend_request(p: FriendIn, u=Depends(current_user)):
         if p.target_user_id == u["id"]: raise HTTPException(400, "Can't friend yourself")
@@ -2849,8 +2855,8 @@ postbluom.online"""
         for r in pending_out: r["to_user"]   = out_users.get(r["to_id"], {})
         return {"friends": friends, "pending_incoming": pending_in, "pending_outgoing": pending_out}
 
-    # ── WebSocket connection manager ────────────────────────────────
-    _ws_connections: dict = {}   # user_id → WebSocket
+    # ââ WebSocket connection manager ââââââââââââââââââââââââââââââââ
+    _ws_connections: dict = {}   # user_id â WebSocket
 
     async def _ws_push(user_id: str, payload: dict) -> bool:
         """Push a JSON payload to a connected user's WebSocket. Returns True if sent."""
@@ -2867,7 +2873,7 @@ postbluom.online"""
     @app.websocket("/ws/{user_id}")
     async def ws_endpoint(websocket: WebSocket, user_id: str):
         """Persistent WebSocket per user for real-time messaging."""
-        # ── Authenticate via ?token= query param ─────────────────
+        # ââ Authenticate via ?token= query param âââââââââââââââââ
         token_val = websocket.query_params.get("token", "")
         try:
             payload = jwt.decode(token_val, JWT_SECRET, algorithms=["HS256"])
@@ -2894,7 +2900,7 @@ postbluom.online"""
 
                 msg_type = data.get("type", "")
 
-                # ── delivered ACK: receiver got message via WS ────
+                # ââ delivered ACK: receiver got message via WS ââââ
                 if msg_type == "delivered":
                     msg_id = data.get("msg_id", "")
                     if not msg_id:
@@ -2909,14 +2915,14 @@ postbluom.online"""
                             {"id": msg_id},
                             {"$set": {"status": "delivered", "delivered_at": now().isoformat()}}
                         )
-                        # Notify sender: their ✓ upgrades to ✓✓ grey
+                        # Notify sender: their â upgrades to ââ grey
                         await _ws_push(msg["from_id"], {
                             "type": "status_update",
                             "msg_id": msg_id,
                             "status": "delivered",
                         })
 
-                # ── seen ACK: receiver opened the chat ────────────
+                # ââ seen ACK: receiver opened the chat ââââââââââââ
                 elif msg_type == "seen":
                     partner_id = data.get("partner_id", "")
                     if not partner_id:
@@ -2936,14 +2942,14 @@ postbluom.online"""
                             {"id": {"$in": ids}},
                             {"$set": {"status": "seen", "seen_at": now().isoformat()}}
                         )
-                        # Notify sender: their ✓✓ turns blue
+                        # Notify sender: their ââ turns blue
                         await _ws_push(partner_id, {
                             "type": "bulk_seen",
                             "msg_ids": ids,
                             "by_user_id": user_id,
                         })
 
-                # ── typing indicator: DM or group chat ─────────────
+                # ââ typing indicator: DM or group chat âââââââââââââ
                 elif msg_type == "typing":
                     to_uid = data.get("to_user_id", "")
                     group_id = data.get("group_id", "")
@@ -2957,7 +2963,7 @@ postbluom.online"""
                     elif to_uid:
                         await _ws_push(to_uid, {"type": "typing", "from_user_id": user_id, "is_typing": is_t})
 
-                    # ── ping / keepalive — no-op ──────────────────────
+                    # ââ ping / keepalive â no-op ââââââââââââââââââââââ
                 elif msg_type == "ping":
                     pass
 
@@ -2972,7 +2978,7 @@ postbluom.online"""
                 {"$set": {"is_online": False, "last_seen": now().isoformat()}}
             )
 
-    # ── Messages ──────────────���───────────────────────────────────
+    # ââ Messages ââââââââââââââï¿½ï¿½ï¿½âââââââââââââââââââââââââââââââââââ
 
     @api.post("/messages")
     async def send_message(p: MessageIn, u=Depends(current_user)):
@@ -3006,7 +3012,7 @@ postbluom.online"""
                 if not fr:
                     raise HTTPException(403, "Connect with this user first to message across countries")
 
-        # ── Build reply-to preview ────────────────────────────────
+        # ââ Build reply-to preview ââââââââââââââââââââââââââââââââ
         reply_to_preview = None
         if p.reply_to_id:
             ref = await db.messages.find_one(
@@ -3022,7 +3028,7 @@ postbluom.online"""
                     "has_photo": bool(ref.get("photo_url")),
                 }
 
-        # ── Build shared-post preview ─────────────────────────────
+        # ââ Build shared-post preview âââââââââââââââââââââââââââââ
         shared_post = None
         if p.shared_post_id:
             sp = await db.posts.find_one(
@@ -3043,7 +3049,7 @@ postbluom.online"""
                     "type": "post",
                 }
 
-        # ── Build shared-reel preview ─────────────────────────────
+        # ââ Build shared-reel preview âââââââââââââââââââââââââââââ
         shared_reel = None
         if p.shared_reel_id:
             sr = await db.reels.find_one(
@@ -3064,7 +3070,7 @@ postbluom.online"""
                     "type": "reel",
                 }
 
-        # ── Assemble message document ─────────────────────────────
+        # ââ Assemble message document âââââââââââââââââââââââââââââ
         m = {
             "id":               str(uuid.uuid4()),
             "from_id":          u["id"],
@@ -3075,7 +3081,7 @@ postbluom.online"""
             "gif_url":          p.gif_url,
             "mood_color":       p.mood_color,
             "created_at":       now().isoformat(),
-            "status":           "sent",           # ✓ — server received
+            "status":           "sent",           # â â server received
             "deleted_for":      [],
             "deleted_for_everyone": False,
             "reply_to_id":      p.reply_to_id or None,
@@ -3091,18 +3097,18 @@ postbluom.online"""
         # Keep direct messages in the same user-activity notification stream
         # as likes, comments, follows, tags, and mentions.
         message_preview = p.text.strip() if p.text and p.text.strip() else (
-            "📷 Photo" if p.photo_url else
+            "ð· Photo" if p.photo_url else
             ("GIF" if p.gif_url else
-            ("📎 Post" if p.shared_post_id or p.shared_reel_id else
-            ("🎤 Voice" if p.audio_url else "Message")))
+            ("ð Post" if p.shared_post_id or p.shared_reel_id else
+            ("ð¤ Voice" if p.audio_url else "Message")))
         )
         await _persist_user_activity_notification(
             p.to_user_id, u, "message", message=message_preview[:120], message_id=m["id"]
         )
 
-        # ── Push to receiver via WebSocket ────────────────────────
+        # ââ Push to receiver via WebSocket ââââââââââââââââââââââââ
         # Receiver client will reply with a "delivered" ACK that upgrades
-        # the status to "delivered" (✓✓ grey) and notifies the sender.
+        # the status to "delivered" (ââ grey) and notifies the sender.
         await _ws_push(p.to_user_id, {"type": "new_message", "message": m})
 
         return m
@@ -3250,7 +3256,7 @@ postbluom.online"""
         await db.users.update_one({"id": u["id"]}, {"$set": {"timezone_offset": float(offset)}})
         return {"ok": True}
 
-    # ── Notifications ─────────────────────────────────────────────
+    # ââ Notifications âââââââââââââââââââââââââââââââââââââââââââââ
     @api.get("/notifications")
     async def get_notifications(u=Depends(current_user)):
         notifs = await db.notifications.find(
@@ -3317,7 +3323,7 @@ postbluom.online"""
         count = await db.notifications.count_documents({"user_id": u["id"], "read": False})
         return {"unread_count": count}
 
-    # ── Settings ──────────────────────────────────────────────────
+    # ââ Settings ââââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.patch("/settings/notifications")
     async def update_notifications_prefs(p: NotificationsPrefsIn, u=Depends(current_user)):
         upd = {k: v for k, v in p.model_dump().items() if v is not None}
@@ -3344,7 +3350,7 @@ postbluom.online"""
         await db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": await hashpw(p.new_password)}})
         return {"message": "Password updated successfully"}
 
-    # ── Username check ────────────────────────────────────────────
+    # ââ Username check ââââââââââââââââââââââââââââââââââââââââââââ
     @api.get("/check-username")
     async def check_username(username: str, u=Depends(current_user)):
         if not re.match(r'^[a-z0-9_]{3,30}$', username):
@@ -3354,7 +3360,7 @@ postbluom.online"""
             return {"available": False, "reason": "Already taken"}
         return {"available": True, "reason": "Available!"}
 
-    # ── Translation ───────────────────────────────────────────────
+    # ââ Translation âââââââââââââââââââââââââââââââââââââââââââââââ
     TRANSLATE_LANG_MAP = {
         "zh": "zh-CN", "en": "en", "hi": "hi", "ur": "ur", "es": "es",
         "fr": "fr", "ar": "ar", "pt": "pt", "de": "de", "ja": "ja",
@@ -3366,15 +3372,15 @@ postbluom.online"""
     def _detect_tone_hint(text: str) -> Optional[str]:
         t = text.lower()
         if any(w in t for w in ["please","kindly","would you","could you","sir","ma'am","madam","dear"]):
-            return "Formal tone — polite phrasing used"
+            return "Formal tone â polite phrasing used"
         if any(w in t for w in ["hey","yo","sup","lol","haha","bruh","bro","sis","wanna","gonna","kinda"]):
-            return "Informal tone — casual/slang phrasing"
+            return "Informal tone â casual/slang phrasing"
         if any(w in t for w in ["urgent","asap","immediately","now","hurry","quickly"]):
-            return "Urgent tone — time-sensitive message"
+            return "Urgent tone â time-sensitive message"
         if text.endswith("?") or text.count("?") > 1:
-            return "Questioning tone — expecting a reply"
+            return "Questioning tone â expecting a reply"
         if any(w in t for w in ["sorry","apolog","forgive","excuse me","pardon"]):
-            return "Apologetic tone — expressing regret"
+            return "Apologetic tone â expressing regret"
         return None
 
     async def _translate_plain_text(value: str, tl: str) -> str:
@@ -3488,7 +3494,7 @@ postbluom.online"""
         return {"translated": translated, "tone_hint": _detect_tone_hint(text) if include_tone else None}
 
 
-    # ── Verification ─────────────────────────────────────────────────────
+    # ââ Verification âââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     async def _is_admin(u=Depends(current_user)):
         if not u.get("is_admin"):
@@ -3578,7 +3584,7 @@ postbluom.online"""
             "id": str(uuid.uuid4()), "user_id": uid,
             "from_user_id": admin["id"], "from_user_name": "POST Team",
             "type": "verification_approved",
-            "text": f"Congratulations! Your account is now verified as '{category}'. ✅",
+            "text": f"Congratulations! Your account is now verified as '{category}'. â",
             "created_at": now_str, "read": False,
         })
         return {"ok": True}
@@ -3623,7 +3629,7 @@ postbluom.online"""
             "id": str(uuid.uuid4()), "user_id": p.user_id,
             "from_user_id": admin["id"], "from_user_name": "POST Team",
             "type": "verification_approved",
-            "text": f"Congratulations! Your account is now verified as '{p.category}'. ✅",
+            "text": f"Congratulations! Your account is now verified as '{p.category}'. â",
             "created_at": now_str, "read": False,
         })
         return {"ok": True}
@@ -3662,15 +3668,15 @@ postbluom.online"""
         await db.users.update_one({"id": user_id}, {"$set": {"is_admin": new_val}})
         return {"ok": True, "is_admin": new_val}
 
-    # ── Health ────────────────────────────────────────────────────
+    # ââ Health ââââââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.get("/")
     async def root():
         return {"status": "ok", "demo_mode": DEMO_MODE, "twilio": bool(TWILIO_SID), "version": "5.0"}
 
-    # ── Startup: indexes ──────────────────────────────────────────
+    # ââ Startup: indexes ââââââââââââââââââââââââââââââââââââââââââ
     @app.on_event("startup")
     async def create_indexes():
-        # Each index is created independently — a name/option conflict on one
+        # Each index is created independently â a name/option conflict on one
         # (e.g. an older non-sparse "username_1" index already existing) must
         # not abort the rest. Previously all calls shared a single try/except,
         # so a conflict on an early index (users.username) silently skipped
@@ -3738,9 +3744,9 @@ postbluom.online"""
                         logging.warning(f"Index rebuild failed ({collection.name}.{keys}): {e2}")
                 else:
                     logging.warning(f"Index creation warning ({collection.name}.{keys}): {e}")
-        logging.info(f"✅ MongoDB indexes created ({ok_count}/{len(index_specs)})")
+        logging.info(f"â MongoDB indexes created ({ok_count}/{len(index_specs)})")
 
-    # ── Startup: make official account an admin + verified ──────────
+    # ââ Startup: make official account an admin + verified ââââââââââ
     @app.on_event("startup")
     async def promote_official_account():
         if not OFFICIAL_ACCOUNT_ID:
@@ -3761,30 +3767,30 @@ postbluom.online"""
                     {"user_id": OFFICIAL_ACCOUNT_ID},
                     {"$set": {"is_badge_verified": True, "verified_category": "Business / Brand"}},
                 )
-                logging.info("✅ Official account promoted to admin + verified badge")
+                logging.info("â Official account promoted to admin + verified badge")
             else:
-                logging.warning("⚠️ OFFICIAL_ACCOUNT_ID set but no matching user found")
+                logging.warning("â ï¸ OFFICIAL_ACCOUNT_ID set but no matching user found")
         except Exception as e:
             logging.warning(f"Official account admin promotion warning: {e}")
 
-    # ── Startup: seed demo users ──────────────────────────────────
+    # ââ Startup: seed demo users ââââââââââââââââââââââââââââââââââ
     @app.on_event("startup")
     async def seed():
         if await db.users.count_documents({"is_seed": True}) > 0:
             return
         WORLD = [
-            ("Aryan",  "@aryan_world",  "Mumbai, India",         "Photographer & traveller 📷", "Asia",     "#FFD600"),
-            ("Bella",  "@bella_creates","London, UK",            "Designer. Coffee lover ☕",    "Europe",   "#00C853"),
-            ("Carlos", "@carlos_global","Mexico City",           "Entrepreneur 🚀",             "Americas", "#29B6F6"),
-            ("Yuki",   "@yuki_jp",      "Tokyo, Japan",          "Manga artist 🎨",             "Asia",     "#00C853"),
-            ("Fatima", "@fatima_sa",    "Riyadh, Saudi Arabia",  "Writer & poet ✍️",            "Asia",     "#FF1744"),
-            ("Pierre", "@pierre_fr",    "Paris, France",         "Chef & food blogger 🥐",      "Europe",   "#FF1744"),
-            ("Lucas",  "@lucas_br",     "São Paulo, Brazil",     "Carnaval organizer 🎉",       "Americas", "#00C853"),
-            ("Chioma", "@chioma_ng",    "Lagos, Nigeria",        "Fashion designer 👗",         "Africa",   "#29B6F6"),
-            ("Jack",   "@jack_au",      "Sydney, Australia",     "Surfer & barista ☕",          "Oceania",  "#00C853"),
-            ("Soo-Jin","@soojin_kr",    "Seoul, South Korea",    "K-pop enthusiast 🎵",         "Asia",     "#FF1744"),
-            ("Anna",   "@anna_se",      "Stockholm, Sweden",     "Environmentalist 🌿",         "Europe",   "#29B6F6"),
-            ("Amara",  "@amara_ke",     "Nairobi, Kenya",        "Safari guide 🦁",             "Africa",   "#FFD600"),
+            ("Aryan",  "@aryan_world",  "Mumbai, India",         "Photographer & traveller ð·", "Asia",     "#FFD600"),
+            ("Bella",  "@bella_creates","London, UK",            "Designer. Coffee lover â",    "Europe",   "#00C853"),
+            ("Carlos", "@carlos_global","Mexico City",           "Entrepreneur ð",             "Americas", "#29B6F6"),
+            ("Yuki",   "@yuki_jp",      "Tokyo, Japan",          "Manga artist ð¨",             "Asia",     "#00C853"),
+            ("Fatima", "@fatima_sa",    "Riyadh, Saudi Arabia",  "Writer & poet âï¸",            "Asia",     "#FF1744"),
+            ("Pierre", "@pierre_fr",    "Paris, France",         "Chef & food blogger ð¥",      "Europe",   "#FF1744"),
+            ("Lucas",  "@lucas_br",     "SÃ£o Paulo, Brazil",     "Carnaval organizer ð",       "Americas", "#00C853"),
+            ("Chioma", "@chioma_ng",    "Lagos, Nigeria",        "Fashion designer ð",         "Africa",   "#29B6F6"),
+            ("Jack",   "@jack_au",      "Sydney, Australia",     "Surfer & barista â",          "Oceania",  "#00C853"),
+            ("Soo-Jin","@soojin_kr",    "Seoul, South Korea",    "K-pop enthusiast ðµ",         "Asia",     "#FF1744"),
+            ("Anna",   "@anna_se",      "Stockholm, Sweden",     "Environmentalist ð¿",         "Europe",   "#29B6F6"),
+            ("Amara",  "@amara_ke",     "Nairobi, Kenya",        "Safari guide ð¦",             "Africa",   "#FFD600"),
         ]
         for name, handle, loc, about, continent, color in WORLD:
             uid = str(uuid.uuid4())
@@ -3796,17 +3802,17 @@ postbluom.online"""
                 "created_at": now(), "followers": [], "following": [], "blocked_users": [],
                 "notifications_prefs": {"likes": True, "comments": True, "friend_requests": True, "messages": True, "mentions": True, "tags": True},
             })
-        logging.info("✅ World users seeded")
+        logging.info("â World users seeded")
 
-    # ── Self-ping keepalive (prevents Render free tier sleep) ────
-    # List holds a strong ref to the task — no nonlocal / global needed
+    # ââ Self-ping keepalive (prevents Render free tier sleep) ââââ
+    # List holds a strong ref to the task â no nonlocal / global needed
     _keepalive_holder = []
 
     @app.on_event("startup")
     async def keepalive_self_ping():
         import urllib.request as _ur2
         # Render only resets its 15-min inactivity/sleep timer on requests that
-        # arrive through its public edge — pinging 127.0.0.1 never reaches the
+        # arrive through its public edge â pinging 127.0.0.1 never reaches the
         # edge, so it did NOT prevent the free-tier service from sleeping.
         # RENDER_EXTERNAL_URL is auto-injected by Render with the real public
         # URL (e.g. https://post-app-backend.onrender.com); use that instead,
@@ -3817,7 +3823,7 @@ postbluom.online"""
         else:
             port = os.environ.get("PORT", "10000")
             ping_url = f"http://127.0.0.1:{port}/api/ping"
-        logging.info(f"[KeepAlive] starting → {ping_url} every 10 min")
+        logging.info(f"[KeepAlive] starting â {ping_url} every 10 min")
 
         async def _ping_loop():
             await asyncio.sleep(30)   # let server fully boot first
@@ -3828,25 +3834,25 @@ postbluom.online"""
             while True:
                 try:
                     await loop.run_in_executor(None, _do_ping)
-                    logging.info("[KeepAlive] ✅ ping OK — server awake")
+                    logging.info("[KeepAlive] â ping OK â server awake")
                 except Exception as _pe:
-                    logging.warning(f"[KeepAlive] ⚠️ ping failed: {_pe}")
-                await asyncio.sleep(10 * 60)   # every 10 min — safe margin under 15 min limit
+                    logging.warning(f"[KeepAlive] â ï¸ ping failed: {_pe}")
+                await asyncio.sleep(10 * 60)   # every 10 min â safe margin under 15 min limit
 
         task = asyncio.ensure_future(_ping_loop())
-        _keepalive_holder.append(task)   # strong ref → GC can never collect this
+        _keepalive_holder.append(task)   # strong ref â GC can never collect this
 
-    # ── Shutdown ──────────────────────────────────────────────────
+    # ââ Shutdown ââââââââââââââââââââââââââââââââââââââââââââââââââ
     @app.on_event("shutdown")
     async def shutdown():
         client.close()
 
-    # ── Health / keep-alive ping ─────────────────────────────────
+    # ââ Health / keep-alive ping âââââââââââââââââââââââââââââââââ
     @api.get("/ping")
     async def ping():
         return {"ok": True}
 
-    # ── Join World ────────────────────────────────────────────────
+    # ââ Join World ââââââââââââââââââââââââââââââââââââââââââââââââ
     _NEWS_NATIVE = {
         "top": "general", "business": "business", "technology": "technology",
         "sports": "sports", "health": "health", "science": "science",
@@ -4106,7 +4112,7 @@ postbluom.online"""
         await db.world_reports.delete_one({"id": report_id})
         return {"ok": True}
 
-    # ── Reels ─────────────────────────────────────────────────────
+    # ââ Reels âââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     @api.post("/reels/upload-signature")
     async def sign_reel_upload(u=Depends(current_user)):
@@ -4206,7 +4212,7 @@ postbluom.online"""
         if not video_url and not photo_url:
             raise HTTPException(400, "video_url or photo_url is required")
         if not is_photo_reel and (duration < 1 or duration > MAX_POST_VIDEO_SECONDS):
-            raise HTTPException(400, f"Reel must be 1–{MAX_POST_VIDEO_SECONDS} seconds")
+            raise HTTPException(400, f"Reel must be 1â{MAX_POST_VIDEO_SECONDS} seconds")
         doc = {
             "id":                str(uuid.uuid4()),
             "user_id":           u["id"],
@@ -4351,8 +4357,7 @@ postbluom.online"""
         if not any(str(row.get("id")) == str(reel_id) for row in rows):
             rows.insert(0, source)
         for row in rows:
-            embedded_views = row.get("views") if isinstance(row.get("views"), list) else []
-            row["view_count"] = max(len(embedded_views), int(row.get("view_count") or 0))
+            row["view_count"] = _reel_unique_view_count(row)
             row.pop("likes", None)
             row.pop("saves", None)
             row.pop("comments", None)
@@ -4414,7 +4419,7 @@ postbluom.online"""
                     age_hours = 0
             except Exception:
                 age_hours = 0
-            _va=r.get("views",[]); views=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+            views = _reel_unique_view_count(r)
             likes = len(r.get("likes") or [])
             comments = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
             shares = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
@@ -4453,7 +4458,7 @@ postbluom.online"""
             r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
             r["mention_count"] = mention_counts.get(r["id"], int(r.get("mention_count") or 0))
             r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
-            _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+            r["view_count"] = _reel_unique_view_count(r)
             r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
         return {"reels": page, "has_more": (skip + limit) < len(reels_raw), "skip": skip, "limit": limit}
 
@@ -4472,10 +4477,13 @@ postbluom.online"""
         except (TypeError, ValueError):
             completion_ratio = 0.0
         category = str(payload.get("category") or reel.get("category") or "general").strip().lower()[:40] or "general"
-        await db.reels.update_one(
-            {"id": reel_id},
+        # The filter and update are one atomic Mongo operation: repeated or concurrent
+        # requests from this user cannot increment this reel's count twice.
+        view_update = await db.reels.update_one(
+            {"id": reel_id, "views": {"$ne": u["id"]}},
             {"$addToSet": {"views": u["id"]}, "$inc": {"view_count": 1}},
         )
+        counted_view = view_update.modified_count > 0
         await db.reel_view_events.insert_one({
             "user_id": u["id"],
             "reel_id": reel_id,
@@ -4485,12 +4493,13 @@ postbluom.online"""
             "completion_ratio": completion_ratio,
             "event_at": now().isoformat(),
         })
-        await db.reel_rank_stats.update_one(
-            {"reel_id": reel_id},
-            {"$inc": {"total_views": 1, "completion_sum": completion_ratio, "watch_seconds_sum": watch_seconds},
-             "$set": {"reel_id": reel_id, "updated_at": now().isoformat()}},
-            upsert=True,
-        )
+        if counted_view:
+            await db.reel_rank_stats.update_one(
+                {"reel_id": reel_id},
+                {"$inc": {"total_views": 1, "completion_sum": completion_ratio, "watch_seconds_sum": watch_seconds},
+                 "$set": {"reel_id": reel_id, "updated_at": now().isoformat()}},
+                upsert=True,
+            )
         return {"ok": True}
 
     @api.get("/search")
@@ -4532,7 +4541,7 @@ postbluom.online"""
                 r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
                 r["share_count"]  = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
                 r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
-                _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+                r["view_count"] = _reel_unique_view_count(r)
                 r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
             results["reels"] = reels_found
 
@@ -4824,7 +4833,7 @@ postbluom.online"""
         return {"ok": True}
 
 
-    # ── Group Chat ─────────────────────────────────────────────────
+    # ââ Group Chat âââââââââââââââââââââââââââââââââââââââââââââââââ
     class GroupIn(BaseModel):
         name: str
         member_ids: List[str] = []
@@ -5019,7 +5028,7 @@ postbluom.online"""
         }
         await db.group_messages.insert_one(doc.copy())
         doc.pop("_id", None)
-        last_text = p.text.strip() or ("🎤 Voice" if p.audio_url else ("📷 Photo" if p.photo_url else ("GIF" if p.gif_url else ("📎 Post" if p.shared_post_id else ""))))
+        last_text = p.text.strip() or ("ð¤ Voice" if p.audio_url else ("ð· Photo" if p.photo_url else ("GIF" if p.gif_url else ("ð Post" if p.shared_post_id else ""))))
         await db.groups.update_one({"id": group_id}, {"$set": {"last_message": last_text, "last_message_at": now().isoformat(), "last_from_name": u["name"]}})
         for mid in [m for m in g.get("members", []) if m != u["id"]]:
             await _persist_user_activity_notification(
@@ -5028,7 +5037,7 @@ postbluom.online"""
             )
         return doc
 
-    # ── Group – leave / clear chat / invite link ──────────────────
+    # ââ Group â leave / clear chat / invite link ââââââââââââââââââ
     # NOTE: literal-path routes (/leave, /clear, /invite-link) must be defined
     # BEFORE any parametric routes (/{msg_id}) so FastAPI matches them correctly.
 
@@ -5101,7 +5110,7 @@ postbluom.online"""
             await db.group_messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
         return {"ok": True}
 
-    # ── Call Signaling (WebRTC polling) ───────────────────────────
+    # ââ Call Signaling (WebRTC polling) âââââââââââââââââââââââââââ
     _call_state: dict = {}
     _CALL_STATE_MAX = 200
     _CALL_SIGNAL_MAX_COUNT = 200
@@ -5256,7 +5265,7 @@ postbluom.online"""
         return {"call": None}
 
 
-    # ── GIF proxy (Giphy) ─────────────────────────────────────────────────────
+    # ââ GIF proxy (Giphy) âââââââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.get("/gifs")
     async def gif_proxy(q: str = Query("", max_length=200), limit: int = Query(30, ge=1, le=50)):
         import httpx
@@ -5293,7 +5302,7 @@ postbluom.online"""
                 pass
         return {"gifs": gifs}
 
-    # ── Stickers proxy (Giphy) ────────────────────────────────────────────────
+    # ââ Stickers proxy (Giphy) ââââââââââââââââââââââââââââââââââââââââââââââââ
     @api.get("/stickers")
     async def sticker_proxy(q: str = Query("", max_length=200), limit: int = Query(30, ge=1, le=50)):
         import httpx
@@ -5330,7 +5339,7 @@ postbluom.online"""
                 pass
         return {"stickers": stickers}
 
-    # ── Security helpers ──────────────────────────────────────────────────────
+    # ââ Security helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     def _parse_device_name(ua: str) -> str:
         """Extract human-readable device name from User-Agent."""
         ua_lower = ua.lower()
@@ -5349,7 +5358,7 @@ postbluom.online"""
         if ua.strip(): return ua[:40]
         return "Unknown device"
 
-    # ── Security & Sessions endpoints ─────────────────────────────────────────
+    # ââ Security & Sessions endpoints âââââââââââââââââââââââââââââââââââââââââ
     @api.get("/security/sessions")
     async def get_security_sessions(request: Request, u=Depends(current_user)):
         current_sid = u.get("_current_session_id")
@@ -5383,7 +5392,7 @@ postbluom.online"""
         return {"ok": True}
 
 
-    # ── Our Planet: public Earth explorer adapters ───────────────────────────
+    # ââ Our Planet: public Earth explorer adapters âââââââââââââââââââââââââââ
     _PLANET_CONTACT_EMAIL = os.environ.get("OUR_PLANET_CONTACT_EMAIL", "support@postbluom.online").strip()
     _PLANET_UA = f"PostApp-OurPlanet/1.0 ({_PLANET_CONTACT_EMAIL})"
     _PLANET_CACHE = {}
@@ -5462,12 +5471,12 @@ postbluom.online"""
         parameter = (power.get("properties") or {}).get("parameter") or {}
         climate=[]
         if current:
-            climate.append(f"Live conditions: {current.get('temperature','—')}°C, wind {current.get('windspeed','—')} km/h")
+            climate.append(f"Live conditions: {current.get('temperature','â')}Â°C, wind {current.get('windspeed','â')} km/h")
             highs, lows, rain = daily.get("temperature_2m_max") or [], daily.get("temperature_2m_min") or [], daily.get("precipitation_sum") or []
-            if highs or lows: climate.append(f"Today's forecast: {highs[0] if highs else '—'}°C high / {lows[0] if lows else '—'}°C low")
+            if highs or lows: climate.append(f"Today's forecast: {highs[0] if highs else 'â'}Â°C high / {lows[0] if lows else 'â'}Â°C low")
             if rain: climate.append(f"Precipitation today: {rain[0]} mm")
         if parameter:
-            climate.extend([f"Long-term temperature: {parameter.get('T2M',{}).get('ANN','—')}°C",f"Average precipitation: {parameter.get('PRECTOTCORR',{}).get('ANN','—')} mm/day",f"Average solar energy: {parameter.get('ALLSKY_SFC_SW_DWN',{}).get('ANN','—')} kWh/m²/day"])
+            climate.extend([f"Long-term temperature: {parameter.get('T2M',{}).get('ANN','â')}Â°C",f"Average precipitation: {parameter.get('PRECTOTCORR',{}).get('ANN','â')} mm/day",f"Average solar energy: {parameter.get('ALLSKY_SFC_SW_DWN',{}).get('ANN','â')} kWh/mÂ²/day"])
         environment=None
         if _PLANET_GFW_KEY:
             try:
@@ -5807,8 +5816,14 @@ postbluom.online"""
             stats[row["reel_id"]] = dict(row)
         all_time = await db.reel_view_events.aggregate([
             {"$match": {"reel_id": {"$in": reel_ids}}},
+            {"$sort": {"event_at": 1}},
             {"$group": {
-                "_id": "$reel_id",
+                "_id": {"reel_id": "$reel_id", "user_id": "$user_id"},
+                "completion_ratio": {"$first": {"$ifNull": ["$completion_ratio", 0]}},
+                "watch_seconds": {"$first": {"$ifNull": ["$watch_seconds", 0]}},
+            }},
+            {"$group": {
+                "_id": "$_id.reel_id",
                 "total_views": {"$sum": 1},
                 "completion_sum": {"$sum": "$completion_ratio"},
                 "watch_seconds_sum": {"$sum": "$watch_seconds"},
@@ -5817,7 +5832,7 @@ postbluom.online"""
         for row in all_time:
             reel_stats = stats.setdefault(row["_id"], {})
             total_views = int(row.get("total_views") or 0)
-            reel_stats["total_views"] = max(int(reel_stats.get("total_views") or 0), total_views)
+            reel_stats["total_views"] = total_views
             reel_stats["completion_sum"] = float(row.get("completion_sum") or 0)
             reel_stats["watch_seconds_sum"] = float(row.get("watch_seconds_sum") or 0)
             reel_stats["avg_completion"] = float(row.get("completion_sum") or 0) / max(total_views, 1)
@@ -5825,9 +5840,13 @@ postbluom.online"""
         hourly = await db.reel_view_events.aggregate([
             {"$match": {"reel_id": {"$in": reel_ids}, "event_at": {"$gte": since}}},
             {"$group": {
-                "_id": "$reel_id",
+                "_id": {"reel_id": "$reel_id", "user_id": "$user_id"},
+                "watch_seconds_1h": {"$sum": {"$ifNull": ["$watch_seconds", 0]}},
+            }},
+            {"$group": {
+                "_id": "$_id.reel_id",
                 "views_1h": {"$sum": 1},
-                "watch_seconds_1h": {"$sum": "$watch_seconds"},
+                "watch_seconds_1h": {"$sum": "$watch_seconds_1h"},
             }},
         ]).to_list(len(reel_ids))
         for row in hourly:
@@ -5904,7 +5923,7 @@ postbluom.online"""
                 "created_at": 1,
                 "duration": 1,
                 "mention_count": 1,
-                "_rank_view_count": {"$max": [_reel_array_size("$views"), _reel_count_value("$view_count")]},
+                "_rank_view_count": {"$cond": [{"$isArray": "$views"}, {"$size": {"$setUnion": ["$views", []]}}, _reel_count_value("$view_count")]},
                 "_rank_like_count": _reel_array_size("$likes"),
                 "_rank_comment_count": {"$max": [_reel_array_size("$comments"), _reel_count_value("$comment_count")]},
                 "_rank_comment_likes": {"$reduce": {
@@ -6021,8 +6040,8 @@ postbluom.online"""
             if not reel_id:
                 continue
             stats = live_stats.get(reel_id, {})
-            total_views = max(int(reel.get("_rank_view_count") or 0), int(stats.get("total_views") or 0), 1)
-            observed_views = max(int(stats.get("total_views") or 0), 1)
+            total_views = max(int(reel.get("_rank_view_count") or 0), 1)
+            observed_views = total_views
             completion_sum = float(stats.get("completion_sum") or 0)
             completion = completion_sum / observed_views if completion_sum else float(stats.get("avg_completion") or 0)
             avg_watch_seconds = float(stats.get("watch_seconds_sum") or 0) / observed_views
@@ -6159,7 +6178,7 @@ postbluom.online"""
                 "save_count": max(len(item.get("saves") or []), int(item.get("save_count") or 0)),
                 "comment_count": max(len(item.get("comments") or []), int(item.get("comment_count") or 0)),
                 "share_count": max(len(item.get("shares") or []), int(item.get("share_count") or 0)),
-                "view_count": max(len(item.get("views") or []), int(item.get("view_count") or 0)),
+                "view_count": _reel_unique_view_count(item),
                 "mention_count": int(item.get("mention_count") or 0),
                 "ranking_signals": item.get("ranking_signals") or {},
                 "is_viral": bool(item.get("is_viral")),
@@ -6229,7 +6248,7 @@ postbluom.online"""
                 "_id": 0,
                 "id": 1,
                 "mention_count": 1,
-                "content_views": {"$max": [_array_size("$views"), _count_value("$view_count")]},
+                "content_views": {"$cond": [{"$isArray": "$views"}, {"$size": {"$setUnion": ["$views", []]}}, _count_value("$view_count")]},
                 "likes": _array_size("$likes"),
                 "comments": _array_size("$comments"),
                 "comment_likes": {"$reduce": {
@@ -6294,7 +6313,7 @@ postbluom.online"""
     app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
     app.include_router(library_router, prefix="/api/library", tags=["library"])
 
-    print("==> [DIAG] server.py loaded OK — app is ready", file=_sys.stderr, flush=True)
+    print("==> [DIAG] server.py loaded OK â app is ready", file=_sys.stderr, flush=True)
 
 except Exception as _boot_err:
     print(f"==> [DIAG] FATAL BOOT ERROR: {type(_boot_err).__name__}: {_boot_err}", file=_sys.stderr, flush=True)
