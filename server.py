@@ -35,6 +35,7 @@ try:
     # ── Cloudinary (video/photo hosting — enables smooth streaming) ──
     import cloudinary
     import cloudinary.uploader
+    import cloudinary.api
     CLOUDINARY_URL        = os.environ.get("CLOUDINARY_URL", "").strip()
     CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
     CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY", "").strip()
@@ -72,7 +73,7 @@ try:
         }
 
     def _safe_media_stage(*fields: str) -> dict:
-        updates = {field: _safe_media_url_expression("$" + field) for field in fields if field != "photo_urls"}
+        updates = {field: _safe_media_url_expression("$" + field) for field in fields if field not in {"photo_urls", "comments"}}
         if "photo_urls" in fields:
             mapped_urls = {
                 "$map": {
@@ -83,6 +84,21 @@ try:
             }
             updates["photo_urls"] = {
                 "$filter": {"input": mapped_urls, "as": "media_url", "cond": {"$ne": ["$" + "$media_url", None]}}
+            }
+        if "comments" in fields:
+            comment_ref = "$" + "$comment"
+            updates["comments"] = {
+                "$map": {
+                    "input": {"$cond": [{"$isArray": "$comments"}, "$comments", []]},
+                    "as": "comment",
+                    "in": {
+                        "$cond": [
+                            {"$eq": [{"$type": comment_ref}, "object"]},
+                            {"$mergeObjects": [comment_ref, {"avatar_photo": _safe_media_url_expression(comment_ref + ".avatar_photo")}]},
+                            comment_ref,
+                        ]
+                    },
+                }
             }
         return {"$set": updates}
 
@@ -1949,75 +1965,230 @@ postbluom.online"""
             "video_height": result.get("height"),  # natural video height (px) from Cloudinary
         }
 
-    # ── One-time migration: move old base64 videos to Cloudinary ────
-    # Posts/profile/cover videos created before the Cloudinary upload was
-    # added are still stored as huge base64 "data:video/..." strings, so
-    # they still stutter/buffer for existing users. This endpoint finds
-    # every one of those, re-uploads the bytes to Cloudinary, and rewrites
-    # the field to the new streamable URL. Safe to call more than once —
-    # already-migrated (http/https) values are skipped.
+    # ── Bounded migration: legacy inline media to Cloudinary ────────
     MIGRATION_SECRET = os.environ.get("MIGRATION_SECRET", "").strip()
+    _MEDIA_MIGRATION_SPECS = [
+        ("users", ("avatar_photo", "profile_video", "cover_photo", "cover_video")),
+        ("posts", ("photo_url", "photo_urls", "video_url", "avatar_photo", "comments.avatar_photo")),
+        ("reels", ("photo_url", "video_url", "avatar_photo", "comments.avatar_photo")),
+        ("world_reports", ("photo_url", "avatar_photo", "comments.avatar_photo")),
+        ("groups", ("avatar_photo",)),
+        ("messages", ("photo_url", "from_avatar_photo", "reply_to_preview.photo_url", "shared_post.photo_url", "shared_post.avatar_photo", "shared_reel.video_url", "shared_reel.photo_url", "shared_reel.avatar_photo")),
+        ("group_messages", ("photo_url", "from_avatar_photo", "reply_to_preview.photo_url", "shared_post.photo_url", "shared_post.avatar_photo", "shared_reel.video_url", "shared_reel.photo_url", "shared_reel.avatar_photo")),
+    ]
+    _MEDIA_MIGRATION_MAX_PATHS_PER_DOCUMENT = 6
+    _MEDIA_MIGRATION_MAX_URI_BYTES = 16 * 1024 * 1024
 
-    def _decode_data_uri_video(data_uri: str) -> bytes:
-        header, _, b64data = data_uri.partition(",")
-        return base64.b64decode(b64data)
+    def _legacy_media_query(fields):
+        media_pattern = {"$regex": "^data:(image|video)/", "$options": "i"}
+        return {"$or": [{field: media_pattern} for field in fields]}
 
-    async def _migrate_one_video(data_uri: str, public_id: str) -> Optional[str]:
+    def _collect_media_at_path(value, parts, mongo_path, results, max_results):
+        if len(results) >= max_results:
+            return
+        if not parts:
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    if len(results) >= max_results:
+                        break
+                    item_path = f"{mongo_path}.{index}" if mongo_path else str(index)
+                    _collect_media_at_path(item, [], item_path, results, max_results)
+            elif isinstance(value, str) and re.match(r"^data:(?:image|video)/", value, re.IGNORECASE):
+                results.append((mongo_path, value))
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                if len(results) >= max_results:
+                    break
+                item_path = f"{mongo_path}.{index}" if mongo_path else str(index)
+                _collect_media_at_path(item, parts, item_path, results, max_results)
+        elif isinstance(value, dict) and parts[0] in value:
+            key = parts[0]
+            next_path = f"{mongo_path}.{key}" if mongo_path else key
+            _collect_media_at_path(value[key], parts[1:], next_path, results, max_results)
+
+    def _decode_legacy_media(data_uri):
+        if len(data_uri) > _MEDIA_MIGRATION_MAX_URI_BYTES:
+            raise ValueError("Legacy media exceeds the migration size limit")
+        header, separator, payload = data_uri.partition(",")
+        if not separator or not header.lower().startswith("data:"):
+            raise ValueError("Invalid data URI")
+        mime_type = header[5:].split(";", 1)[0].lower()
+        if mime_type.startswith("video/"):
+            resource_type = "video"
+        elif mime_type.startswith("image/"):
+            resource_type = "image"
+        else:
+            raise ValueError("Unsupported legacy media type")
+        raw = (
+            base64.b64decode(payload)
+            if ";base64" in header.lower()
+            else urllib.parse.unquote_to_bytes(payload)
+        )
+        if not raw:
+            raise ValueError("Empty legacy media")
+        return raw, resource_type
+
+    async def _migrate_one_media(data_uri, url_cache):
+        raw = resource_type = public_id = cache_key = None
         try:
-            raw = _decode_data_uri_video(data_uri)
-            result = await _cloudinary_upload(
-                cloudinary.uploader.upload_large,
-                io.BytesIO(raw),
-                chunk_size=_CLOUDINARY_CHUNK_SIZE,
-                resource_type="video", folder="post-app/videos-migrated",
-                public_id=public_id, overwrite=False,
-            )
-            return result.get("secure_url")
-        except Exception:
-            logging.exception(f"Video migration failed for {public_id}")
+            raw, resource_type = _decode_legacy_media(data_uri)
+            digest = _hl.sha256(raw).hexdigest()[:40]
+            cache_key = f"{resource_type}:{digest}"
+            if cache_key in url_cache:
+                return url_cache[cache_key]
+            public_id = f"legacy_{digest}"
+            upload_options = {
+                "resource_type": resource_type,
+                "folder": "post-app/legacy-media",
+                "public_id": public_id,
+                "overwrite": False,
+            }
+            if resource_type == "video":
+                upload_fn = cloudinary.uploader.upload_large
+                upload_options["chunk_size"] = _CLOUDINARY_CHUNK_SIZE
+            else:
+                upload_fn = cloudinary.uploader.upload
+            result = await _cloudinary_upload(upload_fn, io.BytesIO(raw), **upload_options)
+            secure_url = result.get("secure_url")
+            if secure_url:
+                url_cache[cache_key] = secure_url
+            return secure_url
+        except Exception as upload_error:
+            if raw is not None and resource_type and public_id and cache_key:
+                try:
+                    resource_path = f"post-app/legacy-media/{public_id}"
+                    existing = await _cloudinary_upload(
+                        cloudinary.api.resource, resource_path, resource_type=resource_type,
+                    )
+                    secure_url = existing.get("secure_url")
+                    if secure_url:
+                        url_cache[cache_key] = secure_url
+                        return secure_url
+                except Exception:
+                    pass
+            logging.warning("Legacy media upload failed (%s)", type(upload_error).__name__)
             return None
 
-    @api.post("/admin/migrate-videos-to-cloudinary")
-    async def migrate_videos_to_cloudinary(request: Request):
+    async def _migrate_media_document(collection, doc, fields, url_cache):
+        paths = []
+        for field in fields:
+            if len(paths) >= _MEDIA_MIGRATION_MAX_PATHS_PER_DOCUMENT:
+                break
+            _collect_media_at_path(doc, field.split("."), "", paths, _MEDIA_MIGRATION_MAX_PATHS_PER_DOCUMENT)
+        updates = {}
+        source_checks = []
+        failed = 0
+        for mongo_path, data_uri in paths:
+            secure_url = await _migrate_one_media(data_uri, url_cache)
+            if secure_url:
+                updates[mongo_path] = secure_url
+                source_checks.append({mongo_path: data_uri})
+            else:
+                failed += 1
+        if not updates:
+            return 0, failed, 0
+        result = await collection.update_one(
+            {"id": doc.get("id"), "$and": source_checks},
+            {"$set": updates},
+        )
+        if not result.matched_count:
+            return 0, failed, 1
+        return len(updates), failed, 0
+
+    def _encode_media_migration_cursor(collection_index, after_id):
+        payload = _json.dumps({"collection": collection_index, "after": after_id}, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+    def _decode_media_migration_cursor(cursor):
+        if not cursor:
+            return 0, None
+        try:
+            payload = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            state = _json.loads(payload.decode())
+            collection_index = state.get("collection")
+            after_id = state.get("after")
+            if type(collection_index) is not int or not 0 <= collection_index < len(_MEDIA_MIGRATION_SPECS):
+                raise ValueError("Invalid collection cursor")
+            if after_id is not None and not isinstance(after_id, str):
+                raise ValueError("Invalid document cursor")
+            return collection_index, after_id
+        except Exception:
+            raise HTTPException(400, "Invalid migration cursor")
+
+    @api.post("/admin/migrate-media-to-cloudinary")
+    @api.post("/admin/migrate-videos-to-cloudinary", include_in_schema=False)
+    async def migrate_media_to_cloudinary(
+        request: Request,
+        batch_size: int = Query(10, ge=1, le=20),
+        cursor: Optional[str] = Query(None, max_length=512),
+    ):
         if not MIGRATION_SECRET or request.headers.get("x-migration-key") != MIGRATION_SECRET:
             raise HTTPException(403, "Not authorized")
         if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
-            raise HTTPException(500, "Video hosting is not configured on the server")
+            raise HTTPException(500, "Cloudinary is not configured")
 
-        posts_migrated, posts_failed = 0, 0
-        users_migrated, users_failed = 0, 0
+        collection_index, after_id = _decode_media_migration_cursor(cursor)
+        documents_processed = media_migrated = media_failed = conflicts = 0
+        url_cache = {}
+        next_cursor = None
 
-        async for post in db.posts.find({"video_url": {"$regex": "^data:video/"}}):
-            new_url = await _migrate_one_video(post["video_url"], f"post_{post['id']}")
-            if new_url:
-                await db.posts.update_one({"id": post["id"]}, {"$set": {"video_url": new_url}})
-                posts_migrated += 1
-            else:
-                posts_failed += 1
+        while collection_index < len(_MEDIA_MIGRATION_SPECS):
+            if documents_processed >= batch_size:
+                next_cursor = _encode_media_migration_cursor(collection_index, after_id)
+                break
+            collection_name, fields = _MEDIA_MIGRATION_SPECS[collection_index]
+            clauses = [_legacy_media_query(fields)]
+            if after_id is not None:
+                clauses.append({"id": {"$gt": after_id}})
+            query = clauses[0] if len(clauses) == 1 else {"$and": clauses}
+            remaining_budget = batch_size - documents_processed
+            cursor_query = getattr(db, collection_name).find(query, {"_id": 0}).sort("id", 1).limit(remaining_budget + 1).batch_size(1)
+            collection_count = 0
+            more_in_collection = False
 
-        async for user in db.users.find({
-            "$or": [
-                {"profile_video": {"$regex": "^data:video/"}},
-                {"cover_video": {"$regex": "^data:video/"}},
-            ]
-        }):
-            upd = {}
-            if user.get("profile_video", "").startswith("data:video/"):
-                new_url = await _migrate_one_video(user["profile_video"], f"profile_{user['id']}")
-                if new_url: upd["profile_video"] = new_url
-                else: users_failed += 1
-            if user.get("cover_video", "").startswith("data:video/"):
-                new_url = await _migrate_one_video(user["cover_video"], f"cover_{user['id']}")
-                if new_url: upd["cover_video"] = new_url
-                else: users_failed += 1
-            if upd:
-                await db.users.update_one({"id": user["id"]}, {"$set": upd})
-                users_migrated += 1
+            async for doc in cursor_query:
+                if collection_count >= remaining_budget:
+                    more_in_collection = True
+                    break
+                media_count, failed_count, conflict_count = await _migrate_media_document(
+                    getattr(db, collection_name), doc, fields, url_cache,
+                )
+                documents_processed += 1
+                collection_count += 1
+                media_migrated += media_count
+                media_failed += failed_count
+                conflicts += conflict_count
+                after_id = str(doc.get("id") or "")
+
+            if more_in_collection:
+                next_cursor = _encode_media_migration_cursor(collection_index, after_id)
+                break
+            collection_index += 1
+            after_id = None
+
+        done = next_cursor is None
+        remaining_documents = None
+        complete = False
+        retry_from_start = False
+        if done:
+            remaining_documents = {}
+            for collection_name, fields in _MEDIA_MIGRATION_SPECS:
+                remaining_documents[collection_name] = await getattr(db, collection_name).count_documents(_legacy_media_query(fields))
+            complete = not any(remaining_documents.values())
+            retry_from_start = not complete
 
         return {
             "ok": True,
-            "posts_migrated": posts_migrated, "posts_failed": posts_failed,
-            "users_migrated": users_migrated, "users_failed": users_failed,
+            "documents_processed": documents_processed,
+            "media_migrated": media_migrated,
+            "media_failed": media_failed,
+            "conflicts": conflicts,
+            "next_cursor": next_cursor,
+            "done": done,
+            "complete": complete,
+            "remaining_documents": remaining_documents,
+            "retry_from_start": retry_from_start,
         }
 
     @api.post("/posts")
@@ -2279,7 +2450,7 @@ postbluom.online"""
                 {"$match": {"$or": [{"user_id": u["id"]}, {"_author.is_private": {"$ne": True}}]}},
                 {"$sort": {"created_at": -1}},
                 {"$limit": fetch_n},
-                _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url"),
+                _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url", "comments"),
                 {"$project": {"_id": 0, "_author": 0}},
             ]
         else:
@@ -2287,7 +2458,7 @@ postbluom.online"""
                 {"$match": query},
                 {"$sort": {"created_at": -1}},
                 {"$limit": fetch_n},
-                _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url"),
+                _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url", "comments"),
                 {"$project": {"_id": 0}},
             ]
         posts_task = db.posts.aggregate(posts_pipeline).to_list(fetch_n)
@@ -2370,7 +2541,7 @@ postbluom.online"""
     async def get_post(pid: str, u=Depends(current_user)):
         post_rows = await db.posts.aggregate([
             {"$match": {"id": pid}},
-            _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url"),
+            _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url", "comments"),
             {"$project": {"_id": 0}},
             {"$limit": 1},
         ]).to_list(1)
@@ -2416,7 +2587,7 @@ postbluom.online"""
         await db.posts.update_one({"id": pid}, {"$set": upd})
         updated_rows = await db.posts.aggregate([
             {"$match": {"id": pid}},
-            _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url"),
+            _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url", "comments"),
             {"$project": {"_id": 0}},
             {"$limit": 1},
         ]).to_list(1)
@@ -4388,7 +4559,7 @@ postbluom.online"""
             {"$sort": {"created_at": -1}},
             {"$skip": skip},
             {"$limit": limit},
-            _safe_media_stage("avatar_photo", "photo_url", "video_url"),
+            _safe_media_stage("avatar_photo", "photo_url", "video_url", "comments"),
             {"$project": {"_id": 0}},
         ]).to_list(limit)
         mention_rows = await db.reel_mentions.aggregate([
@@ -4512,7 +4683,7 @@ postbluom.online"""
             {"$match": query},
             {"$sort": {"created_at": -1}},
             {"$limit": pool_limit},
-            _safe_media_stage("avatar_photo", "photo_url", "video_url"),
+            _safe_media_stage("avatar_photo", "photo_url", "video_url", "comments"),
             {"$project": {"_id": 0}},
         ]).to_list(pool_limit)
         mention_rows = await db.reel_mentions.aggregate([
@@ -6248,7 +6419,7 @@ postbluom.online"""
         final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
         full_reels = await db.reels.aggregate([
             {"$match": {"id": {"$in": final_reel_ids}}},
-            _safe_media_stage("avatar_photo", "photo_url", "video_url"),
+            _safe_media_stage("avatar_photo", "photo_url", "video_url", "comments"),
             {"$project": {"_id": 0}},
         ]).to_list(len(final_reel_ids)) if final_reel_ids else []
         full_reels_by_id = {reel.get("id"): reel for reel in full_reels if reel.get("id")}
