@@ -8,6 +8,7 @@ try:
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.middleware.gzip import GZipMiddleware
+    from fastapi.responses import JSONResponse
     from motor.motor_asyncio import AsyncIOMotorClient
     from dotenv import load_dotenv
     import os, uuid, random, secrets, logging, bcrypt, jwt, re, io, ipaddress, threading as _threading
@@ -46,6 +47,48 @@ try:
             secure=True,
         )
     # else: falls back to CLOUDINARY_URL env var, which the SDK reads automatically on import
+
+    # Keep server-side Cloudinary work bounded; reels/posts use chunked uploads.
+    _CLOUDINARY_UPLOADS = asyncio.Semaphore(1)
+    _CLOUDINARY_CHUNK_SIZE = 4 * 1024 * 1024
+
+    async def _cloudinary_upload(upload_fn, *args, **kwargs):
+        async with _CLOUDINARY_UPLOADS:
+            return await asyncio.to_thread(upload_fn, *args, **kwargs)
+
+    def _safe_media_url_expression(field_expr: str) -> dict:
+        # Legacy clients stored complete data URIs in MongoDB. Do not copy those
+        # large strings into the web process on normal feed/profile reads.
+        return {
+            "$cond": [
+                {"$regexMatch": {
+                    "input": {"$convert": {"input": field_expr, "to": "string", "onError": "", "onNull": ""}},
+                    "regex": "^data:",
+                    "options": "i",
+                }},
+                None,
+                field_expr,
+            ]
+        }
+
+    def _safe_media_stage(*fields: str) -> dict:
+        updates = {field: _safe_media_url_expression("$" + field) for field in fields if field != "photo_urls"}
+        if "photo_urls" in fields:
+            mapped_urls = {
+                "$map": {
+                    "input": {"$cond": [{"$isArray": "$photo_urls"}, "$photo_urls", []]},
+                    "as": "media_url",
+                    "in": _safe_media_url_expression("$" + "$media_url"),
+                }
+            }
+            updates["photo_urls"] = {
+                "$filter": {"input": mapped_urls, "as": "media_url", "cond": {"$ne": ["$" + "$media_url", None]}}
+            }
+        return {"$set": updates}
+
+    def _reject_inline_media(value, field_name: str):
+        if isinstance(value, str) and value.lstrip().lower().startswith("data:"):
+            raise HTTPException(400, f"{field_name} must be uploaded to Cloudinary before saving.")
 
     def _b64ue(b):
         import base64 as _b64
@@ -181,6 +224,24 @@ try:
     db = client[DB_NAME]
 
     app    = FastAPI(title="POST App API")
+    _MAX_MEDIA_JSON_BYTES = 2 * 1024 * 1024
+
+    @app.middleware("http")
+    async def limit_inline_media_json(request: Request, call_next):
+        path = request.url.path
+        is_media_write = (
+            (request.method == "POST" and path in {"/api/posts", "/api/reels"})
+            or (request.method == "PATCH" and (path == "/api/profile" or (path.startswith("/api/posts/") and path.count("/") == 3)))
+        )
+        if is_media_write and request.headers.get("content-type", "").lower().startswith("application/json"):
+            try:
+                content_length = int(request.headers.get("content-length", "0"))
+            except (TypeError, ValueError):
+                content_length = 0
+            if content_length > _MAX_MEDIA_JSON_BYTES:
+                return JSONResponse({"detail": "Request body is too large. Upload photos and videos to Cloudinary first."}, status_code=413)
+        return await call_next(request)
+
     api    = APIRouter(prefix="/api")
     bearer = HTTPBearer(auto_error=False)
 
@@ -429,7 +490,12 @@ try:
             sid = payload.get("sid")
         except Exception:
             raise HTTPException(401, "Invalid token")
-        u = await db.users.find_one({"id": uid}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+        user_rows = await db.users.aggregate([
+            {"$match": {"id": uid}},
+            _safe_media_stage("avatar_photo", "profile_video", "cover_photo", "cover_video"),
+            {"$project": {"_id": 0, "password_hash": 0, "otp_hash": 0}},
+        ]).to_list(1)
+        u = user_rows[0] if user_rows else None
         if not u:
             raise HTTPException(401, "User not found")
         if sid:
@@ -773,7 +839,7 @@ postbluom.online"""
         content: str; accent: str = "#FFD600"; location: Optional[str] = None
         photo_url: Optional[str] = None
         photo_urls: Optional[List[str]] = None  # up to 5 photos
-        video_url: Optional[str] = None         # base64 data URI, max 30s (mutually exclusive with photos)
+        video_url: Optional[str] = None         # hosted URL, max 30s (mutually exclusive with photos)
         video_duration: Optional[float] = None  # seconds, must be <= 30
         feeling: Optional[str] = None           # e.g. "😊 Happy"
         tagged_users: Optional[List[str]] = None  # list of @handles
@@ -1354,6 +1420,8 @@ postbluom.online"""
     @api.patch("/profile")
     async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
         upd = {k: v for k, v in p.model_dump().items() if v is not None}
+        for field in ("avatar_photo", "profile_video", "cover_photo", "cover_video"):
+            _reject_inline_media(upd.get(field), field)
         for field in ("dob_month_day_visibility", "dob_year_visibility"):
             if field in upd and upd[field] not in _DOB_VISIBILITY_OPTIONS:
                 raise HTTPException(400, "Invalid birthday visibility")
@@ -1773,7 +1841,7 @@ postbluom.online"""
         if upload_size > 10 * 1024 * 1024:
             raise HTTPException(400, "Image is too large. Max 10MB.")
         try:
-            result = await asyncio.to_thread(
+            result = await _cloudinary_upload(
                 cloudinary.uploader.upload,
                 file.file,
                 resource_type="image",
@@ -1798,7 +1866,7 @@ postbluom.online"""
         if upload_size > 25 * 1024 * 1024:
             raise HTTPException(400, "Audio is too large. Max 25MB.")
         try:
-            result = await asyncio.to_thread(
+            result = await _cloudinary_upload(
                 cloudinary.uploader.upload,
                 file.file,
                 resource_type="video",   # Cloudinary uses "video" resource_type for audio files
@@ -1857,7 +1925,12 @@ postbluom.online"""
             }]
 
         try:
-            result = await asyncio.to_thread(cloudinary.uploader.upload, file.file, **upload_kwargs)
+            result = await _cloudinary_upload(
+                cloudinary.uploader.upload_large,
+                file.file,
+                chunk_size=_CLOUDINARY_CHUNK_SIZE,
+                **upload_kwargs,
+            )
         except Exception as e:
             # Log the full Cloudinary error server-side only — it can include
             # internal signing details ("String to sign - ...") that must never
@@ -1892,8 +1965,11 @@ postbluom.online"""
     async def _migrate_one_video(data_uri: str, public_id: str) -> Optional[str]:
         try:
             raw = _decode_data_uri_video(data_uri)
-            result = cloudinary.uploader.upload(
-                raw, resource_type="video", folder="post-app/videos-migrated",
+            result = await _cloudinary_upload(
+                cloudinary.uploader.upload_large,
+                io.BytesIO(raw),
+                chunk_size=_CLOUDINARY_CHUNK_SIZE,
+                resource_type="video", folder="post-app/videos-migrated",
                 public_id=public_id, overwrite=False,
             )
             return result.get("secure_url")
@@ -1947,6 +2023,9 @@ postbluom.online"""
     @api.post("/posts")
     async def create_post(p: PostIn, u=Depends(current_user)):
         _validate_post_video(p.video_url, p.video_duration)
+        _reject_inline_media(p.photo_url, "photo_url")
+        for photo_url in p.photo_urls or []:
+            _reject_inline_media(photo_url, "photo_urls")
         # A post is either a photo carousel or a single video, never both
         has_video = bool(p.video_url)
         doc = {
@@ -2178,10 +2257,9 @@ postbluom.online"""
                 query = {"$and": [query, exclusion_filter]} if query else exclusion_filter
 
         # Older Compose versions stored photo/video data URLs directly in posts.
-        # They are valid historical media and must remain visible in home/profile;
-        # the frontend now uploads new photos to hosted URLs before creating posts.
-        # Keep the filter for the separate reels query below, but never apply it
-        # to regular posts or old posts disappear from both screens.
+        # Keep their post documents visible, but strip inline payloads in Mongo
+        # before they enter this process. New uploads must use hosted URLs.
+        # The separate legacy_media_filter excludes inline reels from feed queries.
         legacy_media_filter = {"$nor": [
             {"video_url": {"$regex": "^data:"}},
             {"photo_url": {"$regex": "^data:"}},
@@ -2195,16 +2273,24 @@ postbluom.online"""
         include_reels = (feed or bool(user_id)) and not q and feed_user_filter is not None
         fetch_n = skip + limit
         if filter_public_authors:
-            posts_task = db.posts.aggregate([
+            posts_pipeline = [
                 {"$match": query},
                 {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
                 {"$match": {"$or": [{"user_id": u["id"]}, {"_author.is_private": {"$ne": True}}]}},
                 {"$sort": {"created_at": -1}},
                 {"$limit": fetch_n},
+                _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url"),
                 {"$project": {"_id": 0, "_author": 0}},
-            ]).to_list(fetch_n)
+            ]
         else:
-            posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            posts_pipeline = [
+                {"$match": query},
+                {"$sort": {"created_at": -1}},
+                {"$limit": fetch_n},
+                _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url"),
+                {"$project": {"_id": 0}},
+            ]
+        posts_task = db.posts.aggregate(posts_pipeline).to_list(fetch_n)
         if include_reels:
             # Mention visibility is private to the signed-in viewer, never the profile target.
             mention_target_id = u["id"]
@@ -2282,7 +2368,13 @@ postbluom.online"""
 
     @api.get("/posts/{pid}")
     async def get_post(pid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid}, {"_id": 0})
+        post_rows = await db.posts.aggregate([
+            {"$match": {"id": pid}},
+            _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url"),
+            {"$project": {"_id": 0}},
+            {"$limit": 1},
+        ]).to_list(1)
+        post = post_rows[0] if post_rows else None
         if not post: raise HTTPException(404, "Post not found")
         if u["id"] not in post.get("views", []):
             await db.posts.update_one({"id": pid}, {"$addToSet": {"views": u["id"]}})
@@ -2299,10 +2391,13 @@ postbluom.online"""
 
     @api.patch("/posts/{pid}")
     async def edit_post(pid: str, p: PostIn, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1})
         if not post: raise HTTPException(404, "Post not found")
         if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
         _validate_post_video(p.video_url, p.video_duration)
+        _reject_inline_media(p.photo_url, "photo_url")
+        for photo_url in p.photo_urls or []:
+            _reject_inline_media(photo_url, "photo_urls")
         upd = {"content": p.content, "accent": p.accent, "location": p.location or "", "edited_at": now().isoformat()}
         if p.video_url is not None:
             # Switching to a video clears any existing photos, keeping the two mutually exclusive
@@ -2319,7 +2414,13 @@ postbluom.online"""
                 upd["photo_urls"] = p.photo_urls
                 upd["photo_url"] = p.photo_urls[0] if p.photo_urls else None
         await db.posts.update_one({"id": pid}, {"$set": upd})
-        return await db.posts.find_one({"id": pid}, {"_id": 0})
+        updated_rows = await db.posts.aggregate([
+            {"$match": {"id": pid}},
+            _safe_media_stage("avatar_photo", "photo_url", "photo_urls", "video_url"),
+            {"$project": {"_id": 0}},
+            {"$limit": 1},
+        ]).to_list(1)
+        return updated_rows[0] if updated_rows else {"id": pid}
 
     @api.post("/posts/{pid}/like")
     async def like_post(pid: str, p: LikeIn, u=Depends(current_user)):
@@ -4154,9 +4255,10 @@ postbluom.online"""
         if upload_size > MAX_UPLOAD_VIDEO_BYTES:
             raise HTTPException(400, "Video is too large. Max 100 MB.")
         try:
-            result = await asyncio.to_thread(
-                cloudinary.uploader.upload,
+            result = await _cloudinary_upload(
+                cloudinary.uploader.upload_large,
                 file.file,
+                chunk_size=_CLOUDINARY_CHUNK_SIZE,
                 resource_type="video",
                 folder="post-app/reels",
                 public_id=f"reel_{u['id']}_{uuid.uuid4().hex}",
@@ -4209,6 +4311,8 @@ postbluom.online"""
         if audience not in ("public", "friends", "only_show", "only_me"):
             audience = "public"
         is_photo_reel  = bool(photo_url) and not video_url
+        _reject_inline_media(video_url, "video_url")
+        _reject_inline_media(photo_url, "photo_url")
         if not video_url and not photo_url:
             raise HTTPException(400, "video_url or photo_url is required")
         if not is_photo_reel and (duration < 1 or duration > MAX_POST_VIDEO_SECONDS):
@@ -4279,7 +4383,14 @@ postbluom.online"""
         }
         if excluded:
             query["user_id"] = {"$nin": excluded}
-        reels_list = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        reels_list = await db.reels.aggregate([
+            {"$match": query},
+            {"$sort": {"created_at": -1}},
+            {"$skip": skip},
+            {"$limit": limit},
+            _safe_media_stage("avatar_photo", "photo_url", "video_url"),
+            {"$project": {"_id": 0}},
+        ]).to_list(limit)
         mention_rows = await db.reel_mentions.aggregate([
             {"$match": {"reel_id": {"$in": [r["id"] for r in reels_list]}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
@@ -4397,7 +4508,13 @@ postbluom.online"""
         if category and category.lower() != "all":
             query["category"] = {"$regex": category, "$options": "i"}
         pool_limit = min(limit * 6, 300)
-        reels_raw = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(0).limit(pool_limit).to_list(pool_limit)
+        reels_raw = await db.reels.aggregate([
+            {"$match": query},
+            {"$sort": {"created_at": -1}},
+            {"$limit": pool_limit},
+            _safe_media_stage("avatar_photo", "photo_url", "video_url"),
+            {"$project": {"_id": 0}},
+        ]).to_list(pool_limit)
         mention_rows = await db.reel_mentions.aggregate([
             {"$match": {"reel_id": {"$in": [r.get("id") for r in reels_raw if r.get("id")]}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
@@ -4916,7 +5033,7 @@ postbluom.online"""
         # handing it to Cloudinary so the complete selected image is uploaded.
         file.file.seek(0)
         try:
-            result = await asyncio.to_thread(
+            result = await _cloudinary_upload(
                 cloudinary.uploader.upload,
                 file.file, resource_type="image",
                 folder="post-app/group-avatars",
@@ -6129,9 +6246,11 @@ postbluom.online"""
         combined = main_slice + exploration[:exploration_count]
         final_items = _reels_diversify(combined, limit)
         final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
-        full_reels = await db.reels.find(
-            {"id": {"$in": final_reel_ids}}, {"_id": 0},
-        ).to_list(len(final_reel_ids)) if final_reel_ids else []
+        full_reels = await db.reels.aggregate([
+            {"$match": {"id": {"$in": final_reel_ids}}},
+            _safe_media_stage("avatar_photo", "photo_url", "video_url"),
+            {"$project": {"_id": 0}},
+        ]).to_list(len(final_reel_ids)) if final_reel_ids else []
         full_reels_by_id = {reel.get("id"): reel for reel in full_reels if reel.get("id")}
         ranking_fields = (
             "_rank_view_count", "_rank_like_count", "_rank_comment_count",
