@@ -5878,10 +5878,44 @@ postbluom.online"""
             ).to_list(5000)
         }
         excluded_users = set((u.get("blocked_users") or []) + (u.get("muted_users") or []))
-        raw_candidates = await db.reels.find(
-            {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
-            {"_id": 0},
-        ).sort("created_at", -1).limit(2000).to_list(2000)
+        # Rank compact metadata for the candidate pool; media and embedded
+        # engagement arrays are loaded only for the final page below.
+        def _reel_array_size(field):
+            return {"$size": {"$cond": [{"$isArray": field}, field, []]}}
+
+        def _reel_count_value(field):
+            return {"$convert": {"input": field, "to": "long", "onError": 0, "onNull": 0}}
+
+        raw_candidates = await db.reels.aggregate([
+            {"$match": {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}}},
+            {"$sort": {"created_at": -1}},
+            {"$limit": 2000},
+            {"$project": {
+                "_id": 0,
+                "id": 1,
+                "user_id": 1,
+                "category": 1,
+                "caption": 1,
+                "audio_label": 1,
+                "hashtags": 1,
+                "tags": 1,
+                "audience": 1,
+                "audience_users": 1,
+                "created_at": 1,
+                "duration": 1,
+                "mention_count": 1,
+                "_rank_view_count": {"$max": [_reel_array_size("$views"), _reel_count_value("$view_count")]},
+                "_rank_like_count": _reel_array_size("$likes"),
+                "_rank_comment_count": {"$max": [_reel_array_size("$comments"), _reel_count_value("$comment_count")]},
+                "_rank_comment_likes": {"$reduce": {
+                    "input": {"$cond": [{"$isArray": "$comments"}, "$comments", []]},
+                    "initialValue": 0,
+                    "in": {"$add": ["$$value", _reel_array_size("$$this.likes")]},
+                }},
+                "_rank_share_count": {"$max": [_reel_array_size("$shares"), _reel_count_value("$share_count")]},
+                "_rank_save_count": {"$max": [_reel_array_size("$saves"), _reel_count_value("$save_count")]},
+            }},
+        ]).to_list(2000)
 
         # Search keeps the same eligibility and scoring model as the main feed,
         # but narrows the candidate pool to the requested search term first.
@@ -5987,8 +6021,7 @@ postbluom.online"""
             if not reel_id:
                 continue
             stats = live_stats.get(reel_id, {})
-            embedded_views = reel.get("views") if isinstance(reel.get("views"), list) else []
-            total_views = max(len(embedded_views), int(reel.get("view_count") or 0), int(stats.get("total_views") or 0), 1)
+            total_views = max(int(reel.get("_rank_view_count") or 0), int(stats.get("total_views") or 0), 1)
             observed_views = max(int(stats.get("total_views") or 0), 1)
             completion_sum = float(stats.get("completion_sum") or 0)
             completion = completion_sum / observed_views if completion_sum else float(stats.get("avg_completion") or 0)
@@ -5996,11 +6029,11 @@ postbluom.online"""
             duration_seconds = max(float(reel.get("duration") or 0), 1.0)
             watch_time_score = min(1.0, avg_watch_seconds / duration_seconds) if reel.get("duration") else completion
             completion_quality = max(0.0, min(1.0, completion * 0.70 + watch_time_score * 0.30))
-            likes = len(reel.get("likes") or [])
-            comments = max(len(reel.get("comments") or []), int(reel.get("comment_count") or 0))
-            comment_likes = sum(len(comment.get("likes") or []) for comment in (reel.get("comments") or []))
-            shares = max(len(reel.get("shares") or []), int(reel.get("share_count") or 0))
-            saves = max(len(reel.get("saves") or []), int(reel.get("save_count") or 0))
+            likes = int(reel.get("_rank_like_count") or 0)
+            comments = int(reel.get("_rank_comment_count") or 0)
+            comment_likes = int(reel.get("_rank_comment_likes") or 0)
+            shares = int(reel.get("_rank_share_count") or 0)
+            saves = int(reel.get("_rank_save_count") or 0)
             mentions = mention_counts.get(reel_id, int(reel.get("mention_count") or 0))
             # Documented intent order: share > save > comment > comment-like > like.
             engagement_points = likes + comments * 3 + comment_likes + mentions * 2 + shares * 5 + saves * 4
@@ -6070,12 +6103,32 @@ postbluom.online"""
         exploration = [
             item for item in scored
             if item.get("id") not in main_ids
-            and (max(len(item.get("views") or []), int(item.get("view_count") or 0)) < 10
+            and (int(item.get("_rank_view_count") or 0) < 10
                  or (now_utc - _reels_parse_datetime(item.get("created_at"))).days <= 30)
         ]
         random.Random(f"{user_id}:{page}").shuffle(exploration)
         combined = main_slice + exploration[:exploration_count]
         final_items = _reels_diversify(combined, limit)
+        final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
+        full_reels = await db.reels.find(
+            {"id": {"$in": final_reel_ids}}, {"_id": 0},
+        ).to_list(len(final_reel_ids)) if final_reel_ids else []
+        full_reels_by_id = {reel.get("id"): reel for reel in full_reels if reel.get("id")}
+        ranking_fields = (
+            "_rank_view_count", "_rank_like_count", "_rank_comment_count",
+            "_rank_comment_likes", "_rank_share_count", "_rank_save_count",
+            "category", "score", "is_viral", "mention_count", "ranking_signals",
+        )
+        hydrated_items = []
+        for item in final_items:
+            full_reel = full_reels_by_id.get(item.get("id"))
+            if not full_reel:
+                continue
+            ranking_data = {key: item[key] for key in ranking_fields if key in item}
+            item.update(full_reel)
+            item.update(ranking_data)
+            hydrated_items.append(item)
+        final_items = hydrated_items
         final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
         mention_docs = {}
         if final_reel_ids:
