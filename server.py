@@ -3870,15 +3870,27 @@ postbluom.online"""
 
     _news_cache: dict = {}
     _NEWS_CACHE_TTL = 180  # 3 minutes
+    _NEWS_CACHE_MAX_ENTRIES = 128
 
     def _news_cache_get(key):
+        now_mono = _time.monotonic()
         entry = _news_cache.get(key)
-        if entry and (_time.monotonic() - entry[1]) < _NEWS_CACHE_TTL:
-            return entry[0]
-        return None
+        if not entry:
+            return None
+        if now_mono - entry[1] >= _NEWS_CACHE_TTL:
+            _news_cache.pop(key, None)
+            return None
+        return entry[0]
 
     def _news_cache_set(key, value):
-        _news_cache[key] = (value, _time.monotonic())
+        now_mono = _time.monotonic()
+        for cached_key, (_, cached_at) in list(_news_cache.items()):
+            if now_mono - cached_at >= _NEWS_CACHE_TTL:
+                _news_cache.pop(cached_key, None)
+        if key not in _news_cache and len(_news_cache) >= _NEWS_CACHE_MAX_ENTRIES:
+            oldest_key = min(_news_cache, key=lambda cached_key: _news_cache[cached_key][1])
+            _news_cache.pop(oldest_key, None)
+        _news_cache[key] = (value, now_mono)
 
     async def _fetch_news_articles(category: str, country: Optional[str], page_size: int = 20) -> list:
         if not NEWS_API_KEY:
@@ -4265,7 +4277,7 @@ postbluom.online"""
         mention_rows = await db.reel_mentions.aggregate([
             {"$match": {"reel_id": {"$in": [r["id"] for r in reels_list]}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
-        ]).to_list(None) if reels_list else []
+        ]).to_list(limit) if reels_list else []
         mention_counts = {row["_id"]: row["count"] for row in mention_rows}
         mention_docs = {
             doc["reel_id"]: doc
@@ -4384,7 +4396,7 @@ postbluom.online"""
         mention_rows = await db.reel_mentions.aggregate([
             {"$match": {"reel_id": {"$in": [r.get("id") for r in reels_raw if r.get("id")]}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
-        ]).to_list(length=None)
+        ]).to_list(pool_limit)
         mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
         def _score(r):
             try:
@@ -5376,6 +5388,28 @@ postbluom.online"""
     _PLANET_UA = f"PostApp-OurPlanet/1.0 ({_PLANET_CONTACT_EMAIL})"
     _PLANET_CACHE = {}
     _PLANET_CACHE_TTL = 1800
+    _PLANET_CACHE_MAX_ENTRIES = 128
+
+    def _planet_cache_get(key):
+        now_mono = _time.monotonic()
+        entry = _PLANET_CACHE.get(key)
+        if not entry:
+            return None
+        if now_mono - entry[0] >= _PLANET_CACHE_TTL:
+            _PLANET_CACHE.pop(key, None)
+            return None
+        return entry[1]
+
+    def _planet_cache_set(key, value):
+        now_mono = _time.monotonic()
+        for cached_key, (cached_at, _) in list(_PLANET_CACHE.items()):
+            if now_mono - cached_at >= _PLANET_CACHE_TTL:
+                _PLANET_CACHE.pop(cached_key, None)
+        if key not in _PLANET_CACHE and len(_PLANET_CACHE) >= _PLANET_CACHE_MAX_ENTRIES:
+            oldest_key = min(_PLANET_CACHE, key=lambda cached_key: _PLANET_CACHE[cached_key][0])
+            _PLANET_CACHE.pop(oldest_key, None)
+        _PLANET_CACHE[key] = (now_mono, value)
+
     _PLANET_NOMINATIM_LOCK = _threading.Lock()
     _PLANET_NOMINATIM_LAST = 0.0
     _PLANET_NOMINATIM = "https://nominatim.openstreetmap.org/search"
@@ -5557,9 +5591,9 @@ postbluom.online"""
 
     def _planet_profile(query):
         key = " ".join(query.strip().lower().split())
-        cached_profile = _PLANET_CACHE.get(key)
-        if cached_profile and _time.time() - cached_profile[0] < _PLANET_CACHE_TTL:
-            return cached_profile[1]
+        cached_profile = _planet_cache_get(key)
+        if cached_profile is not None:
+            return cached_profile
         geo_data = _planet_geo(query)
         bio = _planet_bio(query)
         wiki_data = _planet_wiki(query)
@@ -5594,7 +5628,7 @@ postbluom.online"""
             "source": "Wikipedia + Wikimedia Commons + OpenStreetMap + GBIF + Esri World Imagery" + (" + NASA Earthdata" if nasa.get("satellite_desc") else "") + addons.get("source_suffix", ""),
             "source_url": wiki_data.get("page_url") or nasa.get("source_url"),
         }
-        _PLANET_CACHE[key] = (_time.time(), result)
+        _planet_cache_set(key, result)
         return result
 
     @api.get("/our-planet/search")
@@ -5704,30 +5738,42 @@ postbluom.online"""
             totals[category] = totals.get(category, 0.0) + float(row.get("watch_seconds") or 0)
         return [category for category, _ in sorted(totals.items(), key=lambda item: item[1], reverse=True)[:3]]
 
-    async def _reels_seen_ids(user_id):
+    async def _reels_seen_ids(user_id, reel_ids):
+        if not reel_ids:
+            return set()
         since = (now() - timedelta(days=REELS_ALGO_SEEN_LOOKBACK_DAYS)).isoformat()
-        return set(await db.reel_view_events.distinct("reel_id", {"user_id": user_id, "event_at": {"$gte": since}}))
-
-    async def _reels_negative_signals(user_id):
-        not_interested = set(await db.reel_feedback.distinct("reel_id", {"user_id": user_id, "action": "not_interested"}))
-        hidden_creators = set(await db.reel_feedback.distinct(
-            "creator_id", {"user_id": user_id, "action": {"$in": ["report", "hide_creator"]}}
+        return set(await db.reel_view_events.distinct(
+            "reel_id",
+            {"user_id": user_id, "reel_id": {"$in": reel_ids}, "event_at": {"$gte": since}},
         ))
+
+    async def _reels_negative_signals(user_id, reel_ids, creator_ids, categories):
+        not_interested = set(await db.reel_feedback.distinct(
+            "reel_id",
+            {"user_id": user_id, "action": "not_interested", "reel_id": {"$in": reel_ids}},
+        )) if reel_ids else set()
+        hidden_creators = set(await db.reel_feedback.distinct(
+            "creator_id",
+            {"user_id": user_id, "action": {"$in": ["report", "hide_creator"]}, "creator_id": {"$in": creator_ids}},
+        )) if creator_ids else set()
         since = (now() - timedelta(days=3)).isoformat()
         quick_rows = await db.reel_view_events.aggregate([
-            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "watch_seconds": {"$lt": REELS_ALGO_QUICK_SKIP_SECONDS}}},
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$in": categories}, "watch_seconds": {"$lt": REELS_ALGO_QUICK_SKIP_SECONDS}}},
             {"$group": {"_id": "$category", "skip_count": {"$sum": 1}}},
             {"$match": {"skip_count": {"$gte": REELS_ALGO_QUICK_SKIP_MIN_COUNT}}},
-        ]).to_list(length=None)
+        ]).to_list(len(categories)) if categories else []
         return {
             "not_interested_ids": not_interested,
             "hidden_creator_ids": hidden_creators,
             "quick_skip_categories": {row["_id"] for row in quick_rows if row.get("_id")},
         }
 
-    async def _reels_positive_signals(user_id):
+    async def _reels_positive_signals(user_id, reel_ids):
+        if not reel_ids:
+            return set()
         return set(await db.reel_feedback.distinct(
-            "reel_id", {"user_id": user_id, "action": "interested"}
+            "reel_id",
+            {"user_id": user_id, "action": "interested", "reel_id": {"$in": reel_ids}},
         ))
 
     async def _reels_liked_creators(user_id):
@@ -5767,7 +5813,7 @@ postbluom.online"""
                 "completion_sum": {"$sum": "$completion_ratio"},
                 "watch_seconds_sum": {"$sum": "$watch_seconds"},
             }},
-        ]).to_list(length=None)
+        ]).to_list(len(reel_ids))
         for row in all_time:
             reel_stats = stats.setdefault(row["_id"], {})
             total_views = int(row.get("total_views") or 0)
@@ -5783,7 +5829,7 @@ postbluom.online"""
                 "views_1h": {"$sum": 1},
                 "watch_seconds_1h": {"$sum": "$watch_seconds"},
             }},
-        ]).to_list(length=None)
+        ]).to_list(len(reel_ids))
         for row in hourly:
             stats.setdefault(row["_id"], {}).update({
                 "views_1h": int(row.get("views_1h") or 0),
@@ -5880,9 +5926,16 @@ postbluom.online"""
         if not candidates:
             return {"page": page, "limit": limit, "reels": [], "has_more": False, "ab_group": "A", "algorithm": "reels_v1"}
 
+        candidate_ids = list(dict.fromkeys(
+            reel.get("id") for reel in candidates if reel.get("id")
+        ))
+        candidate_creator_ids = list(dict.fromkeys(
+            reel.get("user_id") for reel in candidates if reel.get("user_id")
+        ))
+        candidate_categories = list(dict.fromkeys(_reels_category(reel) for reel in candidates))
         seen_ids, negative = await asyncio.gather(
-            _reels_seen_ids(user_id),
-            _reels_negative_signals(user_id),
+            _reels_seen_ids(user_id, candidate_ids),
+            _reels_negative_signals(user_id, candidate_ids, candidate_creator_ids, candidate_categories),
         )
         filtered = [
             reel for reel in candidates
@@ -5911,14 +5964,14 @@ postbluom.online"""
             _reels_user_categories(user_id),
             _reels_liked_creators(user_id),
             _reels_similar_user_reels(user_id),
-            _reels_positive_signals(user_id),
+            _reels_positive_signals(user_id, candidate_ids),
             _reels_session_categories(user_id),
             _reels_active_hour_categories(user_id),
             db.trending_tags.find({"active": True}, {"_id": 0, "tag": 1, "boost": 1}).to_list(100),
             db.reel_mentions.aggregate([
                 {"$match": {"reel_id": {"$in": reel_ids}}},
                 {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
-            ]).to_list(length=None),
+            ]).to_list(len(reel_ids)),
         )
         top_categories = set(top_category_rows)
         session_categories = set(session_category_rows)
@@ -6108,14 +6161,38 @@ postbluom.online"""
         return {"status": "ok"}
 
     async def _refresh_reels_rank_stats():
-        rows = await db.reels.find(
-            {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
-            {"_id": 0, "id": 1, "views": 1, "view_count": 1, "likes": 1, "comments": 1, "shares": 1, "saves": 1},
-        ).limit(2000).to_list(2000)
+        # Compute aggregate counts in Mongo so large embedded reaction arrays
+        # are not copied into the application process every refresh cycle.
+        def _array_size(field):
+            return {"$size": {"$cond": [{"$isArray": field}, field, []]}}
+
+        def _count_value(field):
+            return {"$convert": {"input": field, "to": "long", "onError": 0, "onNull": 0}}
+
+        rows = await db.reels.aggregate([
+            {"$match": {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}}},
+            {"$limit": 2000},
+            {"$project": {
+                "_id": 0,
+                "id": 1,
+                "mention_count": 1,
+                "content_views": {"$max": [_array_size("$views"), _count_value("$view_count")]},
+                "likes": _array_size("$likes"),
+                "comments": _array_size("$comments"),
+                "comment_likes": {"$reduce": {
+                    "input": {"$cond": [{"$isArray": "$comments"}, "$comments", []]},
+                    "initialValue": 0,
+                    "in": {"$add": ["$$value", _array_size("$$this.likes")]},
+                }},
+                "shares": _array_size("$shares"),
+                "saves": _array_size("$saves"),
+            }},
+        ]).to_list(2000)
+        reel_ids = [r.get("id") for r in rows if r.get("id")]
         mention_rows = await db.reel_mentions.aggregate([
-            {"$match": {"reel_id": {"$in": [r.get("id") for r in rows if r.get("id")]}}},
+            {"$match": {"reel_id": {"$in": reel_ids}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
-        ]).to_list(length=None)
+        ]).to_list(len(reel_ids))
         mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
         for reel in rows:
             reel_id = reel.get("id")
@@ -6125,12 +6202,12 @@ postbluom.online"""
                 {"reel_id": reel_id},
                 {"$set": {
                     "reel_id": reel_id,
-                    "content_views": max(len(reel.get("views") or []), int(reel.get("view_count") or 0)),
-                    "likes": len(reel.get("likes") or []),
-                    "comments": len(reel.get("comments") or []),
-                    "comment_likes": sum(len(comment.get("likes") or []) for comment in (reel.get("comments") or [])),
-                    "shares": len(reel.get("shares") or []),
-                    "saves": len(reel.get("saves") or []),
+                    "content_views": int(reel.get("content_views") or 0),
+                    "likes": int(reel.get("likes") or 0),
+                    "comments": int(reel.get("comments") or 0),
+                    "comment_likes": int(reel.get("comment_likes") or 0),
+                    "shares": int(reel.get("shares") or 0),
+                    "saves": int(reel.get("saves") or 0),
                     "mentions": mention_counts.get(reel_id, int(reel.get("mention_count") or 0)),
                     "updated_at": now().isoformat(),
                 }},
