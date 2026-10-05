@@ -1468,7 +1468,7 @@ postbluom.online"""
                 if source in upd:
                     owner_upd[target] = upd[source]
                     comment_upd["comments.$[c]." + target] = upd[source]
-                    reply_upd["comments.$[].replies.$[r]." + target] = upd[source]
+                    reply_upd["comments.$[c].replies.$[r]." + target] = upd[source]
 
             message_field_map = {
                 "name": "from_name", "handle": "from_handle",
@@ -1508,7 +1508,7 @@ postbluom.online"""
             if reply_upd:
                 sync_operations.append((
                     "reel comment replies", db.reels, {"comments.replies.user_id": uid},
-                    reply_upd, [{"r.user_id": uid}],
+                    reply_upd, [{"c.replies.user_id": uid}, {"r.user_id": uid}],
                 ))
             if message_upd:
                 sync_operations.append(("direct messages", db.messages, {"from_id": uid}, message_upd, None))
