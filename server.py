@@ -1435,7 +1435,7 @@ postbluom.online"""
     # ── Profile ───────────────────────────────────────────────────
     @api.patch("/profile")
     async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
-        upd = {k: v for k, v in p.model_dump().items() if v is not None}
+        upd = p.model_dump(exclude_unset=True)
         for field in ("avatar_photo", "profile_video", "cover_photo", "cover_video"):
             _reject_inline_media(upd.get(field), field)
         for field in ("dob_month_day_visibility", "dob_year_visibility"):
@@ -1452,43 +1452,80 @@ postbluom.online"""
         if upd:
             await db.users.update_one({"id": u["id"]}, {"$set": upd})
 
-            # Build denormalized updates and run them in the background
-            # so the response returns immediately to the client
-            post_upd = {}
-            if "name" in upd: post_upd["user_name"] = upd["name"]
-            if "handle" in upd: post_upd["user_handle"] = upd["handle"]
-            if "avatar_bg" in upd: post_upd["avatar_bg"] = upd["avatar_bg"]
-            if "avatar_letter" in upd: post_upd["avatar_letter"] = upd["avatar_letter"]
-            if "avatar_photo" in upd: post_upd["avatar_photo"] = upd["avatar_photo"]
-
-            comment_upd = {}
-            if "name" in upd: comment_upd["comments.$[c].user_name"] = upd["name"]
-            if "handle" in upd: comment_upd["comments.$[c].user_handle"] = upd["handle"]
-            if "avatar_bg" in upd: comment_upd["comments.$[c].avatar_bg"] = upd["avatar_bg"]
-            if "avatar_letter" in upd: comment_upd["comments.$[c].avatar_letter"] = upd["avatar_letter"]
-            if "avatar_photo" in upd: comment_upd["comments.$[c].avatar_photo"] = upd["avatar_photo"]
-
-            msg_upd = {}
-            if "name" in upd: msg_upd["from_name"] = upd["name"]
-            if "avatar_bg" in upd: msg_upd["avatar_bg"] = upd["avatar_bg"]
-            if "avatar_photo" in upd: msg_upd["avatar_photo"] = upd["avatar_photo"]
-
+            # Refresh denormalized author snapshots before returning so profile saves
+            # are immediately consistent across feeds, comments, chats, and notifications.
             uid = u["id"]
-            async def _bg():
+            owner_field_map = {
+                "name": "user_name", "handle": "user_handle",
+                "avatar_bg": "avatar_bg", "avatar_letter": "avatar_letter",
+                "avatar_photo": "avatar_photo", "is_badge_verified": "is_badge_verified",
+                "verified_category": "verified_category",
+            }
+            owner_upd = {}
+            comment_upd = {}
+            reply_upd = {}
+            for source, target in owner_field_map.items():
+                if source in upd:
+                    owner_upd[target] = upd[source]
+                    comment_upd["comments.$[c]." + target] = upd[source]
+                    reply_upd["comments.$[c].replies.$[r]." + target] = upd[source]
+
+            message_field_map = {
+                "name": "from_name", "handle": "from_handle",
+                "avatar_bg": "from_avatar_bg", "avatar_letter": "from_avatar_letter",
+                "avatar_photo": "from_avatar_photo",
+                "is_badge_verified": "from_is_badge_verified",
+            }
+            message_upd = {target: upd[source] for source, target in message_field_map.items() if source in upd}
+            group_message_upd = dict(message_upd)
+
+            notification_field_map = {
+                "name": "from_user_name", "avatar_photo": "from_user_avatar",
+                "avatar_bg": "from_user_bg", "avatar_letter": "from_user_letter",
+            }
+            notification_upd = {target: upd[source] for source, target in notification_field_map.items() if source in upd}
+
+            mention_field_map = {
+                "name": "source_user_name", "handle": "source_user_handle",
+                "avatar_photo": "source_user_avatar", "avatar_bg": "source_user_bg",
+                "avatar_letter": "source_user_letter",
+            }
+            mention_upd = {target: upd[source] for source, target in mention_field_map.items() if source in upd}
+
+            sync_operations = []
+            if owner_upd:
+                sync_operations.extend([
+                    ("posts", db.posts, {"user_id": uid}, owner_upd, None),
+                    ("reels", db.reels, {"user_id": uid}, owner_upd, None),
+                    ("world reports", db.world_reports, {"user_id": uid}, owner_upd, None),
+                ])
+            if comment_upd:
+                sync_operations.extend([
+                    ("post comments", db.posts, {"comments.user_id": uid}, comment_upd, [{"c.user_id": uid}]),
+                    ("reel comments", db.reels, {"comments.user_id": uid}, comment_upd, [{"c.user_id": uid}]),
+                    ("report comments", db.world_reports, {"comments.user_id": uid}, comment_upd, [{"c.user_id": uid}]),
+                ])
+            if reply_upd:
+                sync_operations.append((
+                    "reel comment replies", db.reels, {"comments.replies.user_id": uid},
+                    reply_upd, [{"c.replies.user_id": uid}, {"r.user_id": uid}],
+                ))
+            if message_upd:
+                sync_operations.append(("direct messages", db.messages, {"from_id": uid}, message_upd, None))
+            if group_message_upd:
+                sync_operations.append(("group messages", db.group_messages, {"from_id": uid}, group_message_upd, None))
+            if notification_upd:
+                sync_operations.append(("notifications", db.notifications, {"from_user_id": uid}, notification_upd, None))
+            if mention_upd:
+                sync_operations.append(("reel mentions", db.reel_mentions, {"source_user_id": uid}, mention_upd, None))
+
+            for label, collection, query, changes, array_filters in sync_operations:
                 try:
-                    if post_upd:
-                        await db.posts.update_many({"user_id": uid}, {"$set": post_upd})
-                    if comment_upd:
-                        await db.posts.update_many(
-                            {"comments.user_id": uid},
-                            {"$set": comment_upd},
-                            array_filters=[{"c.user_id": uid}],
-                        )
-                    if msg_upd:
-                        await db.messages.update_many({"from_id": uid}, {"$set": msg_upd})
+                    options = {"array_filters": array_filters} if array_filters else {}
+                    await collection.update_many(query, {"$set": changes}, **options)
                 except Exception:
-                    pass
-            asyncio.create_task(_bg())
+                    logging.exception("Failed to synchronize %s for user %s", label, uid)
+                    raise HTTPException(503, "Profile saved, but some profile images could not be refreshed. Please try saving again.")
 
         return await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
 
@@ -2623,7 +2660,7 @@ postbluom.online"""
         c = {
             "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
-            "avatar_letter": u["avatar_letter"], "text": p.text,
+            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"), "text": p.text,
             "created_at": now().isoformat(),
         }
         await db.posts.update_one({"id": pid}, {"$push": {"comments": c}})
@@ -3347,6 +3384,10 @@ postbluom.online"""
             "id":               str(uuid.uuid4()),
             "from_id":          u["id"],
             "from_name":        u["name"],
+            "from_handle":      u["handle"],
+            "from_avatar_bg":   u.get("avatar_bg"),
+            "from_avatar_letter": u.get("avatar_letter"),
+            "from_avatar_photo": u.get("avatar_photo"),
             "to_id":            p.to_user_id,
             "text":             p.text,
             "photo_url":        p.photo_url,
