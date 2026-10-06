@@ -2228,10 +2228,7 @@ postbluom.online"""
         """
         likes_ids = r.get("likes", [])
         views_raw = r.get("views", [])
-        view_count = max(
-            len(views_raw) if isinstance(views_raw, list) else 0,
-            int(r.get("view_count") or 0),
-        )
+        view_count = len(set(views_raw)) if isinstance(views_raw, list) else 0
         return {
             "id": r["id"],
             "user_id": r["user_id"],
@@ -4456,6 +4453,7 @@ postbluom.online"""
             "shares":            [],
             "comments":          [],
             "comment_count":     0,
+            "views":             [],
             "view_count":        0,
             "created_at":        now().isoformat(),
             "sticker_overlays":  sticker_overlays,
@@ -4516,7 +4514,7 @@ postbluom.online"""
                 "save_count": {"$max": [{"$size": _safe_reel_array("saves")}, _safe_reel_count("save_count")]},
                 "comment_count": {"$max": [{"$size": _safe_reel_array("comments")}, _safe_reel_count("comment_count")]},
                 "share_count": {"$max": [{"$size": _safe_reel_array("shares")}, _safe_reel_count("share_count")]},
-                "view_count": {"$max": [{"$size": _safe_reel_array("views")}, _safe_reel_count("view_count")]},
+                "view_count": {"$size": {"$setUnion": [_safe_reel_array("views"), []]}},
             }},
             {"$project": {"_id": 0, "likes": 0, "saves": 0, "comments": 0, "shares": 0, "views": 0}},
         ]).to_list(limit)
@@ -4585,7 +4583,7 @@ postbluom.online"""
             rows.insert(0, source)
         for row in rows:
             embedded_views = row.get("views") if isinstance(row.get("views"), list) else []
-            row["view_count"] = max(len(embedded_views), int(row.get("view_count") or 0))
+            row["view_count"] = len(set(embedded_views))
             row.pop("likes", None)
             row.pop("saves", None)
             row.pop("comments", None)
@@ -4647,7 +4645,7 @@ postbluom.online"""
                     age_hours = 0
             except Exception:
                 age_hours = 0
-            _va=r.get("views",[]); views=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+            _va=r.get("views",[]); views=len(set(_va)) if isinstance(_va,list) else 0
             likes = len(r.get("likes") or [])
             comments = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
             shares = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
@@ -4686,7 +4684,7 @@ postbluom.online"""
             r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
             r["mention_count"] = mention_counts.get(r["id"], int(r.get("mention_count") or 0))
             r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
-            _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+            _va=r.get("views",[]); r["view_count"]=len(set(_va)) if isinstance(_va,list) else 0
             r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
         return {"reels": page, "has_more": (skip + limit) < len(reels_raw), "skip": skip, "limit": limit}
 
@@ -4705,25 +4703,40 @@ postbluom.online"""
         except (TypeError, ValueError):
             completion_ratio = 0.0
         category = str(payload.get("category") or reel.get("category") or "general").strip().lower()[:40] or "general"
-        await db.reels.update_one(
-            {"id": reel_id},
-            {"$addToSet": {"views": u["id"]}, "$inc": {"view_count": 1}},
+        viewer_id = u["id"]
+        safe_views = {"$cond": [{"$isArray": "$views"}, "$views", []]}
+        viewer_views = {"$setUnion": [safe_views, [{"$literal": viewer_id}]]}
+        view_update = await db.reels.update_one(
+            {"id": reel_id, "views": {"$ne": viewer_id}},
+            [{"$set": {"views": viewer_views, "view_count": {"$size": viewer_views}}}],
         )
-        await db.reel_view_events.insert_one({
-            "user_id": u["id"],
-            "reel_id": reel_id,
-            "creator_id": reel.get("user_id"),
-            "category": category,
-            "watch_seconds": watch_seconds,
-            "completion_ratio": completion_ratio,
-            "event_at": now().isoformat(),
-        })
-        await db.reel_rank_stats.update_one(
-            {"reel_id": reel_id},
-            {"$inc": {"total_views": 1, "completion_sum": completion_ratio, "watch_seconds_sum": watch_seconds},
-             "$set": {"reel_id": reel_id, "updated_at": now().isoformat()}},
+        is_new_view = view_update.modified_count > 0
+        if not is_new_view:
+            # Legacy counters could already include duplicate plays. Keep the stored
+            # aggregate equal to the distinct viewer IDs instead of preserving it.
+            unique_views = {"$setUnion": [safe_views, []]}
+            await db.reels.update_one(
+                {"id": reel_id},
+                [{"$set": {"view_count": {"$size": unique_views}}}],
+            )
+
+        event_at = now().isoformat()
+        await db.reel_view_events.update_one(
+            {"user_id": viewer_id, "reel_id": reel_id},
+            {
+                "$setOnInsert": {"event_at": event_at},
+                "$set": {"creator_id": reel.get("user_id"), "category": category},
+                "$max": {"watch_seconds": watch_seconds, "completion_ratio": completion_ratio},
+            },
             upsert=True,
         )
+        if is_new_view:
+            await db.reel_rank_stats.update_one(
+                {"reel_id": reel_id},
+                {"$inc": {"total_views": 1, "completion_sum": completion_ratio, "watch_seconds_sum": watch_seconds},
+                 "$set": {"reel_id": reel_id, "updated_at": event_at}},
+                upsert=True,
+            )
         return {"ok": True}
 
     @api.get("/search")
@@ -4765,7 +4778,7 @@ postbluom.online"""
                 r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
                 r["share_count"]  = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
                 r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
-                _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+                _va=r.get("views",[]); r["view_count"]=len(set(_va)) if isinstance(_va,list) else 0
                 r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
             results["reels"] = reels_found
 
@@ -5947,6 +5960,7 @@ postbluom.online"""
         since = (now() - timedelta(days=days)).isoformat()
         rows = await db.reel_view_events.aggregate([
             {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}}},
+            {"$group": {"_id": "$reel_id", "category": {"$max": "$category"}, "watch_seconds": {"$max": "$watch_seconds"}}},
             {"$group": {"_id": "$category", "watch_seconds": {"$sum": "$watch_seconds"}}},
             {"$sort": {"watch_seconds": -1}},
             {"$limit": limit},
@@ -5964,6 +5978,7 @@ postbluom.online"""
         since = (now() - timedelta(minutes=5)).isoformat()
         rows = await db.reel_view_events.aggregate([
             {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}}},
+            {"$group": {"_id": "$reel_id", "category": {"$max": "$category"}, "watch_seconds": {"$max": "$watch_seconds"}}},
             {"$group": {"_id": "$category", "watch_seconds": {"$sum": "$watch_seconds"}}},
             {"$sort": {"watch_seconds": -1}},
             {"$limit": 3},
@@ -5973,10 +5988,16 @@ postbluom.online"""
     async def _reels_active_hour_categories(user_id):
         since = (now() - timedelta(days=14)).isoformat()
         current_hour = now().hour
-        rows = await db.reel_view_events.find(
-            {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}},
-            {"_id": 0, "category": 1, "watch_seconds": 1, "event_at": 1},
-        ).to_list(2000)
+        rows = await db.reel_view_events.aggregate([
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}}},
+            {"$group": {
+                "_id": "$reel_id",
+                "category": {"$max": "$category"},
+                "watch_seconds": {"$max": "$watch_seconds"},
+                "event_at": {"$max": "$event_at"},
+            }},
+            {"$project": {"_id": 0, "category": 1, "watch_seconds": 1, "event_at": 1}},
+        ]).to_list(2000)
         totals = {}
         for row in rows:
             if _reels_parse_datetime(row.get("event_at")).hour != current_hour:
@@ -6005,7 +6026,9 @@ postbluom.online"""
         )) if creator_ids else set()
         since = (now() - timedelta(days=3)).isoformat()
         quick_rows = await db.reel_view_events.aggregate([
-            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$in": categories}, "watch_seconds": {"$lt": REELS_ALGO_QUICK_SKIP_SECONDS}}},
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$in": categories}}},
+            {"$group": {"_id": "$reel_id", "category": {"$max": "$category"}, "watch_seconds": {"$max": "$watch_seconds"}}},
+            {"$match": {"watch_seconds": {"$lt": REELS_ALGO_QUICK_SKIP_SECONDS}}},
             {"$group": {"_id": "$category", "skip_count": {"$sum": 1}}},
             {"$match": {"skip_count": {"$gte": REELS_ALGO_QUICK_SKIP_MIN_COUNT}}},
         ]).to_list(len(categories)) if categories else []
@@ -6049,13 +6072,15 @@ postbluom.online"""
         if not reel_ids:
             return {}
         stats = {}
-        stored = await db.reel_rank_stats.find({"reel_id": {"$in": reel_ids}}, {"_id": 0}).to_list(len(reel_ids))
-        for row in stored:
-            stats[row["reel_id"]] = dict(row)
         all_time = await db.reel_view_events.aggregate([
             {"$match": {"reel_id": {"$in": reel_ids}}},
             {"$group": {
-                "_id": "$reel_id",
+                "_id": {"reel_id": "$reel_id", "user_id": "$user_id"},
+                "completion_ratio": {"$max": "$completion_ratio"},
+                "watch_seconds": {"$max": "$watch_seconds"},
+            }},
+            {"$group": {
+                "_id": "$_id.reel_id",
                 "total_views": {"$sum": 1},
                 "completion_sum": {"$sum": "$completion_ratio"},
                 "watch_seconds_sum": {"$sum": "$watch_seconds"},
@@ -6064,7 +6089,7 @@ postbluom.online"""
         for row in all_time:
             reel_stats = stats.setdefault(row["_id"], {})
             total_views = int(row.get("total_views") or 0)
-            reel_stats["total_views"] = max(int(reel_stats.get("total_views") or 0), total_views)
+            reel_stats["total_views"] = total_views
             reel_stats["completion_sum"] = float(row.get("completion_sum") or 0)
             reel_stats["watch_seconds_sum"] = float(row.get("watch_seconds_sum") or 0)
             reel_stats["avg_completion"] = float(row.get("completion_sum") or 0) / max(total_views, 1)
@@ -6072,7 +6097,11 @@ postbluom.online"""
         hourly = await db.reel_view_events.aggregate([
             {"$match": {"reel_id": {"$in": reel_ids}, "event_at": {"$gte": since}}},
             {"$group": {
-                "_id": "$reel_id",
+                "_id": {"reel_id": "$reel_id", "user_id": "$user_id"},
+                "watch_seconds": {"$max": "$watch_seconds"},
+            }},
+            {"$group": {
+                "_id": "$_id.reel_id",
                 "views_1h": {"$sum": 1},
                 "watch_seconds_1h": {"$sum": "$watch_seconds"},
             }},
@@ -6130,6 +6159,10 @@ postbluom.online"""
         def _reel_array_size(field):
             return {"$size": {"$cond": [{"$isArray": field}, field, []]}}
 
+        def _reel_unique_array_size(field):
+            safe_array = {"$cond": [{"$isArray": field}, field, []]}
+            return {"$size": {"$setUnion": [safe_array, []]}}
+
         def _reel_array(field):
             return {"$cond": [{"$isArray": field}, field, []]}
 
@@ -6154,7 +6187,7 @@ postbluom.online"""
                 "created_at": 1,
                 "duration": 1,
                 "mention_count": 1,
-                "_rank_view_count": {"$max": [_reel_array_size("$views"), _reel_count_value("$view_count")]},
+                "_rank_view_count": _reel_unique_array_size("$views"),
                 "_rank_like_count": _reel_array_size("$likes"),
                 "_rank_comment_count": {"$max": [_reel_array_size("$comments"), _reel_count_value("$comment_count")]},
                 "_rank_comment_likes": {"$reduce": {
@@ -6271,7 +6304,7 @@ postbluom.online"""
             if not reel_id:
                 continue
             stats = live_stats.get(reel_id, {})
-            total_views = max(int(reel.get("_rank_view_count") or 0), int(stats.get("total_views") or 0), 1)
+            total_views = max(int(reel.get("_rank_view_count") or 0), int(stats.get("total_views") or 0))
             observed_views = max(int(stats.get("total_views") or 0), 1)
             completion_sum = float(stats.get("completion_sum") or 0)
             completion = completion_sum / observed_views if completion_sum else float(stats.get("avg_completion") or 0)
@@ -6287,7 +6320,7 @@ postbluom.online"""
             mentions = mention_counts.get(reel_id, int(reel.get("mention_count") or 0))
             # Documented intent order: share > save > comment > comment-like > like.
             engagement_points = likes + comments * 3 + comment_likes + mentions * 2 + shares * 5 + saves * 4
-            engagement = engagement_points / total_views
+            engagement = engagement_points / max(total_views, 1)
             hours_old = max(0.0, (now_utc - _reels_parse_datetime(reel.get("created_at"))).total_seconds() / 3600)
             recency = 1.0 / (1.0 + hours_old)
             category = _reels_category(reel)
@@ -6369,7 +6402,7 @@ postbluom.online"""
                 "save_count": {"$max": [_reel_array_size("$saves"), _reel_count_value("$save_count")]},
                 "comment_count": {"$max": [_reel_array_size("$comments"), _reel_count_value("$comment_count")]},
                 "share_count": {"$max": [_reel_array_size("$shares"), _reel_count_value("$share_count")]},
-                "view_count": {"$max": [_reel_array_size("$views"), _reel_count_value("$view_count")]},
+                "view_count": _reel_unique_array_size("$views"),
             }},
             {"$project": {"_id": 0, "likes": 0, "saves": 0, "shares": 0, "views": 0}},
         ]).to_list(len(final_reel_ids)) if final_reel_ids else []
@@ -6489,7 +6522,7 @@ postbluom.online"""
                 "_id": 0,
                 "id": 1,
                 "mention_count": 1,
-                "content_views": {"$max": [_array_size("$views"), _count_value("$view_count")]},
+                "content_views": {"$size": {"$setUnion": [{"$cond": [{"$isArray": "$views"}, "$views", []]}, []]}},
                 "likes": _array_size("$likes"),
                 "comments": _array_size("$comments"),
                 "comment_likes": {"$reduce": {
@@ -6516,6 +6549,7 @@ postbluom.online"""
                 {"$set": {
                     "reel_id": reel_id,
                     "content_views": int(reel.get("content_views") or 0),
+                    "total_views": int(reel.get("content_views") or 0),
                     "likes": int(reel.get("likes") or 0),
                     "comments": int(reel.get("comments") or 0),
                     "comment_likes": int(reel.get("comment_likes") or 0),
