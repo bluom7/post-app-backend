@@ -14,7 +14,7 @@ try:
     from pydantic import BaseModel, EmailStr, field_validator
     from typing import Optional, List
     from datetime import datetime, timezone, timedelta
-    import base64, asyncio, urllib.request, urllib.parse, json as _json
+    import base64, asyncio, urllib.request, urllib.parse, json as _json, tempfile
     import time as _time
     import hashlib as _hl, hmac as _hmac, os as _os
     from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, ECDSA, SECP256R1
@@ -1366,6 +1366,14 @@ postbluom.online"""
                 raise HTTPException(400, str(e))
             upd["handle"] = f"@{upd['username']}"
         if upd:
+            for field in ("profile_video", "cover_video"):
+                _reject_inline_data_uri(upd.get(field), field)
+            for field in ("avatar_photo", "cover_photo"):
+                if field in upd:
+                    upd[field] = await _cloudinaryize_inline_image(
+                        upd[field], "post-app/profile-photos",
+                        f"profile_{u['id']}_{field}_{uuid.uuid4().hex}",
+                    )
             await db.users.update_one({"id": u["id"]}, {"$set": upd})
 
             # Build denormalized updates and run them in the background
@@ -1748,6 +1756,64 @@ postbluom.online"""
         # File seek/tell is blocking for disk-backed uploads; keep it off the event loop.
         return await asyncio.to_thread(_measure_upload_size, file)
 
+    CLOUDINARY_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+    _cloudinary_upload_semaphore = asyncio.Semaphore(2)
+
+    async def _upload_large_to_cloudinary(file, **options):
+        """Upload video/audio in bounded chunks and limit concurrent transfers."""
+        async with _cloudinary_upload_semaphore:
+            return await asyncio.to_thread(
+                cloudinary.uploader.upload_large,
+                file,
+                chunk_size=CLOUDINARY_UPLOAD_CHUNK_BYTES,
+                **options,
+            )
+
+    async def _cloudinaryize_inline_image(value, folder: str, public_id: str):
+        """Replace a small legacy image data URI with a hosted URL before persistence."""
+        if value is None or value == "":
+            return value
+        if not isinstance(value, str):
+            raise HTTPException(400, "Invalid image value")
+        value = value.strip()
+        if not value.lower().startswith("data:"):
+            return value
+        metadata, separator, encoded = value.partition(",")
+        if not separator or not metadata.lower().startswith("data:image/") or ";base64" not in metadata.lower() or not encoded:
+            raise HTTPException(400, "Invalid image data. Please choose the image again.")
+        max_encoded_chars = 4 * ((10 * 1024 * 1024 + 2) // 3)
+        if len(encoded) > max_encoded_chars:
+            raise HTTPException(413, "Image is too large. Max 10MB.")
+        if not ((CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) or CLOUDINARY_URL):
+            raise HTTPException(500, "Image hosting is not configured on the server")
+        try:
+            async with _cloudinary_upload_semaphore:
+                result = await asyncio.to_thread(
+                    cloudinary.uploader.upload, value, resource_type="image",
+                    folder=folder, public_id=public_id, overwrite=False,
+                )
+        except Exception:
+            logging.exception("Cloudinary inline image upload failed")
+            raise HTTPException(502, "Image upload failed. Please try again.")
+        photo_url = result.get("secure_url") or result.get("url")
+        if not photo_url:
+            raise HTTPException(502, "Image upload did not return a URL")
+        return photo_url
+
+    def _reject_inline_data_uri(value, field_name: str):
+        if isinstance(value, str) and value.lstrip().lower().startswith("data:"):
+            raise HTTPException(400, f"{field_name} must be uploaded before saving; inline media is not stored.")
+
+    def _validate_post_media(p: PostIn):
+        for field_name, value in (("photo_url", p.photo_url), ("gif_url", p.gif_url),
+                                  ("music_artwork", p.music_artwork), ("music_preview_url", p.music_preview_url)):
+            _reject_inline_data_uri(value, field_name)
+        for value in p.photo_urls or []:
+            _reject_inline_data_uri(value, "photo_urls")
+        for sticker in p.sticker_overlays or []:
+            if isinstance(sticker, dict):
+                _reject_inline_data_uri(sticker.get("url"), "sticker URL")
+
     def _validate_post_video(video_url: Optional[str], video_duration: Optional[float]):
         """Raises HTTPException if the given video URL is missing/invalid or too long.
 
@@ -1773,14 +1839,15 @@ postbluom.online"""
         if upload_size > 10 * 1024 * 1024:
             raise HTTPException(400, "Image is too large. Max 10MB.")
         try:
-            result = await asyncio.to_thread(
-                cloudinary.uploader.upload,
-                file.file,
-                resource_type="image",
-                folder="post-app/photos",
-                public_id=f"{u['id']}_{uuid.uuid4().hex}",
-                overwrite=False,
-            )
+            async with _cloudinary_upload_semaphore:
+                result = await asyncio.to_thread(
+                    cloudinary.uploader.upload,
+                    file.file,
+                    resource_type="image",
+                    folder="post-app/photos",
+                    public_id=f"{u['id']}_{uuid.uuid4().hex}",
+                    overwrite=False,
+                )
         except Exception:
             logging.exception("Cloudinary photo upload failed")
             raise HTTPException(502, "Image upload failed. Please try again.")
@@ -1798,8 +1865,7 @@ postbluom.online"""
         if upload_size > 25 * 1024 * 1024:
             raise HTTPException(400, "Audio is too large. Max 25MB.")
         try:
-            result = await asyncio.to_thread(
-                cloudinary.uploader.upload,
+            result = await _upload_large_to_cloudinary(
                 file.file,
                 resource_type="video",   # Cloudinary uses "video" resource_type for audio files
                 folder="post-app/audio",
@@ -1857,7 +1923,7 @@ postbluom.online"""
             }]
 
         try:
-            result = await asyncio.to_thread(cloudinary.uploader.upload, file.file, **upload_kwargs)
+            result = await _upload_large_to_cloudinary(file.file, **upload_kwargs)
         except Exception as e:
             # Log the full Cloudinary error server-side only — it can include
             # internal signing details ("String to sign - ...") that must never
@@ -1885,21 +1951,46 @@ postbluom.online"""
     # already-migrated (http/https) values are skipped.
     MIGRATION_SECRET = os.environ.get("MIGRATION_SECRET", "").strip()
 
-    def _decode_data_uri_video(data_uri: str) -> bytes:
-        header, _, b64data = data_uri.partition(",")
-        return base64.b64decode(b64data)
+    def _decode_data_uri_video(data_uri: str):
+        header, separator, b64data = data_uri.partition(",")
+        if not separator or not header.lower().startswith("data:video/") or ";base64" not in header.lower():
+            raise ValueError("Invalid video data URI")
+        max_encoded_chars = 4 * ((MAX_UPLOAD_VIDEO_BYTES + 2) // 3)
+        if len(b64data) > max_encoded_chars:
+            raise ValueError("Legacy video exceeds the 100MB migration limit")
+        stream = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+        try:
+            chunk_chars = 4 * 1024 * 1024  # multiple of four for base64 decoding
+            total_bytes = 0
+            for offset in range(0, len(b64data), chunk_chars):
+                decoded = base64.b64decode(b64data[offset:offset + chunk_chars], validate=True)
+                total_bytes += len(decoded)
+                if total_bytes > MAX_UPLOAD_VIDEO_BYTES:
+                    raise ValueError("Legacy video exceeds the 100MB migration limit")
+                stream.write(decoded)
+            if total_bytes == 0:
+                raise ValueError("Legacy video is empty")
+            stream.seek(0)
+            return stream
+        except Exception:
+            stream.close()
+            raise
 
     async def _migrate_one_video(data_uri: str, public_id: str) -> Optional[str]:
+        raw_stream = None
         try:
-            raw = _decode_data_uri_video(data_uri)
-            result = cloudinary.uploader.upload(
-                raw, resource_type="video", folder="post-app/videos-migrated",
+            raw_stream = await asyncio.to_thread(_decode_data_uri_video, data_uri)
+            result = await _upload_large_to_cloudinary(
+                raw_stream, resource_type="video", folder="post-app/videos-migrated",
                 public_id=public_id, overwrite=False,
             )
             return result.get("secure_url")
         except Exception:
             logging.exception(f"Video migration failed for {public_id}")
             return None
+        finally:
+            if raw_stream is not None:
+                raw_stream.close()
 
     @api.post("/admin/migrate-videos-to-cloudinary")
     async def migrate_videos_to_cloudinary(request: Request):
@@ -1947,6 +2038,7 @@ postbluom.online"""
     @api.post("/posts")
     async def create_post(p: PostIn, u=Depends(current_user)):
         _validate_post_video(p.video_url, p.video_duration)
+        _validate_post_media(p)
         # A post is either a photo carousel or a single video, never both
         has_video = bool(p.video_url)
         doc = {
@@ -2297,6 +2389,7 @@ postbluom.online"""
         if not post: raise HTTPException(404, "Post not found")
         if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
         _validate_post_video(p.video_url, p.video_duration)
+        _validate_post_media(p)
         upd = {"content": p.content, "accent": p.accent, "location": p.location or "", "edited_at": now().isoformat()}
         if p.video_url is not None:
             # Switching to a video clears any existing photos, keeping the two mutually exclusive
@@ -2977,6 +3070,8 @@ postbluom.online"""
     @api.post("/messages")
     async def send_message(p: MessageIn, u=Depends(current_user)):
         """Save message to DB, then push to receiver via WebSocket if online."""
+        for field, value in (("photo_url", p.photo_url), ("gif_url", p.gif_url), ("audio_url", p.audio_url)):
+            _reject_inline_data_uri(value, field)
         if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id and not p.audio_url:
             raise HTTPException(400, "Message cannot be empty")
         recipient = await db.users.find_one({"id": p.to_user_id})
@@ -4013,8 +4108,12 @@ postbluom.online"""
         if len(p.text) > 2000:
             raise HTTPException(400, "Report too long (max 2000 chars)")
         loc_type = p.location_type.upper() if p.location_type and p.location_type.lower() != "world" else "world"
+        report_id = str(uuid.uuid4())
+        photo_url = await _cloudinaryize_inline_image(
+            p.photo_url, "post-app/world-reports", f"report_{report_id}_{uuid.uuid4().hex}",
+        )
         doc = {
-            "id": str(uuid.uuid4()),
+            "id": report_id,
             "user_id": u["id"],
             "user_name": u["name"],
             "user_handle": u["handle"],
@@ -4027,7 +4126,7 @@ postbluom.online"""
             "is_badge_verified": bool(u.get("is_badge_verified")),
             "verified_category": u.get("verified_category") or None,
             "text": p.text.strip(),
-            "photo_url": p.photo_url or None,
+            "photo_url": photo_url or None,
             "location_type": loc_type,
             "location_label": p.location_label or ("World" if loc_type == "world" else loc_type),
             "likes": [], "like_count": 0,
@@ -4148,8 +4247,7 @@ postbluom.online"""
         if upload_size > MAX_UPLOAD_VIDEO_BYTES:
             raise HTTPException(400, "Video is too large. Max 100 MB.")
         try:
-            result = await asyncio.to_thread(
-                cloudinary.uploader.upload,
+            result = await _upload_large_to_cloudinary(
                 file.file,
                 resource_type="video",
                 folder="post-app/reels",
@@ -4171,6 +4269,13 @@ postbluom.online"""
     async def create_reel(body: dict, u=Depends(current_user)):
         video_url      = (body.get("video_url") or "").strip()
         photo_url      = (body.get("photo_url") or "").strip()
+        _reject_inline_data_uri(video_url, "video_url")
+        _reject_inline_data_uri(photo_url, "photo_url")
+        _reject_inline_data_uri((body.get("music_artwork") or "").strip(), "music_artwork")
+        _reject_inline_data_uri((body.get("music_url") or "").strip(), "music_url")
+        for sticker in body.get("sticker_overlays") or []:
+            if isinstance(sticker, dict):
+                _reject_inline_data_uri(sticker.get("url"), "sticker URL")
         caption        = (body.get("caption") or "").strip()
         audio_label    = (body.get("audio_label") or "Original Audio").strip()
         duration       = int(body.get("duration") or 0)
@@ -4670,6 +4775,7 @@ postbluom.online"""
     async def add_reel_comment(reel_id: str, body: dict, u=Depends(current_user)):
         text = (body.get("text") or "").strip()
         gif_url = (body.get("gif_url") or "").strip() or None
+        _reject_inline_data_uri(gif_url, "gif_url")
         if not text and not gif_url:
             raise HTTPException(400, "Empty comment")
         reel = await db.reels.find_one({"id": reel_id}, {"user_id": 1, "_id": 0})
@@ -4750,6 +4856,7 @@ postbluom.online"""
     async def add_reel_comment_reply(reel_id: str, comment_id: str, body: dict, u=Depends(current_user)):
         text = (body.get("text") or "").strip()
         gif_url = (body.get("gif_url") or "").strip() or None
+        _reject_inline_data_uri(gif_url, "gif_url")
         if not text and not gif_url:
             raise HTTPException(400, "Empty reply")
         reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
@@ -4847,12 +4954,17 @@ postbluom.online"""
         if not name:
             raise HTTPException(400, "Group name required")
         members = list(set([u["id"]] + p.member_ids))
+        group_id = str(uuid.uuid4())
+        avatar_photo = await _cloudinaryize_inline_image(
+            p.avatar_photo, "post-app/group-avatars",
+            f"group_{group_id}_{uuid.uuid4().hex}",
+        )
         doc = {
-            "id": str(uuid.uuid4()),
+            "id": group_id,
             "name": name,
             "avatar_color": p.avatar_color or "#FFD600",
             "avatar_letter": name[0].upper(),
-            "avatar_photo": p.avatar_photo or None,
+            "avatar_photo": avatar_photo or None,
             "creator_id": u["id"],
             "admins": [u["id"]],
             "members": members,
@@ -4907,13 +5019,14 @@ postbluom.online"""
         # handing it to Cloudinary so the complete selected image is uploaded.
         file.file.seek(0)
         try:
-            result = await asyncio.to_thread(
-                cloudinary.uploader.upload,
-                file.file, resource_type="image",
-                folder="post-app/group-avatars",
-                public_id=f"group_{group_id}_{uuid.uuid4().hex}",
-                overwrite=False,
-            )
+            async with _cloudinary_upload_semaphore:
+                result = await asyncio.to_thread(
+                    cloudinary.uploader.upload,
+                    file.file, resource_type="image",
+                    folder="post-app/group-avatars",
+                    public_id=f"group_{group_id}_{uuid.uuid4().hex}",
+                    overwrite=False,
+                )
         except Exception:
             logging.exception("Group avatar upload failed")
             raise HTTPException(502, "Image upload failed. Please try again.")
@@ -4935,7 +5048,11 @@ postbluom.online"""
             upd["name"] = body["name"].strip()
             upd["avatar_letter"] = body["name"].strip()[0].upper()
         if "avatar_color" in body: upd["avatar_color"] = body["avatar_color"]
-        if "avatar_photo" in body: upd["avatar_photo"] = body["avatar_photo"]
+        if "avatar_photo" in body:
+            upd["avatar_photo"] = await _cloudinaryize_inline_image(
+                body["avatar_photo"], "post-app/group-avatars",
+                f"group_{group_id}_{uuid.uuid4().hex}",
+            )
         if upd: await db.groups.update_one({"id": group_id}, {"$set": upd})
         return {"ok": True}
 
@@ -4996,6 +5113,8 @@ postbluom.online"""
         g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "name": 1})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        for field, value in (("photo_url", p.photo_url), ("gif_url", p.gif_url), ("audio_url", p.audio_url)):
+            _reject_inline_data_uri(value, field)
         if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id and not p.audio_url:
             raise HTTPException(400, "Message cannot be empty")
         reply_to_preview = None
