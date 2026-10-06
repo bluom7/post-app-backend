@@ -2308,7 +2308,8 @@ postbluom.online"""
     ):
         query: dict = {}
         filter_public_authors = False
-        following_ids = u.get("following", [])
+        following_ids = u.get("following") or []
+        feed_visible_user_ids = []
         excluded_user_ids = set(
             (u.get("blocked_users") or []) + (u.get("muted_users") or [])
         )
@@ -2328,21 +2329,10 @@ postbluom.online"""
                     return {"posts": [], "total": 0, "skip": skip, "limit": limit, "private_locked": True}
             query["user_id"] = user_id
         elif feed:
-            # Show every public user's posts, plus the viewer's own and followed
-            # private accounts. Keep blocks and mutes out of the feed.
-            can_see_list = list(set(following_ids + [u["id"]]))
-            visible_user_docs = await db.users.find(
-                {"$or": [
-                    {"is_private": {"$ne": True}},
-                    {"id": {"$in": can_see_list}},
-                ]},
-                {"id": 1, "_id": 0},
-            ).to_list(None)
-            feed_ids = [
-                row["id"] for row in visible_user_docs
-                if row.get("id") and row["id"] not in excluded_user_ids
-            ]
-            query["user_id"] = {"$in": feed_ids}
+            # Resolve public visibility in MongoDB; do not load every public user ID into RAM.
+            # Followed private accounts and the viewer's own posts remain visible.
+            feed_visible_user_ids = list(set(following_ids + [u["id"]]))
+            filter_public_authors = True
         else:
             if q:
                 query["$or"] = [
@@ -2381,16 +2371,20 @@ postbluom.online"""
         ]}
         feed_user_filter = query.get("user_id")
 
-        # Reels get merged into the home feed and profile grid (but not search)
-        # so a shared reel shows up for followers/following, and stays on the
-        # poster's own profile — reusing the same user_id filter built above.
-        include_reels = (feed or bool(user_id)) and not q and feed_user_filter is not None
+        # Reels get merged into the home feed and profile grid (but not search).
+        include_reels = (feed or bool(user_id)) and not q
         fetch_n = skip + limit
         if filter_public_authors:
+            visible_author_filters = [
+                {"user_id": u["id"]},
+                {"_author.is_private": {"$ne": True}},
+            ]
+            if feed:
+                visible_author_filters.insert(0, {"user_id": {"$in": feed_visible_user_ids}})
             posts_task = db.posts.aggregate([
                 {"$match": query},
                 {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
-                {"$match": {"$or": [{"user_id": u["id"]}, {"_author.is_private": {"$ne": True}}]}},
+                {"$match": {"$or": visible_author_filters}},
                 {"$sort": {"created_at": -1}},
                 {"$limit": fetch_n},
                 {"$project": {"_id": 0, "_author": 0}},
@@ -2410,16 +2404,15 @@ postbluom.online"""
                 # Fetch normal feed reels and mentioned/reposted reels separately.
                 # Applying limit() to one combined query can drop an old reel
                 # before the mention/repost is merged into the Home feed.
-                normal_query = {"$and": [{"user_id": feed_user_filter}, legacy_media_filter]}
-                mentioned_query = {"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter]}
                 if feed:
-                    # Match the visibility rules used by the dedicated Reels feed.
-                    # Public reels are global; private/friends-only reels remain limited.
                     reel_visibility = {"$or": [
                         {"user_id": u["id"]},
                         {"$and": [
-                            {"user_id": feed_user_filter},
                             {"$or": [{"audience": {"$exists": False}}, {"audience": "public"}]},
+                            {"$or": [
+                                {"_author.is_private": {"$ne": True}},
+                                {"user_id": {"$in": feed_visible_user_ids}},
+                            ]},
                         ]},
                         {"user_id": {"$in": following_ids}, "audience": "friends"},
                         {"audience": "only_show", "audience_users": u["id"]},
@@ -2428,18 +2421,38 @@ postbluom.online"""
                         {"user_id": {"$nin": list(excluded_user_ids)}},
                         {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
                     ]}
-                    normal_query["$and"].extend([reel_visibility, reel_safety])
-                    mentioned_query["$and"].extend([reel_visibility, reel_safety])
-                    # Explicitly shared reels can belong to a private, non-followed account.
-                    normal_query["$and"][0] = {"$or": [
-                        {"user_id": feed_user_filter},
-                        {"audience": "only_show", "audience_users": u["id"]},
+
+                    def _feed_reel_pipeline(base_query, result_limit):
+                        return [
+                            {"$match": base_query},
+                            {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
+                            {"$match": reel_visibility},
+                            {"$sort": {"created_at": -1}},
+                            {"$limit": result_limit},
+                            {"$project": {"_id": 0, "_author": 0}},
+                        ]
+
+                    normal_query = {"$and": [legacy_media_filter, reel_safety]}
+                    mentioned_query = {"$and": [
+                        {"id": {"$in": mentioned_ids}}, legacy_media_filter, reel_safety,
                     ]}
-                normal_task = db.reels.find(normal_query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
-                mentioned_task = (
-                    db.reels.find(mentioned_query, {"_id": 0}).sort("created_at", -1).to_list(len(mentioned_ids))
-                    if mentioned_ids else _empty_list()
-                )
+                    normal_task = db.reels.aggregate(
+                        _feed_reel_pipeline(normal_query, fetch_n)
+                    ).to_list(fetch_n)
+                    mentioned_task = (
+                        db.reels.aggregate(
+                            _feed_reel_pipeline(mentioned_query, len(mentioned_ids))
+                        ).to_list(len(mentioned_ids))
+                        if mentioned_ids else _empty_list()
+                    )
+                else:
+                    normal_query = {"$and": [{"user_id": feed_user_filter}, legacy_media_filter]}
+                    mentioned_query = {"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter]}
+                    normal_task = db.reels.find(normal_query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+                    mentioned_task = (
+                        db.reels.find(mentioned_query, {"_id": 0}).sort("created_at", -1).limit(len(mentioned_ids)).to_list(len(mentioned_ids))
+                        if mentioned_ids else _empty_list()
+                    )
                 normal_reels, mentioned_reels = await asyncio.gather(normal_task, mentioned_task)
                 merged_by_id = {}
                 for item in normal_reels + mentioned_reels:
