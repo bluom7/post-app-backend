@@ -2312,6 +2312,9 @@ postbluom.online"""
         excluded_user_ids = set(
             (u.get("blocked_users") or []) + (u.get("muted_users") or [])
         )
+
+        async def _empty_list():
+            return []
         if user_id and user_id != u["id"] and user_id in excluded_user_ids:
             return {"posts": [], "total": 0, "skip": skip, "limit": limit}
 
@@ -2325,32 +2328,19 @@ postbluom.online"""
                     return {"posts": [], "total": 0, "skip": skip, "limit": limit, "private_locked": True}
             query["user_id"] = user_id
         elif feed:
-            followers_ids = u.get("followers", [])
-            # Users we already have read access to (following + self)
-            can_see_ids = set(following_ids + [u["id"]])
-            can_see_list = list(can_see_ids)
-            # Run both user-set queries in PARALLEL for speed
-            async def _empty_list():
-                return []
-            follower_query = (
-                db.users.find(
-                    {"id": {"$in": followers_ids},
-                     "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
-                    {"id": 1, "_id": 0},
-                ).to_list(500)
-                if followers_ids else _empty_list()
-            )
-            verified_query = db.users.find(
-                {"is_badge_verified": True,
-                 "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
+            # Show every public user's posts, plus the viewer's own and followed
+            # private accounts. Keep blocks and mutes out of the feed.
+            can_see_list = list(set(following_ids + [u["id"]]))
+            visible_user_docs = await db.users.find(
+                {"$or": [
+                    {"is_private": {"$ne": True}},
+                    {"id": {"$in": can_see_list}},
+                ]},
                 {"id": 1, "_id": 0},
-            ).to_list(500)
-            visible_follower_docs, verified_docs = await asyncio.gather(follower_query, verified_query)
-            visible_follower_ids = [v["id"] for v in visible_follower_docs]
-            verified_ids = [v["id"] for v in verified_docs]
+            ).to_list(None)
             feed_ids = [
-                item_id for item_id in set(following_ids + visible_follower_ids + verified_ids + [u["id"]])
-                if item_id not in excluded_user_ids
+                row["id"] for row in visible_user_docs
+                if row.get("id") and row["id"] not in excluded_user_ids
             ]
             query["user_id"] = {"$in": feed_ids}
         else:
@@ -2420,13 +2410,34 @@ postbluom.online"""
                 # Fetch normal feed reels and mentioned/reposted reels separately.
                 # Applying limit() to one combined query can drop an old reel
                 # before the mention/repost is merged into the Home feed.
-                normal_task = db.reels.find(
-                    {"$and": [{"user_id": feed_user_filter}, legacy_media_filter]}, {"_id": 0}
-                ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+                normal_query = {"$and": [{"user_id": feed_user_filter}, legacy_media_filter]}
+                mentioned_query = {"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter]}
+                if feed:
+                    # Match the visibility rules used by the dedicated Reels feed.
+                    # Public reels are global; private/friends-only reels remain limited.
+                    reel_visibility = {"$or": [
+                        {"user_id": u["id"]},
+                        {"$and": [
+                            {"user_id": feed_user_filter},
+                            {"$or": [{"audience": {"$exists": False}}, {"audience": "public"}]},
+                        ]},
+                        {"user_id": {"$in": following_ids}, "audience": "friends"},
+                        {"audience": "only_show", "audience_users": u["id"]},
+                    ]}
+                    reel_safety = {"$and": [
+                        {"user_id": {"$nin": list(excluded_user_ids)}},
+                        {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
+                    ]}
+                    normal_query["$and"].extend([reel_visibility, reel_safety])
+                    mentioned_query["$and"].extend([reel_visibility, reel_safety])
+                    # Explicitly shared reels can belong to a private, non-followed account.
+                    normal_query["$and"][0] = {"$or": [
+                        {"user_id": feed_user_filter},
+                        {"audience": "only_show", "audience_users": u["id"]},
+                    ]}
+                normal_task = db.reels.find(normal_query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
                 mentioned_task = (
-                    db.reels.find(
-                        {"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter]}, {"_id": 0}
-                    ).sort("created_at", -1).to_list(len(mentioned_ids))
+                    db.reels.find(mentioned_query, {"_id": 0}).sort("created_at", -1).to_list(len(mentioned_ids))
                     if mentioned_ids else _empty_list()
                 )
                 normal_reels, mentioned_reels = await asyncio.gather(normal_task, mentioned_task)
