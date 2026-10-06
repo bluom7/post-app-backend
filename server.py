@@ -1769,7 +1769,7 @@ postbluom.online"""
                 **options,
             )
 
-    async def _cloudinaryize_inline_image(value, folder: str, public_id: str):
+    async def _cloudinaryize_inline_image(value, folder: str, public_id: str, overwrite: bool = False):
         """Replace a small legacy image data URI with a hosted URL before persistence."""
         if value is None or value == "":
             return value
@@ -1790,7 +1790,7 @@ postbluom.online"""
             async with _cloudinary_upload_semaphore:
                 result = await asyncio.to_thread(
                     cloudinary.uploader.upload, value, resource_type="image",
-                    folder=folder, public_id=public_id, overwrite=False,
+                    folder=folder, public_id=public_id, overwrite=overwrite,
                 )
         except Exception:
             logging.exception("Cloudinary inline image upload failed")
@@ -1942,13 +1942,10 @@ postbluom.online"""
             "video_height": result.get("height"),  # natural video height (px) from Cloudinary
         }
 
-    # ── One-time migration: move old base64 videos to Cloudinary ────
-    # Posts/profile/cover videos created before the Cloudinary upload was
-    # added are still stored as huge base64 "data:video/..." strings, so
-    # they still stutter/buffer for existing users. This endpoint finds
-    # every one of those, re-uploads the bytes to Cloudinary, and rewrites
-    # the field to the new streamable URL. Safe to call more than once —
-    # already-migrated (http/https) values are skipped.
+    # ── One-time migration: move legacy inline photos/videos to Cloudinary ────
+    # Legacy data URIs make feed responses enormous and prevent smooth video streaming.
+    # This authenticated, repeatable endpoint migrates posts, reels, and profile media
+    # one Mongo document at a time; it does not run during normal feed requests.
     MIGRATION_SECRET = os.environ.get("MIGRATION_SECRET", "").strip()
 
     def _decode_data_uri_video(data_uri: str):
@@ -1960,7 +1957,7 @@ postbluom.online"""
             raise ValueError("Legacy video exceeds the 100MB migration limit")
         stream = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
         try:
-            chunk_chars = 4 * 1024 * 1024  # multiple of four for base64 decoding
+            chunk_chars = 4 * 1024 * 1024
             total_bytes = 0
             for offset in range(0, len(b64data), chunk_chars):
                 decoded = base64.b64decode(b64data[offset:offset + chunk_chars], validate=True)
@@ -1982,7 +1979,7 @@ postbluom.online"""
             raw_stream = await asyncio.to_thread(_decode_data_uri_video, data_uri)
             result = await _upload_large_to_cloudinary(
                 raw_stream, resource_type="video", folder="post-app/videos-migrated",
-                public_id=public_id, overwrite=False,
+                public_id=public_id, overwrite=True,
             )
             return result.get("secure_url")
         except Exception:
@@ -1992,47 +1989,169 @@ postbluom.online"""
             if raw_stream is not None:
                 raw_stream.close()
 
+    async def _migrate_one_image(data_uri: str, folder: str, public_id: str) -> Optional[str]:
+        try:
+            return await _cloudinaryize_inline_image(data_uri, folder, public_id, overwrite=True)
+        except Exception:
+            logging.exception(f"Image migration failed for {public_id}")
+            return None
+
+    def _legacy_media_query(video_fields=(), image_fields=(), image_array_fields=(), overlay_fields=()):
+        conditions = []
+        for field in video_fields:
+            conditions.append({field: {"$regex": "^data:video/", "$options": "i"}})
+        for field in image_fields:
+            conditions.append({field: {"$regex": "^data:image/", "$options": "i"}})
+        for field in image_array_fields:
+            conditions.append({field: {"$elemMatch": {"$regex": "^data:image/", "$options": "i"}}})
+        for field in overlay_fields:
+            conditions.append({field + ".url": {"$regex": "^data:image/", "$options": "i"}})
+        return {"$or": conditions} if conditions else {"_id": {"$exists": False}}
+
+    async def _migrate_collection_media(collection, video_fields=(), image_fields=(), image_array_fields=(), overlay_fields=()):
+        projection = {"_id": 0, "id": 1}
+        for field in tuple(video_fields) + tuple(image_fields) + tuple(image_array_fields) + tuple(overlay_fields):
+            projection[field] = 1
+        result = {"documents_migrated": 0, "documents_failed": 0, "media_migrated": 0, "media_failed": 0}
+        cursor = collection.find(
+            _legacy_media_query(video_fields, image_fields, image_array_fields, overlay_fields), projection
+        ).batch_size(1)
+        async for doc in cursor:
+            doc_id = doc.get("id")
+            if doc_id is None:
+                result["documents_failed"] += 1
+                result["media_failed"] += 1
+                continue
+            safe_id = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(doc_id))[:80] or uuid.uuid4().hex
+            updates = {}
+            migrated = 0
+            failed = 0
+            video_cache = {}
+            image_cache = {}
+
+            for field in video_fields:
+                value = doc.get(field)
+                if isinstance(value, str) and value.lstrip().lower().startswith("data:video/"):
+                    if value not in video_cache:
+                        video_cache[value] = await _migrate_one_video(value, f"legacy_{safe_id}_{field}")
+                    new_url = video_cache[value]
+                    if new_url:
+                        updates[field] = new_url
+                        migrated += 1
+                    else:
+                        failed += 1
+
+            async def migrate_image(value, public_id):
+                if value not in image_cache:
+                    image_cache[value] = await _migrate_one_image(
+                        value, "post-app/photos-migrated", public_id
+                    )
+                return image_cache[value]
+
+            for field in image_fields:
+                value = doc.get(field)
+                if isinstance(value, str) and value.lstrip().lower().startswith("data:image/"):
+                    new_url = await migrate_image(value, f"legacy_{safe_id}_{field}")
+                    if new_url:
+                        updates[field] = new_url
+                        migrated += 1
+                    else:
+                        failed += 1
+
+            for field in image_array_fields:
+                values = doc.get(field)
+                if not isinstance(values, list):
+                    continue
+                new_values = list(values)
+                changed = False
+                for index, value in enumerate(values):
+                    if isinstance(value, str) and value.lstrip().lower().startswith("data:image/"):
+                        new_url = await migrate_image(value, f"legacy_{safe_id}_{field}_{index}")
+                        if new_url:
+                            new_values[index] = new_url
+                            migrated += 1
+                            changed = True
+                        else:
+                            failed += 1
+                if changed:
+                    updates[field] = new_values
+
+            for field in overlay_fields:
+                values = doc.get(field)
+                if not isinstance(values, list):
+                    continue
+                new_values = list(values)
+                changed = False
+                for index, overlay in enumerate(values):
+                    if not isinstance(overlay, dict):
+                        continue
+                    value = overlay.get("url")
+                    if isinstance(value, str) and value.lstrip().lower().startswith("data:image/"):
+                        new_url = await migrate_image(value, f"legacy_{safe_id}_{field}_{index}")
+                        if new_url:
+                            new_overlay = dict(overlay)
+                            new_overlay["url"] = new_url
+                            new_values[index] = new_overlay
+                            migrated += 1
+                            changed = True
+                        else:
+                            failed += 1
+                if changed:
+                    updates[field] = new_values
+
+            if updates:
+                try:
+                    saved = await collection.update_one({"id": doc_id}, {"$set": updates})
+                except Exception:
+                    logging.exception(f"Legacy media database update failed for {safe_id}")
+                    saved = None
+                if saved and saved.matched_count:
+                    result["documents_migrated"] += 1
+                    result["media_migrated"] += migrated
+                else:
+                    result["documents_failed"] += 1
+                    result["media_failed"] += migrated
+            if failed:
+                result["documents_failed"] += 1
+                result["media_failed"] += failed
+        return result
+
     @api.post("/admin/migrate-videos-to-cloudinary")
-    async def migrate_videos_to_cloudinary(request: Request):
+    @api.post("/admin/migrate-legacy-media-to-cloudinary")
+    async def migrate_legacy_media_to_cloudinary(request: Request):
         if not MIGRATION_SECRET or request.headers.get("x-migration-key") != MIGRATION_SECRET:
             raise HTTPException(403, "Not authorized")
-        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
-            raise HTTPException(500, "Video hosting is not configured on the server")
+        if not ((CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) or CLOUDINARY_URL):
+            raise HTTPException(500, "Media hosting is not configured on the server")
 
-        posts_migrated, posts_failed = 0, 0
-        users_migrated, users_failed = 0, 0
-
-        async for post in db.posts.find({"video_url": {"$regex": "^data:video/"}}):
-            new_url = await _migrate_one_video(post["video_url"], f"post_{post['id']}")
-            if new_url:
-                await db.posts.update_one({"id": post["id"]}, {"$set": {"video_url": new_url}})
-                posts_migrated += 1
-            else:
-                posts_failed += 1
-
-        async for user in db.users.find({
-            "$or": [
-                {"profile_video": {"$regex": "^data:video/"}},
-                {"cover_video": {"$regex": "^data:video/"}},
-            ]
-        }):
-            upd = {}
-            if user.get("profile_video", "").startswith("data:video/"):
-                new_url = await _migrate_one_video(user["profile_video"], f"profile_{user['id']}")
-                if new_url: upd["profile_video"] = new_url
-                else: users_failed += 1
-            if user.get("cover_video", "").startswith("data:video/"):
-                new_url = await _migrate_one_video(user["cover_video"], f"cover_{user['id']}")
-                if new_url: upd["cover_video"] = new_url
-                else: users_failed += 1
-            if upd:
-                await db.users.update_one({"id": user["id"]}, {"$set": upd})
-                users_migrated += 1
-
+        posts = await _migrate_collection_media(
+            db.posts,
+            video_fields=("video_url",),
+            image_fields=("photo_url", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"),
+            image_array_fields=("photo_urls",),
+            overlay_fields=("sticker_overlays",),
+        )
+        reels = await _migrate_collection_media(
+            db.reels,
+            video_fields=("video_url",),
+            image_fields=("photo_url", "music_artwork", "thumbnail_url"),
+            overlay_fields=("sticker_overlays",),
+        )
+        users = await _migrate_collection_media(
+            db.users,
+            video_fields=("profile_video", "cover_video"),
+            image_fields=("avatar_photo", "cover_photo"),
+        )
         return {
             "ok": True,
-            "posts_migrated": posts_migrated, "posts_failed": posts_failed,
-            "users_migrated": users_migrated, "users_failed": users_failed,
+            "posts_migrated": posts["documents_migrated"],
+            "posts_failed": posts["documents_failed"],
+            "reels_migrated": reels["documents_migrated"],
+            "reels_failed": reels["documents_failed"],
+            "users_migrated": users["documents_migrated"],
+            "users_failed": users["documents_failed"],
+            "media_migrated": posts["media_migrated"] + reels["media_migrated"] + users["media_migrated"],
+            "media_failed": posts["media_failed"] + reels["media_failed"] + users["media_failed"],
         }
 
     @api.post("/posts")
@@ -4378,7 +4497,29 @@ postbluom.online"""
         }
         if excluded:
             query["user_id"] = {"$nin": excluded}
-        reels_list = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        def _safe_reel_array(field):
+            value = "$" + field
+            return {"$cond": [{"$isArray": value}, value, []]}
+
+        def _safe_reel_count(field):
+            return {"$convert": {"input": "$" + field, "to": "long", "onError": 0, "onNull": 0}}
+
+        reels_list = await db.reels.aggregate([
+            {"$match": query},
+            {"$sort": {"created_at": -1}},
+            {"$skip": skip},
+            {"$limit": limit},
+            {"$addFields": {
+                "is_liked": {"$in": [u["id"], _safe_reel_array("likes")]},
+                "like_count": {"$max": [{"$size": _safe_reel_array("likes")}, _safe_reel_count("like_count")]},
+                "is_saved": {"$in": [u["id"], _safe_reel_array("saves")]},
+                "save_count": {"$max": [{"$size": _safe_reel_array("saves")}, _safe_reel_count("save_count")]},
+                "comment_count": {"$max": [{"$size": _safe_reel_array("comments")}, _safe_reel_count("comment_count")]},
+                "share_count": {"$max": [{"$size": _safe_reel_array("shares")}, _safe_reel_count("share_count")]},
+                "view_count": {"$max": [{"$size": _safe_reel_array("views")}, _safe_reel_count("view_count")]},
+            }},
+            {"$project": {"_id": 0, "likes": 0, "saves": 0, "comments": 0, "shares": 0, "views": 0}},
+        ]).to_list(limit)
         mention_rows = await db.reel_mentions.aggregate([
             {"$match": {"reel_id": {"$in": [r["id"] for r in reels_list]}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
@@ -4392,29 +4533,16 @@ postbluom.online"""
                 {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1}
             )
         } if reels_list else {}
-        following_ids = set(u.get("following", []))
+        following_ids = set(u.get("following") or [])
         for r in reels_list:
-            likes = r.get("likes") or []
-            saves = r.get("saves") or []
-            shares = r.get("shares") or []
-
             mention = mention_docs.get(r["id"])
             r["is_mentioned"] = bool(mention)
             r["mentioned_by"] = (
                 {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
                 if mention else None
             )
-            r["is_liked"]     = u["id"] in likes
-            r["like_count"]   = len(likes)
-            r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
-            r["is_saved"]     = u["id"] in saves
-            r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
-            r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
             r["mention_count"] = mention_counts.get(r["id"], 0)
             r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
-            r.pop("likes", None)
-            r.pop("saves", None)
-            r.pop("comments", None)
         return {"reels": reels_list, "has_more": len(reels_list) == limit, "skip": skip, "limit": limit}
 
 
@@ -6002,6 +6130,9 @@ postbluom.online"""
         def _reel_array_size(field):
             return {"$size": {"$cond": [{"$isArray": field}, field, []]}}
 
+        def _reel_array(field):
+            return {"$cond": [{"$isArray": field}, field, []]}
+
         def _reel_count_value(field):
             return {"$convert": {"input": field, "to": "long", "onError": 0, "onNull": 0}}
 
@@ -6229,9 +6360,19 @@ postbluom.online"""
         combined = main_slice + exploration[:exploration_count]
         final_items = _reels_diversify(combined, limit)
         final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
-        full_reels = await db.reels.find(
-            {"id": {"$in": final_reel_ids}}, {"_id": 0},
-        ).to_list(len(final_reel_ids)) if final_reel_ids else []
+        full_reels = await db.reels.aggregate([
+            {"$match": {"id": {"$in": final_reel_ids}}},
+            {"$addFields": {
+                "is_liked": {"$in": [user_id, _reel_array("$likes")]},
+                "like_count": {"$max": [_reel_array_size("$likes"), _reel_count_value("$like_count")]},
+                "is_saved": {"$in": [user_id, _reel_array("$saves")]},
+                "save_count": {"$max": [_reel_array_size("$saves"), _reel_count_value("$save_count")]},
+                "comment_count": {"$max": [_reel_array_size("$comments"), _reel_count_value("$comment_count")]},
+                "share_count": {"$max": [_reel_array_size("$shares"), _reel_count_value("$share_count")]},
+                "view_count": {"$max": [_reel_array_size("$views"), _reel_count_value("$view_count")]},
+            }},
+            {"$project": {"_id": 0, "likes": 0, "saves": 0, "shares": 0, "views": 0}},
+        ]).to_list(len(final_reel_ids)) if final_reel_ids else []
         full_reels_by_id = {reel.get("id"): reel for reel in full_reels if reel.get("id")}
         ranking_fields = (
             "_rank_view_count", "_rank_like_count", "_rank_comment_count",
@@ -6272,13 +6413,13 @@ postbluom.online"""
                 "is_follow_pending": item.get("user_id") in pending_follow_ids,
                 "category": item.get("category") or "general",
                 "score": round(float(item.get("score") or 0), 6),
-                "is_liked": user_id in (item.get("likes") or []),
-                "like_count": len(item.get("likes") or []),
-                "is_saved": user_id in (item.get("saves") or []),
-                "save_count": max(len(item.get("saves") or []), int(item.get("save_count") or 0)),
-                "comment_count": max(len(item.get("comments") or []), int(item.get("comment_count") or 0)),
-                "share_count": max(len(item.get("shares") or []), int(item.get("share_count") or 0)),
-                "view_count": max(len(item.get("views") or []), int(item.get("view_count") or 0)),
+                "is_liked": bool(item.get("is_liked")),
+                "like_count": int(item.get("like_count") or 0),
+                "is_saved": bool(item.get("is_saved")),
+                "save_count": int(item.get("save_count") or 0),
+                "comment_count": int(item.get("comment_count") or 0),
+                "share_count": int(item.get("share_count") or 0),
+                "view_count": int(item.get("view_count") or 0),
                 "mention_count": int(item.get("mention_count") or 0),
                 "ranking_signals": item.get("ranking_signals") or {},
                 "is_viral": bool(item.get("is_viral")),
