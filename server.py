@@ -1,0 +1,6303 @@
+import sys as _sys
+import traceback as _tb
+
+print('==> [DIAG] server.py starting load...', file=_sys.stderr, flush=True)
+
+try:
+    from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Query, Request, Header, WebSocket, WebSocketDisconnect
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.middleware.gzip import GZipMiddleware
+    from motor.motor_asyncio import AsyncIOMotorClient
+    from dotenv import load_dotenv
+    import os, uuid, random, secrets, logging, bcrypt, jwt, re, io, ipaddress, threading as _threading
+    from pydantic import BaseModel, EmailStr, field_validator
+    from typing import Optional, List
+    from datetime import datetime, timezone, timedelta
+    import base64, asyncio, urllib.request, urllib.parse, json as _json
+    import time as _time
+    import hashlib as _hl, hmac as _hmac, os as _os
+    from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, ECDSA, SECP256R1
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption, load_der_private_key
+    from cryptography.hazmat.primitives.hashes import SHA256
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    from aiscreen import ai_router, auth_router, library_router
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    load_dotenv()
+
+    MONGO_URL      = os.environ["MONGO_URL"].strip()
+    DB_NAME        = os.environ.get("DB_NAME", "postapp")
+    JWT_SECRET     = os.environ.get("JWT_SECRET", "change-me-in-production")
+
+    # ── Cloudinary (video/photo hosting — enables smooth streaming) ──
+    import cloudinary
+    import cloudinary.uploader
+    CLOUDINARY_URL        = os.environ.get("CLOUDINARY_URL", "").strip()
+    CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+    CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+    CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
+    if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+        cloudinary.config(
+            cloud_name=CLOUDINARY_CLOUD_NAME,
+            api_key=CLOUDINARY_API_KEY,
+            api_secret=CLOUDINARY_API_SECRET,
+            secure=True,
+        )
+    # else: falls back to CLOUDINARY_URL env var, which the SDK reads automatically on import
+
+    def _b64ue(b):
+        import base64 as _b64
+        return _b64.urlsafe_b64encode(b).rstrip(b'=').decode()
+
+    def _b64ud(s):
+        import base64 as _b64
+        s = s + '=' * (-len(s) % 4)
+        return _b64.urlsafe_b64decode(s)
+
+    _vapid_cache = {}
+    async def get_vapid_keys():
+        if _vapid_cache: return _vapid_cache.get('pub',''), _vapid_cache.get('priv','')
+        existing = await db.settings.find_one({'key': 'vapid_keys'})
+        if existing:
+            _vapid_cache['pub'] = existing['public_key']
+            _vapid_cache['priv'] = existing['private_key']
+            return existing['public_key'], existing['private_key']
+        try:
+            priv_key = generate_private_key(SECP256R1())
+            pub_bytes = priv_key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+            priv_bytes = priv_key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
+            pub = _b64ue(pub_bytes)
+            priv = _b64ue(priv_bytes)
+            await db.settings.insert_one({'key': 'vapid_keys', 'public_key': pub, 'private_key': priv, 'created_at': now().isoformat()})
+            _vapid_cache['pub'] = pub
+            _vapid_cache['priv'] = priv
+            return pub, priv
+        except Exception:
+            return '', ''
+
+    def _make_vapid_jwt(endpoint, priv_b64):
+        try:
+            from urllib.parse import urlparse
+            priv_key = load_der_private_key(_b64ud(priv_b64), password=None)
+            parsed = urlparse(endpoint)
+            audience = parsed.scheme + '://' + parsed.netloc
+            hdr = _b64ue(_json.dumps({"typ":"JWT","alg":"ES256"}).encode())
+            claims = _b64ue(_json.dumps({"aud":audience,"exp":int(_time.time())+43200,"sub":"mailto:noreply@postapp.com"}).encode())
+            signing_input = (hdr + '.' + claims).encode()
+            sig = priv_key.sign(signing_input, ECDSA(SHA256()))
+            r, s = decode_dss_signature(sig)
+            raw = r.to_bytes(32,'big') + s.to_bytes(32,'big')
+            return hdr + '.' + claims + '.' + _b64ue(raw)
+        except Exception:
+            return ''
+
+    def _encrypt_push_payload(sub_info, data_bytes):
+        try:
+            sub_pub = _b64ud(sub_info['keys']['p256dh'])
+            auth_secret = _b64ud(sub_info['keys']['auth'])
+            # Generate sender ephemeral key
+            sender_key = generate_private_key(SECP256R1())
+            sender_pub = sender_key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+            # Import recipient public key
+            from cryptography.hazmat.primitives.asymmetric.ec import ECDH, EllipticCurvePublicNumbers
+            x = int.from_bytes(sub_pub[1:33],'big')
+            y = int.from_bytes(sub_pub[33:65],'big')
+            recv_pub = EllipticCurvePublicNumbers(x=x,y=y,curve=SECP256R1()).public_key()
+            # ECDH shared secret
+            # ECDH already imported at module level
+            shared = sender_key.exchange(ECDH(), recv_pub)
+            # HKDF pseudorandom key
+            import hmac as _hmac2, hashlib
+            # RFC 8291: two-step HKDF — Step1 PRK, Step2 IKM
+            prk_key = _hmac2.new(auth_secret, shared, hashlib.sha256).digest()
+            ikm = _hmac2.new(prk_key, b"WebPush: info\x00" + sub_pub + sender_pub + b"\x01", hashlib.sha256).digest()
+            salt = os.urandom(16)
+            # Content key and nonce via HKDF
+            # HKDF-Expand: CEK + nonce from IKM
+            cek = HKDF(algorithm=SHA256(),length=16,salt=salt,info=b"Content-Encoding: aes128gcm\x00").derive(ikm)
+            nonce = HKDF(algorithm=SHA256(),length=12,salt=salt,info=b"Content-Encoding: nonce\x00").derive(ikm)
+            padded = data_bytes + b''
+            ct = AESGCM(cek).encrypt(nonce, padded, None)
+            # Build record: salt(16) + rs(4) + keylen(1) + sender_pub(65) + ciphertext
+            import struct
+            header = salt + struct.pack(">I", 4096) + bytes([len(sender_pub)]) + sender_pub
+            return header + ct
+        except Exception:
+            return None
+
+    async def send_push(user_id, title, body, notification_type=None):
+        try:
+            sub_doc = await db.push_subscriptions.find_one({'user_id': user_id})
+            if not sub_doc: return
+            pub, priv = await get_vapid_keys()
+            if not pub or not priv: return
+            sub = sub_doc.get('subscription', {})
+            endpoint = sub.get('endpoint','')
+            if not endpoint: return
+            jwt_tok = _make_vapid_jwt(endpoint, priv)
+            if not jwt_tok: return
+            payload_data = {'title': title, 'body': body}
+            if notification_type:
+                payload_data['type'] = notification_type
+            payload = _json.dumps(payload_data).encode()
+            enc_body = _encrypt_push_payload(sub, payload)
+            loop = asyncio.get_event_loop()
+            def _req():
+                try:
+                    import urllib.request as _ur, urllib.error
+                    r = _ur.Request(endpoint, method='POST')
+                    r.add_header('Authorization', 'vapid t=' + jwt_tok + ',k=' + pub)
+                    r.add_header('TTL', '86400')
+                    if enc_body:
+                        r.data = enc_body
+                        r.add_header('Content-Type','application/octet-stream')
+                        r.add_header('Content-Encoding','aes128gcm')
+                    with _ur.urlopen(r, timeout=10): pass
+                except Exception: pass
+            await loop.run_in_executor(None, _req)
+        except Exception:
+            pass
+    OFFICIAL_ACCOUNT_ID = os.environ.get("OFFICIAL_ACCOUNT_ID", "").strip()
+    RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+    TWILIO_SID     = os.environ.get("TWILIO_SID", "").strip()
+    TWILIO_TOKEN   = os.environ.get("TWILIO_TOKEN", "").strip()
+    TWILIO_PHONE   = os.environ.get("TWILIO_PHONE", "").strip()
+    NEWS_API_KEY   = os.environ.get("NEWS_API_KEY", "").strip()
+
+    DEMO_MODE = not bool(RESEND_API_KEY)
+
+    DELETE_GRACE_DAYS    = 30
+    ABUSE_WINDOW_DAYS    = 90
+    ABUSE_MAX_DELETIONS  = 3
+    ABUSE_COOLDOWN_DAYS  = 14
+
+    client = AsyncIOMotorClient(
+        MONGO_URL,
+        maxPoolSize=20, minPoolSize=5,
+        serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
+    )
+    db = client[DB_NAME]
+
+    app    = FastAPI(title="POST App API")
+    api    = APIRouter(prefix="/api")
+    bearer = HTTPBearer(auto_error=False)
+
+    app.add_middleware(GZipMiddleware, minimum_size=500)
+
+    @app.get("/ping")
+    async def ping():
+        return {"status": "ok"}
+
+    # Public lightweight health routes for Render/cron-job.org.
+    # They intentionally do not touch MongoDB so wake-up checks stay reliable.
+    @app.get("/")
+    async def root_health():
+        return {"status": "ok", "service": "post-app-backend"}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "service": "post-app-backend"}
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "https://postbluom.online",
+            "https://www.postbluom.online",
+            "https://post-app-frontend-fynq.onrender.com",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logging.basicConfig(level=logging.INFO)
+
+    def now():
+        return datetime.now(timezone.utc)
+
+    # ── Password hashing (PBKDF2-HMAC-SHA256) ────────────────────
+    _PBKDF2_ITER   = 32_000
+    _PBKDF2_PREFIX = "$pbkdf2$"
+
+    async def _run_sync(fn):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fn)
+
+    async def run_in_bg(fn, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fn, *args)
+
+    _PBKDF2_ITER_LEGACY = 260_000   # iterations used by all existing DB hashes
+
+    def _pbkdf2_hash(password: str, salt: str, iters: int = _PBKDF2_ITER) -> str:
+        return _hl.pbkdf2_hmac("sha256", password.encode(), salt.encode(), iters).hex()
+
+    async def hashpw(p: str, rounds=None) -> str:
+        iters  = _PBKDF2_ITER
+        salt   = _os.urandom(16).hex()
+        digest = await _run_sync(lambda: _pbkdf2_hash(p, salt, iters))
+        # New format: $pbkdf2$<iters>$<salt>$<digest>  (5 parts when split on "$")
+        return f"{_PBKDF2_PREFIX}{iters}${salt}${digest}"
+
+    async def verifypw(p: str, h: str) -> bool:
+        if not h:
+            return False
+        if h.startswith(_PBKDF2_PREFIX):
+            try:
+                parts = h.split("$")
+                if len(parts) == 5:
+                    # New format: ["", "pbkdf2", iters, salt, digest]
+                    iters = int(parts[2])
+                    if not (10_000 <= iters <= 1_000_000):  # sanity-check iteration bounds
+                        return False
+                    salt, stored = parts[3], parts[4]
+                elif len(parts) == 4:
+                    # Legacy format: ["", "pbkdf2", salt, digest] — always 260k
+                    iters  = _PBKDF2_ITER_LEGACY
+                    salt, stored = parts[2], parts[3]
+                else:
+                    return False  # malformed — reject
+                computed = await _run_sync(lambda: _pbkdf2_hash(p, salt, iters))
+                return _hmac.compare_digest(computed, stored)
+            except Exception:
+                return False
+        else:
+            try:
+                return await _run_sync(lambda: bcrypt.checkpw(p.encode(), h.encode()))
+            except Exception:
+                return False
+
+    def _is_bcrypt(h: str) -> bool:
+        return h.startswith("$2b$") or h.startswith("$2a$")
+
+    def _email_q(email: str) -> dict:
+        """Case-insensitive email lookup for MongoDB."""
+        return {"email": {"$regex": f"^{re.escape(email.strip())}$", "$options": "i"}}
+
+    def make_token(uid, session_id=None):
+        payload = {"sub": uid, "exp": now() + timedelta(days=30)}
+        if session_id:
+            payload["sid"] = session_id
+        return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+    def _client_ip(request: Request | None = None) -> str:
+        """Get the public client IP, including the proxy header used by Render."""
+        if not request:
+            return ""
+        candidates = []
+        candidates.extend(request.headers.get("x-forwarded-for", "").split(","))
+        candidates.append(request.headers.get("x-real-ip", ""))
+        candidates.append(request.headers.get("cf-connecting-ip", ""))
+        candidates.append(request.client.host if request.client else "")
+        for value in candidates:
+            value = value.strip()
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            if not (address.is_private or address.is_loopback or address.is_reserved or address.is_link_local):
+                return str(address)
+        return ""
+
+    def _lookup_ip_location(client_ip: str) -> dict:
+        """Resolve a public IP to a city/region/country using short, keyless fallbacks."""
+        if not client_ip:
+            return {}
+        encoded_ip = urllib.parse.quote(client_ip, safe="")
+        providers = (
+            (f"https://ipwho.is/{encoded_ip}", "ipwho"),
+            (f"https://ipapi.co/{encoded_ip}/json/", "ipapi"),
+        )
+        for url, provider in providers:
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    data = _json.loads(response.read().decode("utf-8"))
+                if data.get("success") is False or data.get("error") is True:
+                    continue
+                if provider == "ipwho":
+                    location = {
+                        "city": str(data.get("city") or "").strip(),
+                        "region": str(data.get("region") or "").strip(),
+                        "country": str(data.get("country") or "").strip(),
+                    }
+                else:
+                    location = {
+                        "city": str(data.get("city") or "").strip(),
+                        "region": str(data.get("region") or data.get("region_code") or "").strip(),
+                        "country": str(data.get("country_name") or data.get("country") or "").strip(),
+                    }
+                if any(location.values()):
+                    return location
+            except Exception:
+                continue
+        return {}
+
+    def _lookup_coordinate_location(client_location: dict | None) -> dict:
+        """Reverse-geocode browser coordinates; coordinates are not persisted."""
+        if not client_location:
+            return {}
+        try:
+            latitude = float(client_location.get("latitude"))
+            longitude = float(client_location.get("longitude"))
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                return {}
+            query = urllib.parse.urlencode({
+                "format": "json",
+                "lat": latitude,
+                "lon": longitude,
+                "zoom": 10,
+                "addressdetails": 1,
+            })
+            request = urllib.request.Request(
+                f"https://nominatim.openstreetmap.org/reverse?{query}",
+                headers={"User-Agent": "PostApp/1.0 (login location)"},
+            )
+            with urllib.request.urlopen(request, timeout=4) as response:
+                data = _json.loads(response.read().decode("utf-8"))
+            address = data.get("address") or {}
+            return {
+                "city": str(address.get("city") or address.get("town") or address.get("village") or address.get("municipality") or "").strip(),
+                "region": str(address.get("state") or address.get("region") or "").strip(),
+                "country": str(address.get("country") or "").strip(),
+            }
+        except Exception:
+            return {}
+
+    def _session_metadata(request: Request | None = None, client_location: dict | None = None) -> dict:
+        """Capture device and city-level login location without storing credentials."""
+        ua = request.headers.get("user-agent", "") if request else ""
+        ua_lower = ua.lower()
+        device_name = _parse_device_name(ua)
+        client_model = (request.headers.get("sec-ch-ua-model", "") if request else "").strip().strip('"')
+        if client_model: device_name = client_model.replace("_", " ")
+        client_ip = _client_ip(request)
+        coordinate_location = _lookup_coordinate_location(client_location)
+        ip_location = coordinate_location or _lookup_ip_location(client_ip)
+        city = ip_location.get("city") or (request.headers.get("x-city", "") if request else "").strip()
+        region = ip_location.get("region") or (request.headers.get("x-region", "") if request else "").strip()
+        country = ip_location.get("country") or (request.headers.get("x-country", "") if request else "").strip()
+        location = ", ".join(part for part in (city, region, country) if part) or "Unknown location"
+        return {
+            "device_name": device_name,
+            "device": device_name,
+            "is_mobile": any(x in ua_lower for x in ("android", "iphone", "ipad", "mobile")),
+            "location": location,
+            "user_agent": ua[:500],
+        }
+
+    async def issue_token(uid, request: Request | None = None, client_location: dict | None = None):
+        """Create a revocable session record and bind the JWT to it."""
+        session_id = str(uuid.uuid4())
+        timestamp = now().isoformat()
+        metadata = await asyncio.to_thread(_session_metadata, request, client_location)
+        await db.sessions.insert_one({
+            "id": session_id,
+            "user_id": uid,
+            "created_at": timestamp,
+            "last_active": timestamp,
+            **metadata,
+        })
+        return make_token(uid, session_id)
+
+    USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
+
+    # ── Translation cache (in-memory, TTL 1 h) — defined early so translate endpoint can use it
+    _trans_cache: dict = {}
+    _TRANS_TTL = 3600
+
+    def _cache_get(key):
+        entry = _trans_cache.get(key)
+        if entry and (_time.monotonic() - entry[1]) < _TRANS_TTL:
+            return entry[0]
+        return None
+
+    def _cache_set(key, value):
+        if len(_trans_cache) > 2000:
+            oldest = sorted(_trans_cache, key=lambda k: _trans_cache[k][1])[:500]
+            for k in oldest:
+                del _trans_cache[k]
+        _trans_cache[key] = (value, _time.monotonic())
+
+    # ── Auth helpers ─────────────────────────────────────────────
+    async def raw_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
+        if not creds:
+            raise HTTPException(401, "Missing token")
+        try:
+            payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
+            uid = payload["sub"]
+            sid = payload.get("sid")
+        except Exception:
+            raise HTTPException(401, "Invalid token")
+        u = await db.users.find_one({"id": uid}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+        if not u:
+            raise HTTPException(401, "User not found")
+        if sid:
+            session = await db.sessions.find_one({"id": sid, "user_id": uid}, {"_id": 0})
+            if not session:
+                raise HTTPException(401, "Session expired or revoked")
+            await db.sessions.update_one(
+                {"id": sid, "user_id": uid},
+                {"$set": {"last_active": now().isoformat()}},
+            )
+            u["_current_session_id"] = sid
+        return u
+
+    async def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
+        u = await raw_user(creds)
+        return u
+
+    # ── One-time reset: force old accounts to new theme/notification defaults ──
+    async def _migrate_prefs_defaults(u: dict):
+        if u.get("prefs_migrated"):
+            return
+        await db.users.update_one(
+            {"id": u["id"]},
+            {"$set": {
+                "theme": "light",
+                "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False, "mentions": False, "tags": False},
+                "prefs_migrated": True,
+            }},
+        )
+
+    # ── Background hash migration helper ─────────────────────────
+    async def _migrate_hash(uid: str, password: str):
+        try:
+            new_hash = await hashpw(password)
+            await db.users.update_one({"id": uid}, {"$set": {"password_hash": new_hash}})
+            logging.info(f"✅ Migrated password hash for {uid}")
+        except Exception as e:
+            logging.warning(f"Hash migration failed for {uid}: {e}")
+
+    # ── Email / SMS senders ───────────────────────────────────────
+    def send_otp_email(email, code):
+        if DEMO_MODE:
+            logging.info(f"[DEMO] Email OTP for {email}: {code}")
+            return True
+        try:
+            import resend
+            resend.api_key = RESEND_API_KEY
+
+            plain_text = f"""Hi,
+
+Your POST App verification code is: {code}
+
+This code is valid for 10 minutes only.
+
+If you did not request this code, please ignore this email.
+
+- POST App Team
+postbluom.online"""
+
+            html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Your POST App Code</title>
+</head>
+<body style="margin:0;padding:0;background:#ffffff;font-family:Arial,Helvetica,sans-serif;color:#111111;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;">
+    <tr>
+      <td style="padding:40px 20px;">
+        <table role="presentation" width="100%" style="max-width:480px;margin:0 auto;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;padding:40px;">
+          <tr>
+            <td style="padding-bottom:24px;border-bottom:1px solid #eeeeee;">
+              <p style="margin:0;font-size:22px;font-weight:900;letter-spacing:4px;">
+                <span style="color:#FFD600;">P</span><span style="color:#00C853;">O</span><span style="color:#FF1744;">S</span><span style="color:#29B6F6;">T</span>
+                <span style="font-size:14px;font-weight:400;color:#666;letter-spacing:1px;margin-left:8px;">App</span>
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px 0 24px 0;">
+              <p style="margin:0 0 8px 0;font-size:15px;color:#333;">Hi,</p>
+              <p style="margin:0 0 24px 0;font-size:15px;color:#333;line-height:1.6;">
+                Here is your verification code for POST App:
+              </p>
+              <table role="presentation" width="100%">
+                <tr>
+                  <td style="text-align:center;padding:20px 0;">
+                    <span style="display:inline-block;background:#f5f5f5;border:2px solid #FFD600;border-radius:8px;padding:16px 32px;font-size:32px;font-weight:900;letter-spacing:10px;color:#111111;">{code}</span>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:16px 0 0 0;font-size:13px;color:#888;text-align:center;">
+                This code expires in <strong>10 minutes</strong>.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-top:24px;border-top:1px solid #eeeeee;">
+              <p style="margin:0 0 8px 0;font-size:13px;color:#999;">
+                If you did not request this code, you can safely ignore this email.
+              </p>
+              <p style="margin:0;font-size:12px;color:#bbb;">
+                &copy; 2025 POST App &middot; postbluom.online
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+            resend.Emails.send({
+                "from": "POST App <otp@postbluom.online>",
+                "to": [email],
+                "subject": "Your POST App verification code",
+                "html": html_body,
+                "text": plain_text,
+                "reply_to": "support@postbluom.online",
+                "headers": {"X-Entity-Ref-ID": str(uuid.uuid4())},
+            })
+            logging.info(f"✅ OTP email sent to {email}")
+            return True
+        except Exception as e:
+            logging.warning(f"Email failed: {e}")
+            return False
+
+    def send_otp_sms(phone, code):
+        if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_PHONE:
+            missing = [k for k,v in {"TWILIO_SID": TWILIO_SID, "TWILIO_TOKEN": TWILIO_TOKEN, "TWILIO_PHONE": TWILIO_PHONE}.items() if not v]
+            logging.warning(f"[SMS] Missing env vars: {missing}. OTP for {phone}: {code}")
+            return None  # None = not configured
+        try:
+            from twilio.rest import Client
+            twilio = Client(TWILIO_SID, TWILIO_TOKEN)
+            twilio.messages.create(
+                body=f"POST App verification code: {code}\nValid for 10 minutes.",
+                from_=TWILIO_PHONE,
+                to=phone,
+            )
+            logging.info(f"[SMS] Sent to {phone}")
+            return True
+        except Exception as e:
+            logging.error(f"[SMS] FAILED to {phone}: {e}")
+            return str(e)  # Return error string so callers can surface it
+
+    # ── Misc helpers ──────────────────────────────────────────────
+    async def ensure_username_unique(username: str, exclude_uid: Optional[str] = None):
+        count = await db.users.count_documents({"username": username})
+        if count > 0:
+            if exclude_uid:
+                user = await db.users.find_one({"username": username})
+                if user["id"] != exclude_uid:
+                    raise ValueError("Username already taken")
+            else:
+                raise ValueError("Username already taken")
+
+    def _aware(dt):
+        if dt and dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    async def permanently_delete_user(uid: str):
+        await db.posts.delete_many({"user_id": uid})
+        await db.messages.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
+        await db.notifications.delete_many({"$or": [{"user_id": uid}, {"from_user_id": uid}]})
+        await db.friend_requests.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
+        await db.users.update_many({}, {"$pull": {"followers": uid, "following": uid, "blocked_users": uid}})
+        await db.users.delete_one({"id": uid})
+
+    async def purge_expired_deleted_account(field: str, value: str):
+        user = await db.users.find_one({field: value})
+        if user and user.get("deleted_at"):
+            deleted_at = _aware(user["deleted_at"])
+            if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
+                await permanently_delete_user(user["id"])
+                return True
+        return False
+
+    async def check_delete_recreate_abuse(identifier: str):
+        since = now() - timedelta(days=ABUSE_WINDOW_DAYS)
+        count = await db.account_deletions.count_documents(
+            {"identifier": identifier, "deleted_at": {"$gte": since}}
+        )
+        if count >= ABUSE_MAX_DELETIONS:
+            last = await db.account_deletions.find(
+                {"identifier": identifier}
+            ).sort("deleted_at", -1).limit(1).to_list(1)
+            if last:
+                cooldown_until = _aware(last[0]["deleted_at"]) + timedelta(days=ABUSE_COOLDOWN_DAYS)
+                if now() < cooldown_until:
+                    raise HTTPException(
+                        429,
+                        f"Too many account deletions. Please try again after "
+                        f"{cooldown_until.strftime('%d %b %Y')}.",
+                    )
+
+    # ── Pydantic models ───────────────────────────────────────────
+    class SignupIn(BaseModel):
+        email: EmailStr; password: str; name: str; username: str
+
+        @field_validator("username")
+        @classmethod
+        def validate_username(cls, v):
+            v = v.strip().lower()
+            if not USERNAME_RE.match(v):
+                raise ValueError("Username: 3-20 chars, only lowercase letters, numbers, underscore")
+            return v
+
+    class OtpIn(BaseModel):
+        email: EmailStr; otp: str
+
+    class ClientLocationIn(BaseModel):
+        latitude: float
+        longitude: float
+        accuracy: Optional[float] = None
+
+    class LoginIn(BaseModel):
+        email: EmailStr; password: str
+        client_location: Optional[ClientLocationIn] = None
+
+    class PhoneInitIn(BaseModel):
+        phone: str
+
+    class PhoneVerifyIn(BaseModel):
+        phone: str; otp: str
+
+    class PhoneSignupIn(BaseModel):
+        phone: str; name: str; password: str; username: str; dob: Optional[str] = None
+
+        @field_validator("username")
+        @classmethod
+        def validate_username(cls, v):
+            v = v.strip().lower()
+            if not USERNAME_RE.match(v):
+                raise ValueError("Username: 3-20 chars, only lowercase letters, numbers, underscore")
+            return v
+
+    class EmailInitIn(BaseModel):
+        email: EmailStr
+
+    class EmailVerifyIn(BaseModel):
+        email: EmailStr; otp: str
+
+    class EmailSignupIn(BaseModel):
+        email: EmailStr; name: str; password: str; username: str; dob: Optional[str] = None
+
+        @field_validator("username")
+        @classmethod
+        def validate_username(cls, v):
+            v = v.strip().lower()
+            if not USERNAME_RE.match(v):
+                raise ValueError("Username: 3-20 chars, only lowercase letters, numbers, underscore")
+            return v
+
+    class PhoneLoginIn(BaseModel):
+        phone: str; password: str
+        client_location: Optional[ClientLocationIn] = None
+
+    class ProfileUpdate(BaseModel):
+        name: Optional[str] = None
+        username: Optional[str] = None
+        handle: Optional[str] = None
+        location: Optional[str] = None
+        about: Optional[str] = None
+        website: Optional[str] = None
+        avatar_bg: Optional[str] = None
+        avatar_letter: Optional[str] = None
+        avatar_photo: Optional[str] = None
+        profile_video: Optional[str] = None
+        cover_photo: Optional[str] = None
+        cover_video: Optional[str] = None
+        language: Optional[str] = None
+        category: Optional[str] = None
+        category_visible: Optional[bool] = None
+        gender: Optional[str] = None
+        dob: Optional[str] = None
+        dob_month_day_visibility: Optional[str] = None
+        dob_year_visibility: Optional[str] = None
+        is_private: Optional[bool] = None
+        theme: Optional[str] = None
+        chat_translation_enabled: Optional[bool] = None
+        account_type: Optional[str] = None
+        is_badge_verified: Optional[bool] = None
+        user_status: Optional[str] = None
+        two_fa_enabled: Optional[bool] = None
+        login_alerts_enabled: Optional[bool] = None
+        who_can_message: Optional[str] = None
+        who_can_follow: Optional[str] = None
+        post_visibility: Optional[str] = None
+        comment_control: Optional[str] = None
+        sensitive_content_filter: Optional[bool] = None
+
+        @field_validator("username")
+        @classmethod
+        def validate_username(cls, v):
+            if v is None:
+                return v
+            v = v.strip().lower()
+            if not USERNAME_RE.match(v):
+                raise ValueError("Username: 3-20 chars, only lowercase letters, numbers, underscore")
+            return v
+
+    class AddPhoneInitIn(BaseModel):
+        phone: str
+
+    class AddPhoneVerifyIn(BaseModel):
+        phone: str; otp: str
+
+    class AddEmailInitIn(BaseModel):
+        email: EmailStr
+
+    class AddEmailVerifyIn(BaseModel):
+        email: EmailStr; otp: str
+
+    class NotificationsPrefsIn(BaseModel):
+        likes: Optional[bool] = None
+        comments: Optional[bool] = None
+        friend_requests: Optional[bool] = None
+        messages: Optional[bool] = None
+        mentions: Optional[bool] = None
+        tags: Optional[bool] = None
+
+    class ThemeIn(BaseModel):
+        theme: str
+
+        @field_validator("theme")
+        @classmethod
+        def validate_theme(cls, v):
+            v = v.strip().lower()
+            if v not in {"light", "dark"}:
+                raise ValueError("Theme must be light or dark")
+            return v
+
+    class ChangePasswordIn(BaseModel):
+        current_password: str; new_password: str
+
+    class PostIn(BaseModel):
+        content: str; accent: str = "#FFD600"; location: Optional[str] = None
+        photo_url: Optional[str] = None
+        photo_urls: Optional[List[str]] = None  # up to 5 photos
+        video_url: Optional[str] = None         # base64 data URI, max 30s (mutually exclusive with photos)
+        video_duration: Optional[float] = None  # seconds, must be <= 30
+        feeling: Optional[str] = None           # e.g. "😊 Happy"
+        tagged_users: Optional[List[str]] = None  # list of @handles
+        audience: Optional[str] = "public"       # public | followers
+        comments_enabled: Optional[bool] = True  # False = comments turned off for this post
+        photo_width: Optional[int] = None         # px width of first photo (from compressPhoto)
+        photo_height: Optional[int] = None        # px height of first photo
+        aspect_ratio: Optional[float] = None      # precomputed width/height
+        music_title: Optional[str] = None             # iTunes track name
+        music_artist: Optional[str] = None            # artist name
+        music_artwork: Optional[str] = None           # 100x100 artwork URL
+        music_preview_url: Optional[str] = None       # 30-sec preview URL from iTunes
+        music_duration_ms: Optional[int] = None       # full track duration in ms
+        music_start_ms: Optional[int] = None          # selected preview start in ms
+        music_clip_duration_ms: Optional[int] = None # selected clip duration in ms (1-30000)
+        alt_text: Optional[str] = None                # accessibility alt text for media
+        gif_url: Optional[str] = None                  # Giphy GIF URL
+        sticker_overlays: Optional[List[dict]] = None  # [{id, url, x, y}] Giphy stickers placed on media
+        emoji_overlays: Optional[List[dict]] = None    # [{id, emoji, x, y, size}] emoji placed on video
+        video_width: Optional[int] = None              # natural px width of video (captured at pick time from browser)
+        video_height: Optional[int] = None             # natural px height of video
+        video_text_overlays: Optional[List[dict]] = None  # [{id,text,x,y,color,size}] draggable text overlays baked during compose
+        video_effect: Optional[str] = None                # VIDEO_EFFECTS id: none|vivid|warm|cool|bw|fade|vintage
+
+    class CommentIn(BaseModel):
+        text: str
+
+    class LikeIn(BaseModel):
+        color: Optional[str] = None
+
+    class MessageIn(BaseModel):
+        to_user_id: str; text: str = ""
+        photo_url: Optional[str] = None; gif_url: Optional[str] = None
+        mood_color: Optional[str] = None
+        reply_to_id: Optional[str] = None
+        shared_post_id: Optional[str] = None
+        shared_reel_id: Optional[str] = None
+        audio_url: Optional[str] = None
+        audio_duration: Optional[int] = None
+
+    class TypingIn(BaseModel):
+        to_user_id: str; is_typing: bool = True
+
+    class FriendIn(BaseModel):
+        target_user_id: str
+
+    class ShareToFriendIn(BaseModel):
+        friend_id: str
+
+    class ForgotPasswordInitIn(BaseModel):
+        identifier: str
+
+    class ForgotPasswordVerifyIn(BaseModel):
+        identifier: str; otp: str
+
+    class ForgotPasswordResetIn(BaseModel):
+        identifier: str; otp: str; new_password: str
+
+    class VerificationRequestIn(BaseModel):
+        full_name: str
+        category: str          # Politician / Blogger / Journalist / Public Figure / Business / Other
+        id_proof_url: Optional[str] = None
+        social_links: Optional[str] = None
+
+    class AdminGrantIn(BaseModel):
+        user_id: str
+        category: str
+
+    class AdminRejectIn(BaseModel):
+        reason: Optional[str] = "Does not meet verification criteria"
+
+    # ── Auth Email ────────────────────────────────────────────────
+    @api.post("/auth/signup")
+    async def signup(p: SignupIn):
+        existing = await db.users.find_one({"email": p.email})
+        if existing and existing.get("is_verified"):
+            raise HTTPException(400, "Email already registered")
+        try:
+            await ensure_username_unique(p.username, exclude_uid=existing["id"] if existing else None)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        code   = f"{secrets.randbelow(1000000):06d}"
+        uid    = existing["id"] if existing else str(uuid.uuid4())
+        colors = ["#FFD600", "#00C853", "#FF1744", "#29B6F6"]
+        doc = {
+            "id": uid, "email": p.email, "name": p.name, "username": p.username,
+            "handle": f"@{p.username}",
+            "password_hash": await hashpw(p.password), "is_verified": False,
+            "otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10),
+            "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
+            "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
+            "website": "", "location": "", "about": "", "language": "en",
+            "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
+            "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
+            "chat_translation_enabled": True,
+            "followers": [], "following": [], "blocked_users": [],
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False, "mentions": False, "tags": False},
+        }
+        if existing:
+            await db.users.update_one({"id": uid}, {"$set": doc})
+        else:
+            await db.users.insert_one(doc)
+        asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
+        return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
+
+    @api.post("/auth/verify-otp")
+    async def verify_otp(request: Request, p: OtpIn):
+        u = await db.users.find_one({"email": p.email})
+        if not u: raise HTTPException(400, "User not found")
+        if u.get("is_verified"): raise HTTPException(400, "Already verified")
+        exp = u["otp_expires_at"]
+        if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+        if now() > exp: raise HTTPException(400, "Code expired")
+        if not await verifypw(p.otp, u["otp_hash"]): raise HTTPException(400, "Incorrect code")
+        await db.users.update_one(
+            {"id": u["id"]},
+            {"$set": {"is_verified": True}, "$unset": {"otp_hash": "", "otp_expires_at": ""}},
+        )
+        return {"token": await issue_token(u["id"], request), "user_id": u["id"]}
+
+    @api.post("/auth/login")
+    async def login(request: Request, p: LoginIn):
+        u = await db.users.find_one(_email_q(p.email))          # case-insensitive lookup
+        if not u: raise HTTPException(404, "User not found")
+        if not u.get("is_verified"):                             # fast check BEFORE slow hash
+            raise HTTPException(400, "Account not verified. Please check your email for the OTP verification code.")
+        pw_hash = u.get("password_hash", "")
+        if not await verifypw(p.password, pw_hash): raise HTTPException(401, "Wrong password")
+        if _is_bcrypt(pw_hash) or (pw_hash.startswith(_PBKDF2_PREFIX) and len(pw_hash.split("$")) == 4):
+            asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
+        asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
+        client_location = p.client_location.model_dump() if p.client_location else None
+        token = await issue_token(u["id"], request, client_location)
+        user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
+        resp = {"token": token, "user_id": u["id"], "user": user_profile}
+        if u.get("deleted_at"):
+            deleted_at = _aware(u["deleted_at"])
+            if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
+                asyncio.create_task(permanently_delete_user(u["id"]))  # background delete
+                raise HTTPException(400, "Invalid credentials")
+            resp["pending_delete"] = True
+            resp["restore_deadline"] = (deleted_at + timedelta(days=DELETE_GRACE_DAYS)).isoformat()
+        return resp
+
+    @api.post("/auth/resend-otp")
+    async def resend_otp(body: dict):
+        u = await db.users.find_one({"email": body.get("email")})
+        if not u: raise HTTPException(400, "User not found")
+        code = f"{secrets.randbelow(1000000):06d}"
+        await db.users.update_one(
+            {"id": u["id"]},
+            {"$set": {"otp_hash": await hashpw(code), "otp_expires_at": now() + timedelta(minutes=10)}},
+        )
+        asyncio.create_task(run_in_bg(send_otp_email, u["email"], code))
+        return {"message": "Resent", "demo_otp": code if DEMO_MODE else None}
+
+    # ── Forgot Password ───────────────────────────────────────────
+    @api.post("/auth/forgot-password-init")
+    async def forgot_password_init(p: ForgotPasswordInitIn):
+        identifier = p.identifier.strip()
+        if "@" in identifier:
+            user = await db.users.find_one({"email": identifier})
+        else:
+            _ph_v = [identifier]
+            if identifier.startswith("+91") and len(identifier) == 13: _ph_v.append(identifier[3:])
+            elif not identifier.startswith("+") and len(identifier) == 10: _ph_v.append("+91" + identifier)
+            user = await db.users.find_one({"phone": {"$in": _ph_v}})
+            # Do NOT change identifier — keep frontend-sent value so verify/reset calls match
+        if not user or not user.get("is_verified"):
+            raise HTTPException(400, "No account found with this email or phone number")
+        is_email = "@" in identifier
+        # Cooldown: if a valid OTP was already sent recently, don't invalidate it with a
+        # fresh one — this previously caused "OTP arrived but verify fails" for email,
+        # since a slow-arriving email could be invalidated by an impatient resend.
+        _existing = await db.reset_otps.find_one({"identifier": identifier})
+        if _existing and _existing.get("otp_sent_at") and not _existing.get("verified"):
+            _sa = _existing["otp_sent_at"]
+            _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 45:
+                return {
+                    "message": "OTP recently sent",
+                    "demo_otp": _existing.get("_plain"),
+                    "method": "email" if is_email else "sms",
+                }
+        code = f"{secrets.randbelow(1000000):06d}"
+        await db.reset_otps.update_one(
+            {"identifier": identifier},
+            {"$set": {
+                "identifier": identifier, "user_id": user["id"],
+                "otp_hash": await hashpw(code),
+                "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
+                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
+            }},
+            upsert=True,
+        )
+        if is_email:
+            # Await send so we can detect and report failure; never leak OTP in response
+            email_sent = await run_in_bg(send_otp_email, identifier, code)
+            if not email_sent and not DEMO_MODE:
+                raise HTTPException(503, "Failed to send verification email. Please try again in a moment.")
+            return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None, "method": "email"}
+        else:
+            sms_result = await run_in_bg(send_otp_sms, identifier, code)
+            sms_ok = sms_result is True
+            sms_err = sms_result if isinstance(sms_result, str) else None
+            return {"message": "OTP sent", "demo_otp": code if not sms_ok else None, "method": "sms", "sms_error": sms_err}
+
+    @api.post("/auth/forgot-password-verify")
+    async def forgot_password_verify(p: ForgotPasswordVerifyIn):
+        rec = await db.reset_otps.find_one({"identifier": p.identifier.strip()})
+        if not rec: raise HTTPException(400, "Request not found. Please start again.")
+        exp = rec["otp_expires_at"]
+        if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+        if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
+        if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+        await db.reset_otps.update_one({"identifier": p.identifier.strip()}, {"$set": {"verified": True}})
+        return {"message": "OTP verified"}
+
+    @api.post("/auth/forgot-password-reset")
+    async def forgot_password_reset(p: ForgotPasswordResetIn):
+        rec = await db.reset_otps.find_one({"identifier": p.identifier.strip(), "verified": True})
+        if not rec: raise HTTPException(400, "Not verified. Please verify OTP first.")
+        if len(p.new_password) < 6: raise HTTPException(400, "Password must be at least 6 characters")
+        await db.users.update_one(
+            {"id": rec["user_id"]},
+            {"$set": {"password_hash": await hashpw(p.new_password)}},
+        )
+        await db.reset_otps.delete_one({"identifier": p.identifier.strip()})
+        return {"message": "Password reset successfully! Please log in."}
+
+    # ── Auth Email (OTP-first flow) ───────────────────────────────
+    @api.post("/auth/email-signup-init")
+    async def email_signup_init(p: EmailInitIn):
+        await purge_expired_deleted_account("email", p.email)
+        await check_delete_recreate_abuse(p.email)
+        existing = await db.users.find_one({"email": p.email, "is_verified": True})
+        if existing: raise HTTPException(400, "Email already registered")
+        _r = await db.email_otps.find_one({"email": p.email})
+        if _r and _r.get("otp_sent_at"):
+            _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 60:
+                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
+        code = f"{secrets.randbelow(1000000):06d}"
+        await db.email_otps.update_one(
+            {"email": p.email},
+            {"$set": {
+                "email": p.email, "otp_hash": await hashpw(code),
+                "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
+                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
+            }},
+            upsert=True,
+        )
+        asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
+        return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
+
+    @api.post("/auth/email-verify-init")
+    async def email_verify_init(p: EmailVerifyIn):
+        rec = await db.email_otps.find_one({"email": p.email})
+        if not rec: raise HTTPException(400, "Email not found")
+        exp = rec["otp_expires_at"]
+        if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+        if now() > exp: raise HTTPException(400, "OTP expired")
+        if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+        await db.email_otps.update_one({"email": p.email}, {"$set": {"verified": True}, "$unset": {"_plain": ""}})
+        return {"message": "Email verified"}
+
+    @api.post("/auth/email-signup")
+    async def email_signup(request: Request, p: EmailSignupIn):
+        rec = await db.email_otps.find_one({"email": p.email, "verified": True})
+        if not rec: raise HTTPException(400, "Email not verified")
+        existing = await db.users.find_one({"email": p.email, "is_verified": True})
+        if existing: raise HTTPException(400, "Email already registered")
+        try:
+            await ensure_username_unique(p.username)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        colors = ["#FFD600", "#00C853", "#FF1744", "#29B6F6"]
+        uid = str(uuid.uuid4())
+        doc = {
+            "id": uid, "email": p.email, "name": p.name, "username": p.username,
+            "handle": f"@{p.username}", "dob": p.dob,
+            "password_hash": await hashpw(p.password), "is_verified": True,
+            "signup_method": "email", "phone_verified": False, "phone": None,
+            "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
+            "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
+            "website": "", "location": "", "about": "", "language": "en",
+            "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
+            "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
+            "chat_translation_enabled": True,
+            "followers": [], "following": [], "blocked_users": [],
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False, "mentions": False, "tags": False},
+        }
+        await db.users.insert_one(doc)
+        await db.email_otps.delete_one({"email": p.email})
+        return {"token": await issue_token(uid, request), "user_id": uid, "requires_phone": True}
+
+    # ── Auth Phone ────────────────────────────────────────────────
+    @api.post("/auth/phone-signup-init")
+    async def phone_signup_init(p: PhoneInitIn):
+        await purge_expired_deleted_account("phone", p.phone)
+        await check_delete_recreate_abuse(p.phone)
+        _r = await db.phone_otps.find_one({"phone": p.phone})
+        if _r and _r.get("otp_sent_at"):
+            _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 60:
+                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
+        code = f"{secrets.randbelow(1000000):06d}"
+        await db.phone_otps.update_one(
+            {"phone": p.phone},
+            {"$set": {
+                "phone": p.phone, "otp_hash": await hashpw(code),
+                "otp_expires_at": now() + timedelta(minutes=10), "verified": False,
+                "otp_sent_at": now(), "_plain": None,
+            }},
+            upsert=True,
+        )
+        sms_result = await run_in_bg(send_otp_sms, p.phone, code)
+        sms_ok = sms_result is True
+        sms_err = sms_result if isinstance(sms_result, str) else None
+        demo = code if not sms_ok else None
+        if demo: await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"_plain": demo}})
+        return {"message": "OTP sent", "demo_otp": demo, "sms_error": sms_err}
+
+    @api.post("/auth/phone-verify-init")
+    async def phone_verify_init(p: PhoneVerifyIn):
+        rec = await db.phone_otps.find_one({"phone": p.phone})
+        if not rec: raise HTTPException(400, "Phone not found")
+        exp = rec["otp_expires_at"]
+        if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+        if now() > exp: raise HTTPException(400, "OTP expired")
+        if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+        await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"verified": True}, "$unset": {"_plain": ""}})
+        return {"message": "Phone verified"}
+
+    @api.post("/auth/phone-signup")
+    async def phone_signup(request: Request, p: PhoneSignupIn):
+        rec = await db.phone_otps.find_one({"phone": p.phone, "verified": True})
+        if not rec: raise HTTPException(400, "Phone not verified")
+        existing = await db.users.find_one({"phone": p.phone, "is_verified": True})
+        if existing: raise HTTPException(400, "Phone already registered")
+        try:
+            await ensure_username_unique(p.username)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        colors = ["#FFD600", "#00C853", "#FF1744", "#29B6F6"]
+        uid = str(uuid.uuid4())
+        doc = {
+            "id": uid, "phone": p.phone, "email": None,
+            "name": p.name, "username": p.username, "handle": f"@{p.username}", "dob": p.dob,
+            "password_hash": await hashpw(p.password), "is_verified": True,
+            "signup_method": "phone", "email_verified": False,
+            "avatar_bg": random.choice(colors), "avatar_letter": p.name[0].upper(),
+            "avatar_photo": None, "profile_video": None, "cover_photo": None, "cover_video": None,
+            "website": "", "location": "", "about": "", "language": "en",
+            "continent": "Asia", "created_at": now(), "is_seed": False, "deleted_at": None,
+            "is_online": False, "last_seen": None, "is_private": False, "theme": "light",
+            "chat_translation_enabled": True,
+            "followers": [], "following": [], "blocked_users": [],
+            "notifications_prefs": {"likes": False, "comments": False, "friend_requests": False, "messages": False, "mentions": False, "tags": False},
+        }
+        await db.users.insert_one(doc)
+        await db.phone_otps.delete_one({"phone": p.phone})
+        return {"token": await issue_token(uid, request), "user_id": uid, "requires_email": True}
+
+    @api.post("/auth/phone-login")
+    async def phone_login(request: Request, p: PhoneLoginIn):
+        # Flexible lookup: match +91XXXXXXXXXX or bare 10-digit, whichever is stored
+        _ph = p.phone
+        _ph_variants = [_ph]
+        if _ph.startswith("+91") and len(_ph) == 13: _ph_variants.append(_ph[3:])
+        elif not _ph.startswith("+") and len(_ph) == 10: _ph_variants.append("+91" + _ph)
+        u = await db.users.find_one({"phone": {"$in": _ph_variants}})
+        if not u: raise HTTPException(400, "No account found with this phone number")
+        pw_hash_p = u.get("password_hash", "")
+        if not await verifypw(p.password, pw_hash_p):
+            raise HTTPException(401, "Wrong password")
+        if u and (_is_bcrypt(pw_hash_p) or (pw_hash_p.startswith(_PBKDF2_PREFIX) and len(pw_hash_p.split("$")) == 4)):
+            asyncio.create_task(_migrate_hash(u["id"], p.password))  # upgrade legacy 260k → 100k
+        if not u.get("is_verified"): raise HTTPException(400, "Account not verified")
+        asyncio.create_task(_migrate_prefs_defaults(u))  # background — don't block login
+        client_location = p.client_location.model_dump() if p.client_location else None
+        token = await issue_token(u["id"], request, client_location)
+        user_profile = {k: v for k, v in u.items() if k not in ("_id", "password_hash", "otp_hash")}
+        resp = {"token": token, "user_id": u["id"], "user": user_profile}
+        if u.get("deleted_at"):
+            deleted_at = _aware(u["deleted_at"])
+            if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
+                asyncio.create_task(permanently_delete_user(u["id"]))  # background delete
+                raise HTTPException(400, "Invalid phone or password")
+            resp["pending_delete"] = True
+            resp["restore_deadline"] = (deleted_at + timedelta(days=DELETE_GRACE_DAYS)).isoformat()
+        return resp
+
+    @api.get("/auth/me")
+    async def me(u=Depends(current_user)):
+        return u
+
+    # ── Add Secondary Contact ─────────────────────────────────────
+    @api.post("/auth/add-phone-init")
+    async def add_phone_init(p: AddPhoneInitIn, u=Depends(raw_user)):
+        if u.get("signup_method") != "email": raise HTTPException(403, "Only for email-registered accounts")
+        if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
+        existing = await db.users.find_one({"phone": p.phone, "is_verified": True, "id": {"$ne": u["id"]}})
+        if existing: raise HTTPException(400, "This phone is already registered to another account")
+        _r = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
+        if _r and _r.get("otp_sent_at"):
+            _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 60:
+                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
+        code = f"{secrets.randbelow(1000000):06d}"
+        await db.phone_otps.update_one(
+            {"phone": p.phone},
+            {"$set": {
+                "phone": p.phone, "otp_hash": await hashpw(code),
+                "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"],
+                "otp_sent_at": now(), "_plain": None,
+            }},
+            upsert=True,
+        )
+        sms_result = await run_in_bg(send_otp_sms, p.phone, code)
+        sms_ok = sms_result is True
+        sms_err = sms_result if isinstance(sms_result, str) else None
+        demo = code if not sms_ok else None
+        if demo: await db.phone_otps.update_one({"phone": p.phone}, {"$set": {"_plain": demo}})
+        return {"message": "OTP sent", "demo_otp": demo, "sms_error": sms_err}
+
+    @api.post("/auth/add-phone-verify")
+    async def add_phone_verify(request: Request, p: AddPhoneVerifyIn, u=Depends(raw_user)):
+        if u.get("signup_method") != "email": raise HTTPException(403, "Only for email-registered accounts")
+        if u.get("phone_verified"): raise HTTPException(400, "Phone already verified")
+        rec = await db.phone_otps.find_one({"phone": p.phone, "user_id": u["id"]})
+        if not rec: raise HTTPException(400, "OTP not found. Please request a new one.")
+        exp = rec["otp_expires_at"]
+        if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+        if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
+        if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+        await db.users.update_one({"id": u["id"]}, {"$set": {"phone": p.phone, "phone_verified": True}})
+        await db.phone_otps.delete_one({"phone": p.phone})
+        return {"message": "Phone verified successfully", "token": await issue_token(u["id"], request)}
+
+    @api.post("/auth/add-email-init")
+    async def add_email_init(p: AddEmailInitIn, u=Depends(raw_user)):
+        if u.get("signup_method") != "phone": raise HTTPException(403, "Only for phone-registered accounts")
+        if u.get("email_verified"): raise HTTPException(400, "Email already verified")
+        existing = await db.users.find_one({"email": p.email, "is_verified": True, "id": {"$ne": u["id"]}})
+        if existing: raise HTTPException(400, "This email is already registered to another account")
+        _r = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
+        if _r and _r.get("otp_sent_at"):
+            _sa = _r["otp_sent_at"]; _sa = _sa if _sa.tzinfo else _sa.replace(tzinfo=timezone.utc)
+            if (now() - _sa).total_seconds() < 60:
+                return {"message": "OTP recently sent", "demo_otp": _r.get("_plain")}
+        code = f"{secrets.randbelow(1000000):06d}"
+        await db.email_otps.update_one(
+            {"email": p.email},
+            {"$set": {
+                "email": p.email, "otp_hash": await hashpw(code),
+                "otp_expires_at": now() + timedelta(minutes=10), "verified": False, "user_id": u["id"],
+                "otp_sent_at": now(), "_plain": code if DEMO_MODE else None,
+            }},
+            upsert=True,
+        )
+        asyncio.create_task(run_in_bg(send_otp_email, p.email, code))
+        return {"message": "OTP sent", "demo_otp": code if DEMO_MODE else None}
+
+    @api.post("/auth/add-email-verify")
+    async def add_email_verify(request: Request, p: AddEmailVerifyIn, u=Depends(raw_user)):
+        if u.get("signup_method") != "phone": raise HTTPException(403, "Only for phone-registered accounts")
+        if u.get("email_verified"): raise HTTPException(400, "Email already verified")
+        rec = await db.email_otps.find_one({"email": p.email, "user_id": u["id"]})
+        if not rec: raise HTTPException(400, "OTP not found. Please request a new one.")
+        exp = rec["otp_expires_at"]
+        if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+        if now() > exp: raise HTTPException(400, "OTP expired. Please request a new one.")
+        if not await verifypw(p.otp, rec["otp_hash"]): raise HTTPException(400, "Incorrect OTP")
+        await db.users.update_one({"id": u["id"]}, {"$set": {"email": p.email, "email_verified": True}})
+        await db.email_otps.delete_one({"email": p.email})
+        return {"message": "Email verified successfully", "token": await issue_token(u["id"], request)}
+
+    # ── Account deletion / restore ────────────────────────────────
+    @api.post("/account/delete-request")
+    async def request_account_delete(u=Depends(current_user)):
+        if u.get("deleted_at"):
+            raise HTTPException(400, "Account is already pending deletion")
+        deleted_at = now()
+        await db.users.update_one({"id": u["id"]}, {"$set": {"deleted_at": deleted_at}})
+        identifier = u.get("phone") or u.get("email")
+        await db.account_deletions.insert_one({
+            "id": str(uuid.uuid4()), "user_id": u["id"],
+            "identifier": identifier, "deleted_at": deleted_at,
+        })
+        restore_deadline = deleted_at + timedelta(days=DELETE_GRACE_DAYS)
+        return {
+            "message": f"Account will be permanently deleted in {DELETE_GRACE_DAYS} days unless you restore it.",
+            "restore_deadline": restore_deadline.isoformat(),
+        }
+
+    @api.post("/account/restore")
+    async def restore_account(u=Depends(current_user)):
+        if not u.get("deleted_at"):
+            raise HTTPException(400, "Account is not pending deletion")
+        deleted_at = _aware(u["deleted_at"])
+        if now() >= deleted_at + timedelta(days=DELETE_GRACE_DAYS):
+            raise HTTPException(400, "Restore window expired; account was permanently deleted")
+        await db.users.update_one({"id": u["id"]}, {"$set": {"deleted_at": None}})
+        await db.account_deletions.delete_many({"user_id": u["id"], "deleted_at": u["deleted_at"]})
+        return {"message": "Account restored successfully"}
+
+    @api.get("/account/deletion-status")
+    async def deletion_status(u=Depends(current_user)):
+        if not u.get("deleted_at"):
+            return {"pending_delete": False}
+        deleted_at = _aware(u["deleted_at"])
+        deadline = deleted_at + timedelta(days=DELETE_GRACE_DAYS)
+        return {
+            "pending_delete": True,
+            "restore_deadline": deadline.isoformat(),
+            "days_left": max(0, (deadline - now()).days),
+        }
+
+    _DOB_VISIBILITY_OPTIONS = {"public", "followers", "following", "mutuals", "only_you"}
+
+    def _dob_audience_allows(profile, viewer_id, audience, default):
+        viewer = str(viewer_id or "")
+        owner = str(profile.get("id") or "")
+        if viewer and viewer == owner:
+            return True
+        if not viewer or not owner:
+            return False
+        audience = audience or default
+        if audience not in _DOB_VISIBILITY_OPTIONS:
+            return False
+        followers = {str(value) for value in (profile.get("followers") or [])}
+        following = {str(value) for value in (profile.get("following") or [])}
+        if audience == "public":
+            return True
+        if audience == "followers":
+            return viewer in followers
+        if audience == "following":
+            return viewer in following
+        if audience == "mutuals":
+            return viewer in followers and viewer in following
+        return False
+
+    def _apply_dob_visibility(profile, viewer_id):
+        if not profile:
+            return profile
+        safe = dict(profile)
+        raw_dob = profile.get("dob")
+        is_self = str(profile.get("id") or "") == str(viewer_id or "")
+        month_day_audience = profile.get("dob_month_day_visibility") or "mutuals"
+        year_audience = profile.get("dob_year_visibility") or "only_you"
+        for key in ("dob_month_day", "dob_year"):
+            safe.pop(key, None)
+        if is_self:
+            safe["dob_month_day_visibility"] = month_day_audience if month_day_audience in _DOB_VISIBILITY_OPTIONS else "mutuals"
+            safe["dob_year_visibility"] = year_audience if year_audience in _DOB_VISIBILITY_OPTIONS else "only_you"
+        else:
+            safe.pop("dob", None)
+            safe.pop("dob_month_day_visibility", None)
+            safe.pop("dob_year_visibility", None)
+        if not raw_dob:
+            return safe
+        try:
+            parsed_dob = datetime.strptime(str(raw_dob)[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            return safe
+        can_see_month_day = _dob_audience_allows(profile, viewer_id, month_day_audience, "mutuals")
+        can_see_year = _dob_audience_allows(profile, viewer_id, year_audience, "only_you")
+        if is_self or can_see_month_day:
+            safe["dob_month_day"] = parsed_dob.strftime("%m-%d")
+        if is_self or can_see_year:
+            safe["dob_year"] = parsed_dob.strftime("%Y")
+        if not is_self and can_see_month_day and can_see_year:
+            safe["dob"] = raw_dob
+        return safe
+
+    # ── Profile ───────────────────────────────────────────────────
+    @api.patch("/profile")
+    async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
+        upd = {k: v for k, v in p.model_dump().items() if v is not None}
+        for field in ("dob_month_day_visibility", "dob_year_visibility"):
+            if field in upd and upd[field] not in _DOB_VISIBILITY_OPTIONS:
+                raise HTTPException(400, "Invalid birthday visibility")
+        if "username" in upd:
+            if u.get("username_locked") and upd["username"] != u.get("username"):
+                raise HTTPException(400, "Verified accounts cannot change their username")
+            try:
+                await ensure_username_unique(upd["username"], exclude_uid=u["id"])
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            upd["handle"] = f"@{upd['username']}"
+        if upd:
+            await db.users.update_one({"id": u["id"]}, {"$set": upd})
+
+            # Build denormalized updates and run them in the background
+            # so the response returns immediately to the client
+            post_upd = {}
+            if "name" in upd: post_upd["user_name"] = upd["name"]
+            if "handle" in upd: post_upd["user_handle"] = upd["handle"]
+            if "avatar_bg" in upd: post_upd["avatar_bg"] = upd["avatar_bg"]
+            if "avatar_letter" in upd: post_upd["avatar_letter"] = upd["avatar_letter"]
+            if "avatar_photo" in upd: post_upd["avatar_photo"] = upd["avatar_photo"]
+
+            comment_upd = {}
+            if "name" in upd: comment_upd["comments.$[c].user_name"] = upd["name"]
+            if "handle" in upd: comment_upd["comments.$[c].user_handle"] = upd["handle"]
+            if "avatar_bg" in upd: comment_upd["comments.$[c].avatar_bg"] = upd["avatar_bg"]
+            if "avatar_letter" in upd: comment_upd["comments.$[c].avatar_letter"] = upd["avatar_letter"]
+            if "avatar_photo" in upd: comment_upd["comments.$[c].avatar_photo"] = upd["avatar_photo"]
+
+            msg_upd = {}
+            if "name" in upd: msg_upd["from_name"] = upd["name"]
+            if "avatar_bg" in upd: msg_upd["avatar_bg"] = upd["avatar_bg"]
+            if "avatar_photo" in upd: msg_upd["avatar_photo"] = upd["avatar_photo"]
+
+            uid = u["id"]
+            async def _bg():
+                try:
+                    if post_upd:
+                        await db.posts.update_many({"user_id": uid}, {"$set": post_upd})
+                    if comment_upd:
+                        await db.posts.update_many(
+                            {"comments.user_id": uid},
+                            {"$set": comment_upd},
+                            array_filters=[{"c.user_id": uid}],
+                        )
+                    if msg_upd:
+                        await db.messages.update_many({"from_id": uid}, {"$set": msg_upd})
+                except Exception:
+                    pass
+            asyncio.create_task(_bg())
+
+        return await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+
+
+    @api.get("/data/activity-log")
+    async def get_activity_log(u=Depends(current_user)):
+        """Return the signed-in user's recent posts and comments with safe display metadata."""
+        def public_profile(profile):
+            if not profile: return None
+            return {"id":profile.get("id"),"name":profile.get("name"),"handle":profile.get("handle"),"username":profile.get("username"),"avatar_photo":profile.get("avatar_photo"),"avatar_bg":profile.get("avatar_bg"),"avatar_letter":profile.get("avatar_letter"),"is_badge_verified":bool(profile.get("is_badge_verified"))}
+        actor = public_profile(u)
+        posts = []
+        async for post in db.posts.find({"user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"photo_url":1,"photo_urls":1,"video_url":1}).sort("created_at",-1).limit(50):
+            posts.append({"id":post.get("id"),"type":"post","content":post.get("content") or "(media post)","created_at":post.get("created_at"),"author":actor,"has_media":bool(post.get("photo_url") or post.get("photo_urls") or post.get("video_url")),"media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
+        comments=[]; owner_ids=set()
+        async for post in db.posts.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"comments":1,"photo_url":1,"photo_urls":1}):
+            owner_id=post.get("user_id")
+            if owner_id: owner_ids.add(owner_id)
+            for comment in post.get("comments",[]):
+                if comment.get("user_id")==u["id"]:
+                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id,"target_media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
+        async for reel in db.reels.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"comments":1,"photo_url":1}):
+            owner_id=reel.get("user_id")
+            if owner_id: owner_ids.add(owner_id)
+            for comment in reel.get("comments",[]):
+                if comment.get("user_id")==u["id"]:
+                    comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
+        like_items=[]
+        async for post in db.posts.find({"likes.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"photo_url":1,"photo_urls":1}):
+            owner_id=post.get("user_id")
+            if owner_id: owner_ids.add(owner_id)
+            like_items.append({"id":"post:"+post.get("id"),"type":"like","actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id,"target_media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
+        async for reel in db.reels.find({"likes":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"photo_url":1}):
+            owner_id=reel.get("user_id")
+            if owner_id: owner_ids.add(owner_id)
+            like_items.append({"id":"reel:"+reel.get("id"),"type":"like","actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
+        owners=await db.users.find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1,"is_badge_verified":1}).to_list(len(owner_ids)) if owner_ids else []
+        owner_map={profile.get("id"):public_profile(profile) for profile in owners}
+        for item in comments: item["target_author"]=owner_map.get(item.get("target_user_id"))
+        comments.sort(key=lambda item:item.get("created_at") or "",reverse=True)
+        for item in like_items: item["target_author"]=owner_map.get(item.get("target_user_id"))
+        like_items.sort(key=lambda item:item.get("target_created_at") or "",reverse=True)
+        return {"actor":actor,"posts":posts,"comments":comments[:50],"likes":like_items[:50]}
+
+    @api.delete("/data/activity-log/{activity_type}/{activity_id}")
+    async def delete_activity_log_item(activity_type: str, activity_id: str, u=Depends(current_user)):
+        """Permanently delete one of the signed-in user's posts or comments."""
+        if activity_type == "like":
+            if ":" not in activity_id:
+                raise HTTPException(400, "Invalid like activity")
+            target_type, target_id = activity_id.split(":", 1)
+            if target_type == "post":
+                result = await db.posts.update_one({"id": target_id}, {"$pull": {"likes": {"user_id": u["id"]}}})
+            elif target_type == "reel":
+                result = await db.reels.update_one({"id": target_id}, {"$pull": {"likes": u["id"]}})
+            else:
+                raise HTTPException(400, "Unsupported like target")
+            if not result.modified_count:
+                raise HTTPException(404, "Activity not found")
+            return {"ok": True, "deleted": "like"}
+        if activity_type == "post":
+            result = await db.posts.delete_one({"id": activity_id, "user_id": u["id"]})
+            if not result.deleted_count:
+                raise HTTPException(404, "Activity not found")
+            return {"ok": True, "deleted": "post"}
+        if activity_type != "comment":
+            raise HTTPException(400, "Unsupported activity type")
+        post_result = await db.posts.update_one(
+            {"comments": {"$elemMatch": {"id": activity_id, "user_id": u["id"]}}},
+            {"$pull": {"comments": {"id": activity_id, "user_id": u["id"]}}},
+        )
+        if post_result.modified_count:
+            await db.posts.update_many(
+                {"comments": {"$exists": True}},
+                [{"$set": {"comment_count": {"$size": {"$ifNull": ["$comments", []]}}}}],
+            )
+            return {"ok": True, "deleted": "comment"}
+        reel_result = await db.reels.update_one(
+            {"comments": {"$elemMatch": {"id": activity_id, "user_id": u["id"]}}},
+            {"$pull": {"comments": {"id": activity_id, "user_id": u["id"]}}},
+        )
+        if reel_result.modified_count:
+            await db.reels.update_one(
+                {"comments": {"$exists": True}},
+                [{"$set": {"comment_count": {"$size": {"$ifNull": ["$comments", []]}}}}],
+            )
+            return {"ok": True, "deleted": "comment"}
+        raise HTTPException(404, "Activity not found")
+    @api.patch("/profile/online")
+    async def update_online_status(body: dict, u=Depends(current_user)):
+        is_online = body.get("is_online", True)
+        await db.users.update_one(
+            {"id": u["id"]},
+            {"$set": {"is_online": is_online, "last_seen": now().isoformat()}},
+        )
+        return {"ok": True}
+
+    # ── Users ─────────────────────────────────────────────────────
+    @api.get("/users/me/blocked")
+    async def get_blocked_users(u=Depends(current_user)):
+        ids = u.get("blocked_users", [])
+        if not ids: return []
+        users = await db.users.find(
+            {"id": {"$in": ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}
+        ).to_list(len(ids))
+        return [_apply_dob_visibility(profile, u["id"]) for profile in users]
+
+    @api.get("/users/me/follow-requests")
+    async def my_follow_requests(u=Depends(current_user)):
+        pending = await db.follow_requests.find(
+            {"to_id": u["id"], "status": "pending"}, {"_id": 0}
+        ).to_list(500)
+        from_ids = [r["from_id"] for r in pending]
+        PUBLIC = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+                  "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1, "location": 1, "about": 1}
+        users_list = await db.users.find({"id": {"$in": from_ids}}, PUBLIC).to_list(500) if from_ids else []
+        users_map  = {u2["id"]: u2 for u2 in users_list}
+        for r in pending:
+            r["from_user"] = users_map.get(r["from_id"], {})
+        outgoing = await db.follow_requests.find(
+            {"from_id": u["id"], "status": "pending"}, {"_id": 0}
+        ).to_list(500)
+        return {"incoming": pending, "outgoing": outgoing}
+
+    @api.get("/users/me/remove-follower/{follower_id}")
+    async def remove_follower_get(follower_id: str, u=Depends(current_user)):
+        raise HTTPException(405, "Use POST")
+
+    @api.post("/users/me/remove-follower/{follower_id}")
+    async def remove_follower(follower_id: str, u=Depends(current_user)):
+        await db.users.update_one({"id": u["id"]}, {"$pull": {"followers": follower_id}})
+        await db.users.update_one({"id": follower_id}, {"$pull": {"following": u["id"]}})
+        return {"ok": True}
+
+    @api.get("/users")
+    async def list_users(
+        continent: Optional[str] = None, q: Optional[str] = Query(None, max_length=100),
+        skip: int = Query(0, ge=0, le=10000), limit: int = Query(50, ge=1, le=100), u=Depends(current_user),
+    ):
+        excluded_ids = list(set([u["id"]] + (u.get("following") or [])))
+        query: dict = {"id": {"$nin": excluded_ids}, "is_verified": True, "deleted_at": None}
+        if continent and continent != "All":
+            query["continent"] = continent
+        if q:
+            query["$or"] = [
+                {"name": {"$regex": q, "$options": "i"}},
+                {"handle": {"$regex": q, "$options": "i"}},
+                {"username": {"$regex": q, "$options": "i"}},
+                {"location": {"$regex": q, "$options": "i"}},
+            ]
+        users = await db.users.find(
+            query, {"_id": 0, "password_hash": 0, "otp_hash": 0}
+        ).skip(skip).limit(limit).to_list(limit)
+        total = await db.users.count_documents(query)
+        return {"users": [_apply_dob_visibility(profile, u["id"]) for profile in users], "total": total, "skip": skip, "limit": limit}
+
+    @api.get("/users/{user_id}")
+    async def get_user(user_id: str, u=Depends(current_user)):
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+        if not user: raise HTTPException(404, "User not found")
+        is_self      = user_id == u["id"]
+        is_follower  = u["id"] in user.get("followers", [])
+        is_private   = user.get("is_private", False)
+        is_private_locked = is_private and not is_follower and not is_self
+        pending_req  = None
+        posts_count_task = db.posts.count_documents({"user_id": user_id})
+        follow_req_task  = (
+            db.follow_requests.find_one({"from_id": u["id"], "to_id": user_id, "status": "pending"})
+            if is_private_locked else None
+        )
+        if follow_req_task is not None:
+            posts_count, pending_req = await asyncio.gather(posts_count_task, follow_req_task)
+        else:
+            posts_count = await posts_count_task
+        is_mutual        = user_id in u.get("following", []) and u["id"] in (user.get("following") or [])
+        is_following_you = u["id"] in user.get("following", [])
+        followers_count  = len(user.get("followers", []))
+        following_count  = len(user.get("following", []))
+        base = {
+            "id": user["id"], "name": user.get("name"), "handle": user.get("handle"),
+            "username": user.get("username"), "avatar_bg": user.get("avatar_bg"),
+            "avatar_letter": user.get("avatar_letter"), "avatar_photo": user.get("avatar_photo"),
+            "is_private": is_private, "account_type": user.get("account_type"),
+            "is_badge_verified": user.get("is_badge_verified"), "category": user.get("category"),
+            "category_visible": user.get("category_visible", True),
+            "is_official": bool(OFFICIAL_ACCOUNT_ID and user_id == OFFICIAL_ACCOUNT_ID),
+            "is_mutual": is_mutual, "is_following_you": is_following_you,
+            "is_private_locked": is_private_locked, "has_pending_request": bool(pending_req),
+            "stats": {"posts": posts_count, "followers": followers_count, "following": following_count},
+        }
+        if is_private_locked:
+            return base
+        safe_user = _apply_dob_visibility(user, u["id"])
+        return {
+            **safe_user, "is_official": bool(OFFICIAL_ACCOUNT_ID and user_id == OFFICIAL_ACCOUNT_ID),
+            "is_mutual": is_mutual, "is_following_you": is_following_you,
+            "is_private_locked": False, "has_pending_request": False,
+            "stats": {"posts": posts_count, "followers": followers_count, "following": following_count},
+        }
+
+    # ── Follow / Unfollow ─────────────────────────────────────────
+    async def _persist_follow_notification(notification):
+        try:
+            await db.notifications.insert_one(notification)
+        except Exception:
+            logging.exception("Failed to persist follow notification")
+
+    async def _persist_user_activity_notification(recipient_id, actor, notification_type, **extra):
+        notification = {
+            "id": str(uuid.uuid4()), "user_id": recipient_id,
+            "from_user_id": actor.get("id"), "from_user_name": actor.get("name", ""),
+            "from_user_avatar": actor.get("avatar_photo"),
+            "from_user_bg": actor.get("avatar_bg"), "from_user_letter": actor.get("avatar_letter"),
+            "type": notification_type, "created_at": now().isoformat(), "read": False,
+        }
+        notification.update(extra)
+        try:
+            await db.notifications.insert_one(notification)
+        except Exception:
+            logging.exception("Failed to persist user activity notification")
+
+    @api.post("/users/{user_id}/follow")
+    async def follow_user(user_id: str, u=Depends(current_user)):
+        if user_id == u["id"]: raise HTTPException(400, "Can't follow yourself")
+        target = await db.users.find_one({"id": user_id})
+        if not target: raise HTTPException(404, "User not found")
+        if u["id"] in target.get("blocked_users", []) or user_id in u.get("blocked_users", []): raise HTTPException(403, "Action not allowed")
+        if target.get("is_private"):
+            existing = await db.follow_requests.find_one({"from_id": u["id"], "to_id": user_id})
+            if existing: return {"ok": True, "pending": True}
+            await db.follow_requests.insert_one({"id": str(uuid.uuid4()), "from_id": u["id"], "to_id": user_id, "status": "pending", "created_at": now().isoformat()})
+            asyncio.create_task(_persist_follow_notification({"id": str(uuid.uuid4()), "user_id": user_id, "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"), "type": "follow_request", "created_at": now().isoformat(), "read": False}))
+            asyncio.create_task(send_push(user_id, "New follow request", u["name"] + " wants to follow you"))
+            return {"ok": True, "pending": True}
+        await asyncio.gather(db.users.update_one({"id": user_id}, {"$addToSet": {"followers": u["id"]}}), db.users.update_one({"id": u["id"]}, {"$addToSet": {"following": user_id}}))
+        asyncio.create_task(_persist_follow_notification({"id": str(uuid.uuid4()), "user_id": user_id, "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"), "type": "follow", "created_at": now().isoformat(), "read": False}))
+        asyncio.create_task(send_push(user_id, "New follower", u["name"] + " started following you"))
+        return {"ok": True, "pending": False}
+
+    @api.post("/users/{user_id}/unfollow")
+    async def unfollow_user(user_id: str, u=Depends(current_user)):
+        await asyncio.gather(db.users.update_one({"id": user_id}, {"$pull": {"followers": u["id"]}}), db.users.update_one({"id": u["id"]}, {"$pull": {"following": user_id}}), db.follow_requests.delete_many({"from_id": u["id"], "to_id": user_id}))
+        return {"ok": True, "following": False, "pending": False}
+
+    @api.get("/users/{user_id}/followers")
+    async def get_followers(user_id: str, u=Depends(current_user)):
+        user = await db.users.find_one({"id": user_id})
+        if not user: raise HTTPException(404, "User not found")
+        profiles = await db.users.find(
+            {"id": {"$in": user.get("followers", [])}},
+            {"_id": 0, "password_hash": 0, "otp_hash": 0},
+        ).to_list(500)
+        return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
+
+    @api.get("/users/{user_id}/following")
+    async def get_following(user_id: str, u=Depends(current_user)):
+        user = await db.users.find_one({"id": user_id})
+        if not user: raise HTTPException(404, "User not found")
+        profiles = await db.users.find(
+            {"id": {"$in": user.get("following", [])}},
+            {"_id": 0, "password_hash": 0, "otp_hash": 0},
+        ).to_list(500)
+        return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
+
+    # ── Follow Requests (private accounts) ───────────────────────
+    @api.post("/users/{user_id}/follow-request/cancel")
+    async def cancel_follow_request(user_id: str, u=Depends(current_user)):
+        await db.follow_requests.delete_one({"from_id": u["id"], "to_id": user_id})
+        return {"ok": True}
+
+    @api.post("/users/{user_id}/follow-request/accept")
+    async def accept_follow_request(user_id: str, u=Depends(current_user)):
+        req = await db.follow_requests.find_one({"from_id": user_id, "to_id": u["id"], "status": "pending"})
+        if not req: raise HTTPException(404, "Follow request not found")
+        await db.users.update_one({"id": u["id"]}, {"$addToSet": {"followers": user_id}})
+        await db.users.update_one({"id": user_id}, {"$addToSet": {"following": u["id"]}})
+        await db.follow_requests.delete_one({"from_id": user_id, "to_id": u["id"]})
+        # Delete the follow_request notification so it never reappears
+        await db.notifications.delete_one(
+            {"user_id": u["id"], "from_user_id": user_id, "type": "follow_request"}
+        )
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": user_id,
+            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+            "type": "follow_accept", "created_at": now().isoformat(), "read": False,
+        })
+        asyncio.create_task(send_push(user_id, "Follow accepted", u["name"] + " accepted your follow request"))
+        return {"ok": True}
+
+    @api.post("/users/{user_id}/follow-request/decline")
+    async def decline_follow_request(user_id: str, u=Depends(current_user)):
+        await db.follow_requests.delete_one({"from_id": user_id, "to_id": u["id"]})
+        # Delete the follow_request notification so it never reappears
+        await db.notifications.delete_one(
+            {"user_id": u["id"], "from_user_id": user_id, "type": "follow_request"}
+        )
+        return {"ok": True}
+
+    # ── Block / Unblock ───────────────────────────────────────────
+    @api.post("/users/{user_id}/block")
+    async def block_user(user_id: str, u=Depends(current_user)):
+        if user_id == u["id"]: raise HTTPException(400, "Can't block yourself")
+        await db.users.update_one({"id": u["id"]}, {"$addToSet": {"blocked_users": user_id}})
+        return {"ok": True}
+
+    @api.post("/users/{user_id}/unblock")
+    async def unblock_user(user_id: str, u=Depends(current_user)):
+        await db.users.update_one({"id": u["id"]}, {"$pull": {"blocked_users": user_id}})
+        return {"ok": True}
+
+    @api.post("/users/{user_id}/mute")
+    async def mute_user(user_id: str, u=Depends(current_user)):
+        if user_id == u["id"]: raise HTTPException(400, "Can't mute yourself")
+        await db.users.update_one({"id": u["id"]}, {"$addToSet": {"muted_users": user_id}})
+        return {"ok": True}
+
+    @api.post("/users/{user_id}/unmute")
+    async def unmute_user(user_id: str, u=Depends(current_user)):
+        await db.users.update_one({"id": u["id"]}, {"$pull": {"muted_users": user_id}})
+        return {"ok": True}
+
+    @api.post("/posts/{pid}/not-interested")
+    async def not_interested(pid: str, u=Depends(current_user)):
+        await db.users.update_one({"id": u["id"]}, {"$addToSet": {"not_interested": pid}})
+        return {"ok": True}
+
+
+    # ── Posts ─────────────────────────────────────────────────────
+    MAX_POST_VIDEO_SECONDS = 30
+    MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024  # 100MB raw file, uploaded straight to Cloudinary (no base64 inflation)
+
+    def _measure_upload_size(file: UploadFile) -> int:
+        """Measure and rewind the spooled upload without copying it into RAM."""
+        stream = file.file
+        stream.seek(0, _os.SEEK_END)
+        size = stream.tell()
+        stream.seek(0)
+        return size
+
+    async def _get_upload_size(file: UploadFile) -> int:
+        # File seek/tell is blocking for disk-backed uploads; keep it off the event loop.
+        return await asyncio.to_thread(_measure_upload_size, file)
+
+    def _validate_post_video(video_url: Optional[str], video_duration: Optional[float]):
+        """Raises HTTPException if the given video URL is missing/invalid or too long.
+
+        Videos are now hosted on Cloudinary (real files, streamed with HTTP range
+        support) instead of being embedded as base64 data URIs — that's what used
+        to make playback stall/buffer since a data URI can't be streamed or seeked.
+        """
+        if not video_url:
+            return
+        if not (video_url.startswith("https://") or video_url.startswith("http://")):
+            raise HTTPException(400, "Invalid video URL — please upload the video again")
+        if video_duration is not None and video_duration > MAX_POST_VIDEO_SECONDS + 0.5:
+            raise HTTPException(400, f"Videos must be {MAX_POST_VIDEO_SECONDS} seconds or less")
+
+    @api.post("/upload/photo")
+    async def upload_photo(file: UploadFile = File(...), u=Depends(current_user)):
+        """Upload any image to Cloudinary and return its URL."""
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Image hosting is not configured on the server")
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(400, "Please upload a valid image file")
+        upload_size = await _get_upload_size(file)
+        if upload_size > 10 * 1024 * 1024:
+            raise HTTPException(400, "Image is too large. Max 10MB.")
+        try:
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                file.file,
+                resource_type="image",
+                folder="post-app/photos",
+                public_id=f"{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception:
+            logging.exception("Cloudinary photo upload failed")
+            raise HTTPException(502, "Image upload failed. Please try again.")
+        return {"url": result.get("secure_url")}
+
+    @api.post("/upload/audio")
+    async def upload_audio(file: UploadFile = File(...), u=Depends(current_user)):
+        """Upload a voice/audio recording to Cloudinary and return its URL."""
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Audio hosting is not configured on the server")
+        ct = (file.content_type or "").split(";")[0].strip()
+        if ct and not ct.startswith("audio/") and ct not in ("application/octet-stream",):
+            raise HTTPException(400, "Please upload a valid audio file")
+        upload_size = await _get_upload_size(file)
+        if upload_size > 25 * 1024 * 1024:
+            raise HTTPException(400, "Audio is too large. Max 25MB.")
+        try:
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                file.file,
+                resource_type="video",   # Cloudinary uses "video" resource_type for audio files
+                folder="post-app/audio",
+                public_id=f"{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception:
+            logging.exception("Cloudinary audio upload failed")
+            raise HTTPException(502, "Audio upload failed. Please try again.")
+        return {"url": result.get("secure_url"), "duration": int(result.get("duration") or 0)}
+
+    @api.post("/upload/video")
+    async def upload_video(
+        file: UploadFile = File(...),
+        start_offset: Optional[float] = Form(None),
+        end_offset: Optional[float] = Form(None),
+        u=Depends(current_user),
+    ):
+        """Uploads a raw video file to Cloudinary and returns its streamable URL.
+
+        Cloudinary serves videos over HTTP with byte-range support, so playback
+        can start immediately and seek/buffer smoothly — unlike a base64 data URI,
+        which forces the browser to download the entire clip up front before it
+        can play anything. The original file is uploaded as-is, so quality is
+        unchanged (no re-encoding/transcoding) unless a trim window is given.
+
+        If start_offset/end_offset are given (seconds), the clip is cut down to
+        that window during upload — this lets users pick up to a 1-minute video
+        and trim it to the 30s max before it's ever stored, keeping the same
+        resolution/bitrate (only the length changes).
+        """
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Video hosting is not configured on the server")
+        if not file.content_type or not file.content_type.startswith("video/"):
+            raise HTTPException(400, "Please upload a valid video file")
+
+        upload_size = await _get_upload_size(file)
+        if upload_size > MAX_UPLOAD_VIDEO_BYTES:
+            raise HTTPException(400, "Video is too large. Please choose a smaller clip.")
+
+        upload_kwargs = dict(
+            resource_type="video",
+            folder="post-app/videos",
+            public_id=f"{u['id']}_{uuid.uuid4().hex}",
+            overwrite=False,
+        )
+        if start_offset is not None and end_offset is not None:
+            if end_offset <= start_offset:
+                raise HTTPException(400, "Invalid trim range")
+            if end_offset - start_offset > MAX_POST_VIDEO_SECONDS + 0.5:
+                raise HTTPException(400, f"Trimmed clip must be {MAX_POST_VIDEO_SECONDS} seconds or less")
+            upload_kwargs["transformation"] = [{
+                "start_offset": round(start_offset, 2),
+                "end_offset": round(end_offset, 2),
+            }]
+
+        try:
+            result = await asyncio.to_thread(cloudinary.uploader.upload, file.file, **upload_kwargs)
+        except Exception as e:
+            # Log the full Cloudinary error server-side only — it can include
+            # internal signing details ("String to sign - ...") that must never
+            # be shown to end users.
+            logging.exception("Cloudinary video upload failed")
+            msg = str(e)
+            if "Invalid Signature" in msg or "String to sign" in msg:
+                raise HTTPException(500, "Video hosting is misconfigured on the server (invalid Cloudinary credentials). Please contact the app admin.")
+            raise HTTPException(502, "Video upload failed. Please try again.")
+
+        return {
+            "url": result.get("secure_url"),
+            "duration": result.get("duration"),
+            "bytes": result.get("bytes"),
+            "video_width": result.get("width"),    # natural video width (px) from Cloudinary
+            "video_height": result.get("height"),  # natural video height (px) from Cloudinary
+        }
+
+    # ── One-time migration: move old base64 videos to Cloudinary ────
+    # Posts/profile/cover videos created before the Cloudinary upload was
+    # added are still stored as huge base64 "data:video/..." strings, so
+    # they still stutter/buffer for existing users. This endpoint finds
+    # every one of those, re-uploads the bytes to Cloudinary, and rewrites
+    # the field to the new streamable URL. Safe to call more than once —
+    # already-migrated (http/https) values are skipped.
+    MIGRATION_SECRET = os.environ.get("MIGRATION_SECRET", "").strip()
+
+    def _decode_data_uri_video(data_uri: str) -> bytes:
+        header, _, b64data = data_uri.partition(",")
+        return base64.b64decode(b64data)
+
+    async def _migrate_one_video(data_uri: str, public_id: str) -> Optional[str]:
+        try:
+            raw = _decode_data_uri_video(data_uri)
+            result = cloudinary.uploader.upload(
+                raw, resource_type="video", folder="post-app/videos-migrated",
+                public_id=public_id, overwrite=False,
+            )
+            return result.get("secure_url")
+        except Exception:
+            logging.exception(f"Video migration failed for {public_id}")
+            return None
+
+    @api.post("/admin/migrate-videos-to-cloudinary")
+    async def migrate_videos_to_cloudinary(request: Request):
+        if not MIGRATION_SECRET or request.headers.get("x-migration-key") != MIGRATION_SECRET:
+            raise HTTPException(403, "Not authorized")
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Video hosting is not configured on the server")
+
+        posts_migrated, posts_failed = 0, 0
+        users_migrated, users_failed = 0, 0
+
+        async for post in db.posts.find({"video_url": {"$regex": "^data:video/"}}):
+            new_url = await _migrate_one_video(post["video_url"], f"post_{post['id']}")
+            if new_url:
+                await db.posts.update_one({"id": post["id"]}, {"$set": {"video_url": new_url}})
+                posts_migrated += 1
+            else:
+                posts_failed += 1
+
+        async for user in db.users.find({
+            "$or": [
+                {"profile_video": {"$regex": "^data:video/"}},
+                {"cover_video": {"$regex": "^data:video/"}},
+            ]
+        }):
+            upd = {}
+            if user.get("profile_video", "").startswith("data:video/"):
+                new_url = await _migrate_one_video(user["profile_video"], f"profile_{user['id']}")
+                if new_url: upd["profile_video"] = new_url
+                else: users_failed += 1
+            if user.get("cover_video", "").startswith("data:video/"):
+                new_url = await _migrate_one_video(user["cover_video"], f"cover_{user['id']}")
+                if new_url: upd["cover_video"] = new_url
+                else: users_failed += 1
+            if upd:
+                await db.users.update_one({"id": user["id"]}, {"$set": upd})
+                users_migrated += 1
+
+        return {
+            "ok": True,
+            "posts_migrated": posts_migrated, "posts_failed": posts_failed,
+            "users_migrated": users_migrated, "users_failed": users_failed,
+        }
+
+    @api.post("/posts")
+    async def create_post(p: PostIn, u=Depends(current_user)):
+        _validate_post_video(p.video_url, p.video_duration)
+        # A post is either a photo carousel or a single video, never both
+        has_video = bool(p.video_url)
+        doc = {
+            "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
+            "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
+            "content": p.content, "accent": p.accent, "location": p.location or "",
+            "photo_url": None if has_video else ((p.photo_urls[0] if p.photo_urls else None) or p.photo_url or None),
+            "photo_urls": [] if has_video else (p.photo_urls or ([p.photo_url] if p.photo_url else [])),
+            "video_url": p.video_url if has_video else None,
+            "video_duration": min(p.video_duration, MAX_POST_VIDEO_SECONDS) if (has_video and p.video_duration is not None) else None,
+            "user_location": u.get("location", ""),
+            "feeling": p.feeling or None,
+            "tagged_users": p.tagged_users or [],
+            "audience": p.audience or "public",
+            "comments_enabled": False if p.audience == "only_me" else (p.comments_enabled if p.comments_enabled is not None else True),
+            "photo_width": p.photo_width or None,
+            "photo_height": p.photo_height or None,
+            "video_width": p.video_width or None,
+            "video_height": p.video_height or None,
+            "aspect_ratio": p.aspect_ratio or (
+                round(p.video_width / p.video_height, 4) if (has_video and p.video_width and p.video_height) else
+                round(p.photo_width / p.photo_height, 4) if (p.photo_width and p.photo_height) else None
+            ),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "verified_category": u.get("verified_category") or None,
+            "music_title": p.music_title or None,
+            "music_artist": p.music_artist or None,
+            "music_artwork": p.music_artwork or None,
+            "music_preview_url": p.music_preview_url or None,
+            "music_duration_ms": p.music_duration_ms or None,
+            "music_start_ms": max(0, int(p.music_start_ms or 0)),
+            "music_clip_duration_ms": max(1000, min(30000, int(p.music_clip_duration_ms or 30000))) if p.music_preview_url else None,
+            "alt_text": (p.alt_text or "")[:1000] or None,
+            "gif_url": (p.gif_url or "").strip() or None,
+            "sticker_overlays": [{"id": s["id"], "url": s["url"], "x": float(s.get("x", 50)), "y": float(s.get("y", 50))} for s in (p.sticker_overlays or []) if s.get("url")][:10],
+            "emoji_overlays": [{"id": e.get("id", ""), "emoji": str(e.get("emoji", ""))[:8], "x": float(e.get("x", 50)), "y": float(e.get("y", 50)), "size": max(24, min(int(e.get("size", 72)), 160))} for e in (p.emoji_overlays or []) if e.get("emoji")][:20],
+            "video_text_overlays": [{"id": t.get("id",""), "text": (t.get("text") or "")[:200], "x": float(t.get("x", 50)), "y": float(t.get("y", 50)), "color": (t.get("color") or "#ffffff")[:20], "bgColor": (t.get("bgColor") or "transparent")[:20], "bgScale": float(t.get("bgScale") or 1), "size": int(t.get("size") or 22)} for t in (p.video_text_overlays or []) if t.get("text")][:10],
+            "video_effect": (p.video_effect or "none")[:20] if p.video_effect else None,
+            "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
+            "created_at": now().isoformat(), "edited_at": None, "is_pinned": False,
+        }
+        await db.posts.insert_one(doc.copy())
+        doc.pop("_id", None)
+        # Send tag notifications to tagged users
+        for handle in (p.tagged_users or []):
+            try:
+                tagged_user = await db.users.find_one({"handle": handle.lstrip("@")})
+                if tagged_user and tagged_user["id"] != u["id"]:
+                    await db.notifications.insert_one({
+                        "id": str(uuid.uuid4()), "user_id": tagged_user["id"],
+                        "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+                        "type": "tag", "post_id": doc["id"], "created_at": now().isoformat(), "read": False,
+                    })
+                    tag_prefs = tagged_user.get("notifications_prefs", {})
+                    if tag_prefs.get("tags", True):
+                        asyncio.create_task(send_push(tagged_user["id"], "Tag 🏷️", u["name"] + " tagged you in a post"))
+            except Exception:
+                pass
+        return doc
+
+    def _reel_to_feed_item(r: dict, mentioned: bool = False, mentioned_by: Optional[dict] = None) -> dict:
+        """Shapes a raw `reels` doc so it can sit alongside `posts` docs in the
+        home feed / profile grid — same field names the frontend post card and
+        PostMedia component already know how to render (video_url, content,
+        likes as [{user_id,color}], etc). `is_reel` lets the frontend route
+        interactions (like/comment/save/delete/open) to the /reels/* endpoints.
+        """
+        likes_ids = r.get("likes", [])
+        views_raw = r.get("views", [])
+        view_count = max(
+            len(views_raw) if isinstance(views_raw, list) else 0,
+            int(r.get("view_count") or 0),
+        )
+        return {
+            "id": r["id"],
+            "user_id": r["user_id"],
+            "user_name": r.get("user_name"),
+            "user_handle": r.get("user_handle"),
+            "avatar_bg": r.get("avatar_bg"),
+            "avatar_letter": r.get("avatar_letter"),
+            "avatar_photo": r.get("avatar_photo"),
+            "is_badge_verified": bool(r.get("is_badge_verified")),
+            "verified_category": None,
+            "content": r.get("caption") or "",
+            # Keep the reel API contract intact for the full-screen Reels viewer.
+            # The algorithm feed previously exposed this only as `content`, while
+            # the viewer reads `caption`, hiding hashtags and prompts after posting.
+            "caption": r.get("caption") or "",
+            "accent": None,
+            "location": None,
+            # photo reels: pass photo_url so the home-feed card can render it.
+            # video reels: keep photo_url null (video_url is the media).
+            "photo_url":  (r.get("photo_url") if not r.get("video_url") else None),
+            "photo_urls": ([r["photo_url"]] if r.get("photo_url") and not r.get("video_url") else None),
+            "video_url": r.get("video_url"),
+            "video_duration": r.get("duration"),
+            "photo_width": None, "photo_height": None,
+            # aspect_ratio: only meaningful for video reels (default 9/16).
+            # For photo reels leave None — frontend uses natural img dimensions.
+            "aspect_ratio": (
+                r.get("aspect_ratio")
+                or (
+                    r.get("media_width") / r.get("media_height")
+                    if r.get("video_url") and r.get("media_width") and r.get("media_height")
+                    else (9 / 16 if r.get("video_url") else None)
+                )
+            ),
+            "audience": "public",
+            "comments_enabled": True,
+            "likes": [{"user_id": uid, "color": "#FF3B30"} for uid in likes_ids],
+            "comments": r.get("comments", []),
+            # Keep raw viewer IDs out of the feed; expose the real aggregate count.
+            "views": [],
+            "views_count": view_count,
+            "view_count": view_count,
+            "saves": r.get("saves", []),
+            "save_count": max(len(r.get("saves") or []), int(r.get("save_count") or 0)),
+            "share_count": max(len(r.get("shares") or []), int(r.get("share_count") or 0)),
+            "reposts": [],
+            "created_at": r.get("created_at"),
+            "edited_at": None,
+            "is_pinned": False,
+            "is_reel": True,
+            # A mention is a reference to the original reel, never a copied
+            # upload.  The frontend can therefore render the same URL and
+            # preserve its natural media dimensions.
+            "is_mentioned": mentioned,
+            "mentioned_by": mentioned_by,
+            "audio_label":      r.get("audio_label"),
+            "music_url":        r.get("music_url"),
+            "music_start_time": r.get("music_start_time") or 0,
+            "music_clip_duration": r.get("music_clip_duration") or 15,
+            "music_title":      r.get("music_title"),
+            "music_artist":     r.get("music_artist"),
+            "music_artwork":    r.get("music_artwork"),
+            # Editing overlays — must be forwarded so the home-feed card renders
+            # stickers, text, emoji and filter identically to the full-screen viewer.
+            "sticker_overlays": r.get("sticker_overlays") or [],
+            "text_overlays":    r.get("text_overlays")    or [],
+            "emoji_overlays":   r.get("emoji_overlays")   or [],
+            "video_effect":     r.get("video_effect"),
+        }
+
+    @api.get("/posts")
+    async def list_posts(
+        q: Optional[str] = Query(None, max_length=200), user_id: Optional[str] = None,
+        skip: int = Query(0, ge=0, le=500), limit: int = Query(20, ge=1, le=50), feed: bool = False,
+        following_only: bool = False,
+        u=Depends(current_user),
+    ):
+        query: dict = {}
+        filter_public_authors = False
+        following_ids = u.get("following", [])
+        excluded_user_ids = set(
+            (u.get("blocked_users") or []) + (u.get("muted_users") or [])
+        )
+        if user_id and user_id != u["id"] and user_id in excluded_user_ids:
+            return {"posts": [], "total": 0, "skip": skip, "limit": limit}
+
+        if following_only:
+            ids = list(set(following_ids + [u["id"]]))
+            query["user_id"] = {"$in": ids} if ids else {"$in": [u["id"]]}
+        elif user_id:
+            target_user = await db.users.find_one({"id": user_id}, {"is_private": 1, "followers": 1})
+            if target_user and target_user.get("is_private") and user_id != u["id"]:
+                if u["id"] not in target_user.get("followers", []):
+                    return {"posts": [], "total": 0, "skip": skip, "limit": limit, "private_locked": True}
+            query["user_id"] = user_id
+        elif feed:
+            followers_ids = u.get("followers", [])
+            # Users we already have read access to (following + self)
+            can_see_ids = set(following_ids + [u["id"]])
+            can_see_list = list(can_see_ids)
+            # Run both user-set queries in PARALLEL for speed
+            async def _empty_list():
+                return []
+            follower_query = (
+                db.users.find(
+                    {"id": {"$in": followers_ids},
+                     "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
+                    {"id": 1, "_id": 0},
+                ).to_list(500)
+                if followers_ids else _empty_list()
+            )
+            verified_query = db.users.find(
+                {"is_badge_verified": True,
+                 "$or": [{"is_private": {"$ne": True}}, {"id": {"$in": can_see_list}}]},
+                {"id": 1, "_id": 0},
+            ).to_list(500)
+            visible_follower_docs, verified_docs = await asyncio.gather(follower_query, verified_query)
+            visible_follower_ids = [v["id"] for v in visible_follower_docs]
+            verified_ids = [v["id"] for v in verified_docs]
+            feed_ids = [
+                item_id for item_id in set(following_ids + visible_follower_ids + verified_ids + [u["id"]])
+                if item_id not in excluded_user_ids
+            ]
+            query["user_id"] = {"$in": feed_ids}
+        else:
+            if q:
+                query["$or"] = [
+                    {"content": {"$regex": q, "$options": "i"}},
+                    {"user_name": {"$regex": q, "$options": "i"}},
+                    {"location": {"$regex": q, "$options": "i"}},
+                ]
+            filter_public_authors = True
+        if q and user_id:
+            query["$or"] = [
+                {"content": {"$regex": q, "$options": "i"}},
+                {"user_name": {"$regex": q, "$options": "i"}},
+                {"location": {"$regex": q, "$options": "i"}},
+            ]
+
+        if excluded_user_ids:
+            current_user_filter = query.get("user_id")
+            if feed and isinstance(current_user_filter, dict) and "$in" in current_user_filter:
+                current_user_filter["$in"] = [
+                    item_id for item_id in current_user_filter["$in"]
+                    if item_id not in excluded_user_ids
+                ]
+            elif not user_id:
+                exclusion_filter = {"user_id": {"$nin": list(excluded_user_ids)}}
+                query = {"$and": [query, exclusion_filter]} if query else exclusion_filter
+
+        # Older Compose versions stored photo/video data URLs directly in posts.
+        # They are valid historical media and must remain visible in home/profile;
+        # the frontend now uploads new photos to hosted URLs before creating posts.
+        # Keep the filter for the separate reels query below, but never apply it
+        # to regular posts or old posts disappear from both screens.
+        legacy_media_filter = {"$nor": [
+            {"video_url": {"$regex": "^data:"}},
+            {"photo_url": {"$regex": "^data:"}},
+            {"photo_urls": {"$elemMatch": {"$regex": "^data:"}}},
+        ]}
+        feed_user_filter = query.get("user_id")
+
+        # Reels get merged into the home feed and profile grid (but not search)
+        # so a shared reel shows up for followers/following, and stays on the
+        # poster's own profile — reusing the same user_id filter built above.
+        include_reels = (feed or bool(user_id)) and not q and feed_user_filter is not None
+        fetch_n = skip + limit
+        if filter_public_authors:
+            posts_task = db.posts.aggregate([
+                {"$match": query},
+                {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
+                {"$match": {"$or": [{"user_id": u["id"]}, {"_author.is_private": {"$ne": True}}]}},
+                {"$sort": {"created_at": -1}},
+                {"$limit": fetch_n},
+                {"$project": {"_id": 0, "_author": 0}},
+            ]).to_list(fetch_n)
+        else:
+            posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+        if include_reels:
+            # Mention visibility is private to the signed-in viewer, never the profile target.
+            mention_target_id = u["id"]
+            viewer_mentions = await db.reel_mentions.find(
+                {"target_user_id": mention_target_id},
+                {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
+            ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            mentioned_ids = list(dict.fromkeys(doc["reel_id"] for doc in viewer_mentions if doc.get("reel_id")))
+
+            async def _load_feed_reels():
+                # Fetch normal feed reels and mentioned/reposted reels separately.
+                # Applying limit() to one combined query can drop an old reel
+                # before the mention/repost is merged into the Home feed.
+                normal_task = db.reels.find(
+                    {"$and": [{"user_id": feed_user_filter}, legacy_media_filter]}, {"_id": 0}
+                ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+                mentioned_task = (
+                    db.reels.find(
+                        {"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter]}, {"_id": 0}
+                    ).sort("created_at", -1).to_list(len(mentioned_ids))
+                    if mentioned_ids else _empty_list()
+                )
+                normal_reels, mentioned_reels = await asyncio.gather(normal_task, mentioned_task)
+                merged_by_id = {}
+                for item in normal_reels + mentioned_reels:
+                    merged_by_id[item["id"]] = item
+                return sorted(
+                    merged_by_id.values(),
+                    key=lambda item: item.get("created_at") or "",
+                    reverse=True,
+                )[:fetch_n]
+
+            reels_task = _load_feed_reels()
+        else:
+            async def _no_reels(): return []
+            reels_task = _no_reels()
+        posts_raw, reels_raw = await asyncio.gather(posts_task, reels_task)
+        # Mention visibility is private to the signed-in viewer, never the profile target.
+        mention_docs = {}
+        if include_reels:
+            mention_docs = {doc["reel_id"]: doc for doc in viewer_mentions if doc.get("reel_id")}
+        merged_reels = []
+        seen_reel_ids = set()
+        for reel in reels_raw:
+            if reel["id"] in seen_reel_ids:
+                continue
+            seen_reel_ids.add(reel["id"])
+            mention = mention_docs.get(reel["id"])
+            mentioned_by = (
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
+                if mention else None
+            )
+            feed_item = _reel_to_feed_item(reel, bool(mention), mentioned_by)
+            if mention and mention.get("created_at"):
+                # A repost is a new feed event. Sort it by repost time rather
+                # than the original reel upload time.
+                feed_item["original_created_at"] = feed_item.get("created_at")
+                feed_item["created_at"] = mention["created_at"]
+            merged_reels.append(feed_item)
+        merged = posts_raw + merged_reels
+        merged.sort(key=lambda d: d.get("created_at") or "", reverse=True)
+        posts = merged[skip:skip + limit]
+        unviewed_ids = [p["id"] for p in posts if not p.get("is_reel") and u["id"] not in p.get("views", [])]
+        if unviewed_ids:
+            # Fire-and-forget: don't block the response for view tracking
+            async def _mark_viewed():
+                try:
+                    await db.posts.update_many(
+                        {"id": {"$in": unviewed_ids}}, {"$addToSet": {"views": u["id"]}}
+                    )
+                except Exception:
+                    pass
+            asyncio.create_task(_mark_viewed())
+        return {"posts": posts, "has_more": len(posts) == limit, "skip": skip, "limit": limit}
+
+    @api.get("/posts/{pid}")
+    async def get_post(pid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid}, {"_id": 0})
+        if not post: raise HTTPException(404, "Post not found")
+        if u["id"] not in post.get("views", []):
+            await db.posts.update_one({"id": pid}, {"$addToSet": {"views": u["id"]}})
+            post["views"] = post.get("views", []) + [u["id"]]
+        return post
+
+    @api.delete("/posts/{pid}")
+    async def delete_post(pid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Not found")
+        if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
+        await db.posts.delete_one({"id": pid})
+        return {"ok": True}
+
+    @api.patch("/posts/{pid}")
+    async def edit_post(pid: str, p: PostIn, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
+        _validate_post_video(p.video_url, p.video_duration)
+        upd = {"content": p.content, "accent": p.accent, "location": p.location or "", "edited_at": now().isoformat()}
+        if p.video_url is not None:
+            # Switching to a video clears any existing photos, keeping the two mutually exclusive
+            upd["video_url"] = p.video_url
+            upd["video_duration"] = min(p.video_duration, MAX_POST_VIDEO_SECONDS) if p.video_duration is not None else None
+            upd["photo_url"] = None
+            upd["photo_urls"] = []
+        elif p.photo_url is not None or p.photo_urls is not None:
+            # Switching to photos clears any existing video
+            upd["video_url"] = None
+            upd["video_duration"] = None
+            if p.photo_url is not None: upd["photo_url"] = p.photo_url
+            if p.photo_urls is not None:
+                upd["photo_urls"] = p.photo_urls
+                upd["photo_url"] = p.photo_urls[0] if p.photo_urls else None
+        await db.posts.update_one({"id": pid}, {"$set": upd})
+        return await db.posts.find_one({"id": pid}, {"_id": 0})
+
+    @api.post("/posts/{pid}/like")
+    async def like_post(pid: str, p: LikeIn, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Not found")
+        # Atomic: first remove any existing like from this user, then add new one if color given.
+        # Avoids race condition where two simultaneous requests overwrite each other's likes.
+        await db.posts.update_one({"id": pid}, {"$pull": {"likes": {"user_id": u["id"]}}})
+        if p.color:
+            new_like = {"user_id": u["id"], "color": p.color, "liked_at": now().isoformat()}
+            await db.posts.update_one({"id": pid}, {"$push": {"likes": new_like}})
+        updated = await db.posts.find_one({"id": pid}, {"_id": 0, "likes": 1})
+        likes = updated.get("likes", []) if updated else []
+        if p.color and post["user_id"] != u["id"]:
+            await db.notifications.insert_one({
+                "id": str(uuid.uuid4()), "user_id": post["user_id"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+                "type": "like", "post_id": pid, "created_at": now().isoformat(), "read": False,
+            })
+            asyncio.create_task(send_push(post["user_id"], "New like ♥️", u["name"] + " liked your post"))
+        return {"likes": likes, "total": len(likes)}
+
+    @api.post("/posts/{pid}/comments")
+    async def add_comment(pid: str, p: CommentIn, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        if not post.get("comments_enabled", True):
+            raise HTTPException(403, "Comments are turned off for this post")
+        c = {
+            "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
+            "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"], "text": p.text,
+            "created_at": now().isoformat(),
+        }
+        await db.posts.update_one({"id": pid}, {"$push": {"comments": c}})
+        if post["user_id"] != u["id"]:
+            await db.notifications.insert_one({
+                "id": str(uuid.uuid4()), "user_id": post["user_id"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+                "type": "comment", "post_id": pid, "created_at": now().isoformat(), "read": False,
+            })
+            asyncio.create_task(send_push(post["user_id"], "New comment 💬", u["name"] + " commented on your post"))
+        return c
+
+    @api.delete("/posts/{pid}/comments/{cid}")
+    async def delete_comment(pid: str, cid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        comment = next((c for c in post.get("comments", []) if c["id"] == cid), None)
+        if not comment: raise HTTPException(404, "Comment not found")
+        if comment["user_id"] != u["id"] and post["user_id"] != u["id"]:
+            raise HTTPException(403, "Cannot delete")
+        await db.posts.update_one({"id": pid}, {"$pull": {"comments": {"id": cid}}})
+        return {"ok": True}
+
+    @api.post("/posts/{pid}/view")
+    async def view_post(pid: str, u=Depends(current_user)):
+        await db.posts.update_one({"id": pid}, {"$addToSet": {"views": u["id"]}})
+        return {"ok": True}
+
+    @api.post("/posts/{pid}/save")
+    async def save_post(pid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        if u["id"] in (post.get("saves") or []):
+            await db.posts.update_one({"id": pid}, {"$pull": {"saves": u["id"]}})
+            return {"saved": False}
+        await db.posts.update_one({"id": pid}, {"$addToSet": {"saves": u["id"]}})
+        return {"saved": True}
+
+    @api.post("/posts/{pid}/repost")
+    async def repost_post(pid: str, u=Depends(current_user)):
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        already = await db.posts.find_one({"repost_of": pid, "user_id": u["id"]})
+        if already:
+            await db.posts.delete_one({"id": already["id"]})
+            await db.posts.update_one({"id": pid}, {"$pull": {"reposts": u["id"]}})
+            return {"reposted": False}
+        doc = {
+            "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
+            "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
+            "content": post.get("content", ""), "accent": post.get("accent", "#FFD600"),
+            "location": "", "photo_url": post.get("photo_url"), "photo_urls": post.get("photo_urls", []),
+            "video_url": post.get("video_url"), "video_duration": post.get("video_duration"),
+            "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
+            "repost_of": pid, "repost_user_name": post.get("user_name"),
+            "repost_user_handle": post.get("user_handle"),
+            "created_at": now().isoformat(), "is_pinned": False,
+        }
+        await db.posts.insert_one(doc.copy())
+        await db.posts.update_one({"id": pid}, {"$addToSet": {"reposts": u["id"]}})
+        if post["user_id"] != u["id"]:
+            await db.notifications.insert_one({
+                "id": str(uuid.uuid4()), "user_id": post["user_id"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+                "type": "repost", "post_id": pid, "created_at": now().isoformat(), "read": False,
+            })
+            asyncio.create_task(send_push(post["user_id"], "Repost", u["name"] + " reposted your post"))
+        doc.pop("_id", None)
+        return {"reposted": True, "post": doc}
+
+    @api.post("/posts/{pid}/repost-to-friend")
+    async def repost_to_friend(pid: str, p: ShareToFriendIn, u=Depends(current_user)):
+        friend_id = p.friend_id.strip()
+        if not friend_id:
+            raise HTTPException(400, "friend_id required")
+        if friend_id == u["id"]:
+            raise HTTPException(400, "You cannot share a post with yourself")
+
+        post = await db.posts.find_one(
+            {"id": pid},
+            {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1,
+             "user_name": 1, "user_handle": 1, "avatar_bg": 1,
+             "avatar_letter": 1, "avatar_photo": 1},
+        )
+        if not post:
+            raise HTTPException(404, "Post not found")
+        friend = await db.users.find_one(
+            {"id": friend_id},
+            {"_id": 0, "id": 1, "name": 1, "blocked_users": 1,
+             "is_badge_verified": 1},
+        )
+        if not friend:
+            raise HTTPException(404, "Friend not found")
+        if friend_id in (u.get("blocked_users") or []) or u["id"] in (friend.get("blocked_users") or []):
+            raise HTTPException(403, "Cannot share with this user")
+        friendship = await db.friend_requests.find_one({
+            "status": "accepted",
+            "$or": [
+                {"from_id": u["id"], "to_id": friend_id},
+                {"from_id": friend_id, "to_id": u["id"]},
+            ],
+        })
+        if not friendship:
+            raise HTTPException(403, "Only connected friends can receive shared posts")
+
+        existing = await db.post_shares.find_one({
+            "post_id": pid, "from_id": u["id"], "to_id": friend_id,
+        })
+        if existing:
+            message_id = existing.get("message_id")
+            if message_id:
+                await db.messages.update_one(
+                    {"id": message_id, "from_id": u["id"], "to_id": friend_id},
+                    {"$set": {
+                        "deleted_for_everyone": True,
+                        "text": "",
+                        "shared_post": None,
+                        "shared_post_id": None,
+                    }},
+                )
+                await _ws_push(friend_id, {"type": "message_deleted", "msg_id": message_id})
+            await db.post_shares.delete_one({"id": existing["id"]})
+            return {"ok": True, "reposted": False}
+
+        shared_post = {
+            "id": post["id"],
+            "content": (post.get("content") or "")[:200],
+            "photo_url": post.get("photo_url") or ((post.get("photo_urls") or [None])[0]),
+            "user_name": post.get("user_name", ""),
+            "user_handle": post.get("user_handle", ""),
+            "avatar_bg": post.get("avatar_bg", ""),
+            "avatar_letter": post.get("avatar_letter", ""),
+            "avatar_photo": post.get("avatar_photo"),
+            "type": "post",
+        }
+        message_id = str(uuid.uuid4())
+        message = {
+            "id": message_id,
+            "from_id": u["id"],
+            "from_name": u["name"],
+            "to_id": friend_id,
+            "text": "",
+            "photo_url": None,
+            "gif_url": None,
+            "mood_color": None,
+            "created_at": now().isoformat(),
+            "status": "sent",
+            "deleted_for": [],
+            "deleted_for_everyone": False,
+            "reply_to_id": None,
+            "reply_to_preview": None,
+            "shared_post": shared_post,
+            "shared_post_id": pid,
+            "shared_via_post_share": True,
+            "audio_url": None,
+            "audio_duration": None,
+        }
+        await db.messages.insert_one(message.copy())
+        await db.post_shares.insert_one({
+            "id": str(uuid.uuid4()),
+            "post_id": pid,
+            "from_id": u["id"],
+            "to_id": friend_id,
+            "message_id": message_id,
+            "created_at": message["created_at"],
+        })
+        await _persist_user_activity_notification(
+            friend_id, u, "message", message="Shared a post with you", message_id=message_id, post_id=pid
+        )
+        await _ws_push(friend_id, {"type": "new_message", "message": message})
+        asyncio.create_task(send_push(
+            friend_id, "Post shared", u["name"] + " shared a post with you", "message"
+        ))
+        return {"ok": True, "reposted": True}
+
+    @api.post("/posts/{pid}/mention")
+    async def mention_in_post(pid: str, body: dict, u=Depends(current_user)):
+        mentioned_username = (body.get("username") or "").lstrip("@")
+        if not mentioned_username: raise HTTPException(400, "username required")
+        target = await db.users.find_one({"username": mentioned_username})
+        if not target: raise HTTPException(404, "User not found")
+        if target["id"] == u["id"]: return {"ok": True}
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": target["id"],
+            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+            "type": "mention", "post_id": pid, "created_at": now().isoformat(), "read": False,
+        })
+        target_prefs = target.get("notifications_prefs", {})
+        if target_prefs.get("mentions", True):
+            asyncio.create_task(send_push(target["id"], "Mention 📢", u["name"] + " mentioned you in a post"))
+        return {"ok": True}
+
+    @api.post("/reels/{reel_id}/mention")
+    async def mention_in_reel(reel_id: str, body: dict, u=Depends(current_user)):
+        """Save the original reel into another user's home/profile media feed.
+
+        This is a reference, not a media copy: the target feed reads the
+        source reel so the original photo/video URL and natural aspect ratio
+        remain unchanged.
+        """
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        raw_target_user_id = body.get("target_user_id")
+        if not isinstance(raw_target_user_id, str):
+            raise HTTPException(400, "Select exactly one user")
+        target_user_id = raw_target_user_id.strip()
+        if not target_user_id:
+            raise HTTPException(400, "target_user_id required")
+        target = await db.users.find_one({"id": target_user_id}, {"_id": 0})
+        if not target:
+            raise HTTPException(404, "User not found")
+        blocked_by_target = target_user_id in (u.get("blocked_users") or []) or u["id"] in (target.get("blocked_users") or [])
+        if blocked_by_target:
+            raise HTTPException(403, "Action not allowed")
+
+        async def sync_mention_rank_stats(mention_count: int):
+            try:
+                await db.reel_rank_stats.update_one(
+                    {"reel_id": reel_id},
+                    {"$set": {"reel_id": reel_id, "mentions": mention_count, "updated_at": now().isoformat()}},
+                    upsert=True,
+                )
+            except Exception:
+                logging.exception("Could not refresh mention rank stats for reel %s", reel_id)
+
+        mention = {
+            "id": str(uuid.uuid4()),
+            "reel_id": reel_id,
+            "target_user_id": target_user_id,
+            "source_user_id": u["id"],
+            "source_user_name": u.get("name"),
+            "source_user_handle": u.get("handle"),
+            "source_user_avatar": u.get("avatar_photo"),
+            "source_user_bg": u.get("avatar_bg"),
+            "source_user_letter": u.get("avatar_letter"),
+            "created_at": now().isoformat(),
+        }
+        existing_mention = await db.reel_mentions.find_one(
+            {"reel_id": reel_id, "target_user_id": target_user_id},
+            {"_id": 0, "source_user_id": 1},
+        )
+        if existing_mention:
+            # Mentioning the same user again is a true toggle: only the user
+            # who created this mention may remove it. A mention created by
+            # somebody else must stay untouched.
+            if existing_mention.get("source_user_id") == u["id"]:
+                await db.reel_mentions.delete_one(
+                    {"reel_id": reel_id, "target_user_id": target_user_id, "source_user_id": u["id"]}
+                )
+                await db.notifications.delete_many({
+                    "type": "reel_mention",
+                    "reel_id": reel_id,
+                    "user_id": target_user_id,
+                    "from_user_id": u["id"],
+                })
+                mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+                await sync_mention_rank_stats(mention_count)
+                return {"ok": True, "mentioned": False, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
+            mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+            await sync_mention_rank_stats(mention_count)
+            return {"ok": True, "mentioned": True, "already": True, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
+
+        await db.reel_mentions.insert_one(mention)
+        await db.notifications.update_one(
+            {"user_id": target_user_id, "type": "reel_mention", "reel_id": reel_id, "from_user_id": u["id"]},
+            {"$set": {
+                "id": str(uuid.uuid4()),
+                "user_id": target_user_id,
+                "from_user_id": u["id"],
+                "from_user_name": u.get("name"),
+                "from_user_avatar": u.get("avatar_photo"),
+                "type": "reel_mention",
+                "reel_id": reel_id,
+                "created_at": now().isoformat(),
+                "read": False,
+            }},
+            upsert=True,
+        )
+        # Direct feed reposts target the signed-in user and do not need a
+        # notification or push to the same account. Keep notifications for
+        # mentions sent to another user.
+        if target_user_id != u["id"]:
+            target_prefs = target.get("notifications_prefs", {})
+            if target_prefs.get("mentions", True):
+                asyncio.create_task(send_push(target_user_id, "Mention", u.get("name", "Someone") + " mentioned you in a reel"))
+        mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+        await sync_mention_rank_stats(mention_count)
+        return {"ok": True, "target_user_id": target_user_id, "reel_id": reel_id, "mention_count": mention_count}
+
+    @api.delete("/reels/{reel_id}/mention/{target_user_id}")
+    async def unmention_reel(reel_id: str, target_user_id: str, u=Depends(current_user)):
+        if target_user_id == u["id"]:
+            raise HTTPException(400, "Invalid target")
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        if reel["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Only the reel owner can remove a mention")
+        await db.reel_mentions.delete_one({"reel_id": reel_id, "target_user_id": target_user_id})
+        await db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id, "user_id": target_user_id})
+        mention_count = await db.reel_mentions.count_documents({"reel_id": reel_id})
+        await db.reel_rank_stats.update_one(
+            {"reel_id": reel_id},
+            {"$set": {"reel_id": reel_id, "mentions": mention_count, "updated_at": now().isoformat()}},
+            upsert=True,
+        )
+        return {"ok": True, "mention_count": mention_count}
+
+
+    @api.post("/posts/{pid}/report")
+    async def report_post(pid: str, body: dict, u=Depends(current_user)):
+        reason = (body.get("reason") or "").strip()
+        if not reason: raise HTTPException(400, "Reason required")
+        post = await db.posts.find_one({"id": pid})
+        if not post: raise HTTPException(404, "Post not found")
+        already = await db.reports.find_one({"post_id": pid, "reported_by": u["id"]})
+        if already: return {"ok": True, "already": True}
+        await db.reports.insert_one({"id": str(uuid.uuid4()), "post_id": pid, "reported_by": u["id"], "reported_user_id": post.get("user_id"), "reason": reason, "created_at": now().isoformat(), "status": "pending"})
+        return {"ok": True}
+    @api.post("/report/general")
+    async def report_general(body: dict, u=Depends(current_user)):
+        report_type = (body.get("type") or "").strip()
+        description = (body.get("description") or "").strip()
+        username = (body.get("username") or "").strip()
+        if not report_type: raise HTTPException(400, "Report type required")
+        if not description or len(description) < 5: raise HTTPException(400, "Description too short")
+        if len(description) > 2000: raise HTTPException(400, "Description too long")
+        doc = {
+            "id": str(uuid.uuid4()),
+            "reported_by": u["id"],
+            "reporter_handle": u.get("handle", ""),
+            "type": report_type,
+            "description": description,
+            "target_username": username or None,
+            "created_at": now().isoformat(),
+            "status": "pending"
+        }
+        await db.general_reports.insert_one(doc)
+        return {"ok": True, "message": "Report submitted. Our team will review it within 24 hours."}
+
+    @api.delete("/users/me/reports/{report_id}")
+    async def delete_my_report(report_id: str, u=Depends(current_user)):
+        """Allow a user to remove only their own submitted report."""
+        deleted = await db.reports.delete_one({"id": report_id, "reported_by": u["id"]})
+        if deleted.deleted_count == 0:
+            deleted = await db.general_reports.delete_one({"id": report_id, "reported_by": u["id"]})
+        if deleted.deleted_count == 0:
+            raise HTTPException(404, "Report not found")
+        return {"ok": True}
+
+    @api.get("/users/me/reports")
+    async def get_my_reports(u=Depends(current_user)):
+        """Return all reports submitted by the current user (general + content reports)."""
+        gen_cursor = db.general_reports.find({"reported_by": u["id"]}, {"_id": 0}).sort("created_at", -1).limit(50)
+        general_reports = await gen_cursor.to_list(50)
+        content_cursor = db.reports.find({"reported_by": u["id"]}, {"_id": 0}).sort("created_at", -1).limit(50)
+        content_reports = await content_cursor.to_list(50)
+        all_reports = []
+        for r in general_reports:
+            r["report_kind"] = "general"
+            all_reports.append(r)
+        for r in content_reports:
+            r["report_kind"] = r.get("type", "content")
+            if not r.get("type"):
+                r["type"] = "post" if r.get("post_id") else "reel"
+            target_id = r.get("reported_user_id")
+            if target_id:
+                target = await db.users.find_one({"id": target_id}, {"_id": 0, "name": 1, "handle": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1})
+                if target:
+                    r["reported_user"] = target
+            source = None
+            if r.get("post_id"):
+                source = await db.posts.find_one({"id": r["post_id"]}, {"_id": 0, "photo_urls": 1, "photo_url": 1, "video_url": 1})
+            elif r.get("reel_id"):
+                source = await db.reels.find_one({"id": r["reel_id"]}, {"_id": 0, "photo_urls": 1, "photo_url": 1, "video_url": 1})
+            if source:
+                photos = source.get("photo_urls") or ([source.get("photo_url")] if source.get("photo_url") else [])
+                if photos:
+                    r["reported_media_url"] = photos[0]
+                    r["reported_media_type"] = "image"
+                elif source.get("video_url"):
+                    r["reported_media_url"] = source["video_url"]
+                    r["reported_media_type"] = "video"
+            all_reports.append(r)
+        all_reports.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return {"reports": all_reports[:50]}
+
+
+    @api.post("/users/me/badge-request")
+    async def request_badge(body: dict, u=Depends(current_user)):
+        if u.get("is_badge_verified"): raise HTTPException(400, "Already verified")
+        existing = await db.badge_requests.find_one({"user_id": u["id"], "status": "pending"})
+        if existing: raise HTTPException(400, "A request is already pending review")
+        await db.badge_requests.insert_one({"id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"], "user_handle": u.get("handle"), "reason": (body.get("reason") or "").strip(), "created_at": now().isoformat(), "status": "pending"})
+        return {"ok": True}
+
+    @api.get("/users/me/saved-posts")
+    async def get_saved_posts(u=Depends(current_user)):
+        user_id = u["id"]
+        posts_cursor = db.posts.find({"saves": user_id}).sort("created_at", -1).limit(50)
+        result = []
+        async for p in posts_cursor:
+            p.pop("_id", None)
+            result.append(p)
+        return {"posts": result}
+
+    @api.get("/users/{target_user_id}/saved-posts")
+    async def get_user_saved_posts(target_user_id: str, u=Depends(current_user)):
+        target = await db.users.find_one({"id": target_user_id}, {"_id": 0, "id": 1, "is_private": 1, "followers": 1})
+        if not target:
+            raise HTTPException(404, "User not found")
+        if target.get("is_private") and target_user_id != u["id"] and u["id"] not in (target.get("followers") or []):
+            return {"posts": [], "private_locked": True}
+        posts_cursor = db.posts.find({"saves": target_user_id}).sort("created_at", -1).limit(50)
+        result = []
+        async for p in posts_cursor:
+            p.pop("_id", None)
+            result.append(p)
+        return {"posts": result}
+
+    # ── Friends ───────────────────────────────────────────────────
+    @api.post("/friends/request")
+    async def friend_request(p: FriendIn, u=Depends(current_user)):
+        if p.target_user_id == u["id"]: raise HTTPException(400, "Can't friend yourself")
+        target = await db.users.find_one({"id": p.target_user_id})
+        if not target: raise HTTPException(404, "User not found")
+        if target.get("account_type") == "organisation":
+            raise HTTPException(400, "You can only follow organisation accounts, not connect")
+        if target.get("is_badge_verified"):
+            raise HTTPException(400, "Verified public figures can only be followed, not connected")
+        existing = await db.friend_requests.find_one({"from_id": u["id"], "to_id": p.target_user_id})
+        if existing: return {"status": existing["status"]}
+        already_accepted = await db.friend_requests.find_one({
+            "$or": [
+                {"from_id": u["id"], "to_id": p.target_user_id, "status": "accepted"},
+                {"from_id": p.target_user_id, "to_id": u["id"], "status": "accepted"},
+            ]
+        })
+        if already_accepted: return {"status": "accepted"}
+        await db.friend_requests.insert_one({
+            "id": str(uuid.uuid4()), "from_id": u["id"], "to_id": p.target_user_id,
+            "status": "pending", "created_at": now().isoformat(),
+        })
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": p.target_user_id,
+            "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+            "type": "friend_request", "created_at": now().isoformat(), "read": False,
+        })
+        asyncio.create_task(send_push(p.target_user_id, "Connect request", u["name"] + " sent you a connect request"))
+        return {"status": "pending"}
+
+    @api.post("/friends/accept")
+    async def friend_accept(p: FriendIn, u=Depends(current_user)):
+        await db.friend_requests.update_one(
+            {"from_id": p.target_user_id, "to_id": u["id"], "status": "pending"},
+            {"$set": {"status": "accepted"}},
+        )
+        # Delete the notification from DB so it never reappears
+        await db.notifications.delete_one(
+            {"user_id": u["id"], "from_user_id": p.target_user_id, "type": "friend_request"}
+        )
+        return {"ok": True}
+
+    @api.post("/friends/decline")
+    async def friend_decline(p: FriendIn, u=Depends(current_user)):
+        await db.friend_requests.delete_one({"from_id": p.target_user_id, "to_id": u["id"]})
+        # Delete the notification from DB so it never reappears
+        await db.notifications.delete_one(
+            {"user_id": u["id"], "from_user_id": p.target_user_id, "type": "friend_request"}
+        )
+        return {"ok": True}
+
+    @api.post("/friends/cancel")
+    async def friend_cancel(p: FriendIn, u=Depends(current_user)):
+        await db.friend_requests.delete_one({"from_id": u["id"], "to_id": p.target_user_id})
+        return {"ok": True}
+
+    @api.get("/friends")
+    async def list_friends(u=Depends(current_user)):
+        accepted = await db.friend_requests.find(
+            {"$or": [{"from_id": u["id"], "status": "accepted"}, {"to_id": u["id"], "status": "accepted"}]},
+            {"_id": 0},
+        ).to_list(500)
+        friend_ids  = [r["to_id"] if r["from_id"] == u["id"] else r["from_id"] for r in accepted]
+        pending_in  = await db.friend_requests.find({"to_id": u["id"], "status": "pending"}, {"_id": 0}).to_list(500)
+        pending_out = await db.friend_requests.find({"from_id": u["id"], "status": "pending"}, {"_id": 0}).to_list(500)
+        PUBLIC_FIELDS = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+                         "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1,
+                         "category": 1, "location": 1, "about": 1, "cover_photo": 1,
+                         "stats": 1, "following": 1}
+        friends = await db.users.find({"id": {"$in": friend_ids}}, PUBLIC_FIELDS).to_list(500)
+        in_from_ids  = [r["from_id"] for r in pending_in]
+        out_to_ids   = [r["to_id"]   for r in pending_out]
+        in_users_list  = await db.users.find({"id": {"$in": in_from_ids}},  PUBLIC_FIELDS).to_list(500) if in_from_ids  else []
+        out_users_list = await db.users.find({"id": {"$in": out_to_ids}},   PUBLIC_FIELDS).to_list(500) if out_to_ids   else []
+        in_users  = {usr["id"]: usr for usr in in_users_list}
+        out_users = {usr["id"]: usr for usr in out_users_list}
+        for r in pending_in:  r["from_user"] = in_users.get(r["from_id"], {})
+        for r in pending_out: r["to_user"]   = out_users.get(r["to_id"], {})
+        return {"friends": friends, "pending_incoming": pending_in, "pending_outgoing": pending_out}
+
+    # ── WebSocket connection manager ────────────────────────────────
+    _ws_connections: dict = {}   # user_id → WebSocket
+
+    async def _ws_push(user_id: str, payload: dict) -> bool:
+        """Push a JSON payload to a connected user's WebSocket. Returns True if sent."""
+        ws = _ws_connections.get(user_id)
+        if not ws:
+            return False
+        try:
+            await ws.send_text(_json.dumps(payload))
+            return True
+        except Exception:
+            _ws_connections.pop(user_id, None)
+            return False
+
+    @app.websocket("/ws/{user_id}")
+    async def ws_endpoint(websocket: WebSocket, user_id: str):
+        """Persistent WebSocket per user for real-time messaging."""
+        # ── Authenticate via ?token= query param ─────────────────
+        token_val = websocket.query_params.get("token", "")
+        try:
+            payload = jwt.decode(token_val, JWT_SECRET, algorithms=["HS256"])
+            if payload.get("sub") != user_id:
+                await websocket.close(code=4001)
+                return
+        except Exception:
+            await websocket.close(code=4001)
+            return
+
+        await websocket.accept()
+        _ws_connections[user_id] = websocket
+        await db.users.update_one(
+            {"id": user_id},
+            {"$set": {"is_online": True, "last_seen": now().isoformat()}}
+        )
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    data = _json.loads(raw)
+                except Exception:
+                    continue   # ignore malformed frames
+
+                msg_type = data.get("type", "")
+
+                # ── delivered ACK: receiver got message via WS ────
+                if msg_type == "delivered":
+                    msg_id = data.get("msg_id", "")
+                    if not msg_id:
+                        continue
+                    msg = await db.messages.find_one(
+                        {"id": msg_id},
+                        {"_id": 0, "from_id": 1, "to_id": 1, "status": 1}
+                    )
+                    # Only upgrade if we are the intended receiver and status is still "sent"
+                    if msg and msg.get("to_id") == user_id and msg.get("status") == "sent":
+                        await db.messages.update_one(
+                            {"id": msg_id},
+                            {"$set": {"status": "delivered", "delivered_at": now().isoformat()}}
+                        )
+                        # Notify sender: their ✓ upgrades to ✓✓ grey
+                        await _ws_push(msg["from_id"], {
+                            "type": "status_update",
+                            "msg_id": msg_id,
+                            "status": "delivered",
+                        })
+
+                # ── seen ACK: receiver opened the chat ────────────
+                elif msg_type == "seen":
+                    partner_id = data.get("partner_id", "")
+                    if not partner_id:
+                        continue
+                    unseen = await db.messages.find(
+                        {
+                            "from_id": partner_id,
+                            "to_id": user_id,
+                            "status": {"$ne": "seen"},
+                            "deleted_for_everyone": {"$ne": True},
+                        },
+                        {"_id": 0, "id": 1}
+                    ).to_list(500)
+                    ids = [m["id"] for m in unseen]
+                    if ids:
+                        await db.messages.update_many(
+                            {"id": {"$in": ids}},
+                            {"$set": {"status": "seen", "seen_at": now().isoformat()}}
+                        )
+                        # Notify sender: their ✓✓ turns blue
+                        await _ws_push(partner_id, {
+                            "type": "bulk_seen",
+                            "msg_ids": ids,
+                            "by_user_id": user_id,
+                        })
+
+                # ── typing indicator: DM or group chat ─────────────
+                elif msg_type == "typing":
+                    to_uid = data.get("to_user_id", "")
+                    group_id = data.get("group_id", "")
+                    is_t = bool(data.get("is_typing", True))
+                    if group_id:
+                        group = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
+                        if not group or user_id not in group.get("members", []):
+                            continue
+                        payload = {"type": "typing", "group_id": group_id, "from_user_id": user_id, "is_typing": is_t}
+                        await asyncio.gather(*[_ws_push(member_id, payload) for member_id in group.get("members", []) if member_id != user_id])
+                    elif to_uid:
+                        await _ws_push(to_uid, {"type": "typing", "from_user_id": user_id, "is_typing": is_t})
+
+                    # ── ping / keepalive — no-op ──────────────────────
+                elif msg_type == "ping":
+                    pass
+
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            _ws_connections.pop(user_id, None)
+            await db.users.update_one(
+                {"id": user_id},
+                {"$set": {"is_online": False, "last_seen": now().isoformat()}}
+            )
+
+    # ── Messages ──────────────���───────────────────────────────────
+
+    @api.post("/messages")
+    async def send_message(p: MessageIn, u=Depends(current_user)):
+        """Save message to DB, then push to receiver via WebSocket if online."""
+        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id and not p.audio_url:
+            raise HTTPException(400, "Message cannot be empty")
+        recipient = await db.users.find_one({"id": p.to_user_id})
+        if not recipient:
+            raise HTTPException(404, "Recipient not found")
+        if u["id"] in recipient.get("blocked_users", []) or p.to_user_id in u.get("blocked_users", []):
+            raise HTTPException(403, "Cannot message this user")
+        if recipient.get("is_badge_verified"):
+            raise HTTPException(403, "Cannot message verified public figures")
+
+        # Cross-continent rule: must follow each other or be connected friends
+        same_continent = (
+            (u.get("continent") or "").strip() == (recipient.get("continent") or "").strip()
+            and bool(u.get("continent"))
+        )
+        if not same_continent:
+            sender_follows    = p.to_user_id in (u.get("following") or [])
+            recipient_follows = u["id"] in (recipient.get("followers") or [])
+            if not (sender_follows or recipient_follows):
+                fr = await db.friend_requests.find_one({
+                    "status": "accepted",
+                    "$or": [
+                        {"from_id": u["id"], "to_id": p.to_user_id},
+                        {"from_id": p.to_user_id, "to_id": u["id"]},
+                    ],
+                })
+                if not fr:
+                    raise HTTPException(403, "Connect with this user first to message across countries")
+
+        # ── Build reply-to preview ────────────────────────────────
+        reply_to_preview = None
+        if p.reply_to_id:
+            ref = await db.messages.find_one(
+                {"id": p.reply_to_id},
+                {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "photo_url": 1}
+            )
+            if ref:
+                reply_to_preview = {
+                    "id":       p.reply_to_id,
+                    "from_name": ref.get("from_name", ""),
+                    "from_id":  ref.get("from_id", ""),
+                    "text":     (ref.get("text") or "")[:120],
+                    "has_photo": bool(ref.get("photo_url")),
+                }
+
+        # ── Build shared-post preview ─────────────────────────────
+        shared_post = None
+        if p.shared_post_id:
+            sp = await db.posts.find_one(
+                {"id": p.shared_post_id},
+                {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1,
+                 "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1}
+            )
+            if sp:
+                shared_post = {
+                    "id":           sp["id"],
+                    "content":      (sp.get("content") or "")[:200],
+                    "photo_url":    sp.get("photo_url") or ((sp.get("photo_urls") or [None])[0]),
+                    "user_name":    sp.get("user_name", ""),
+                    "user_handle":  sp.get("user_handle", ""),
+                    "avatar_bg":    sp.get("avatar_bg", ""),
+                    "avatar_letter": sp.get("avatar_letter", ""),
+                    "avatar_photo": sp.get("avatar_photo"),
+                    "type": "post",
+                }
+
+        # ── Build shared-reel preview ─────────────────────────────
+        shared_reel = None
+        if p.shared_reel_id:
+            sr = await db.reels.find_one(
+                {"id": p.shared_reel_id},
+                {"_id": 0, "id": 1, "caption": 1, "video_url": 1,
+                 "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1}
+            )
+            if sr:
+                shared_reel = {
+                    "id":           sr["id"],
+                    "caption":      (sr.get("caption") or "")[:200],
+                    "video_url":    sr.get("video_url"),
+                    "user_name":    sr.get("user_name", ""),
+                    "user_handle":  sr.get("user_handle", ""),
+                    "avatar_bg":    sr.get("avatar_bg", ""),
+                    "avatar_letter": sr.get("avatar_letter", ""),
+                    "avatar_photo": sr.get("avatar_photo"),
+                    "type": "reel",
+                }
+
+        # ── Assemble message document ─────────────────────────────
+        m = {
+            "id":               str(uuid.uuid4()),
+            "from_id":          u["id"],
+            "from_name":        u["name"],
+            "to_id":            p.to_user_id,
+            "text":             p.text,
+            "photo_url":        p.photo_url,
+            "gif_url":          p.gif_url,
+            "mood_color":       p.mood_color,
+            "created_at":       now().isoformat(),
+            "status":           "sent",           # ✓ — server received
+            "deleted_for":      [],
+            "deleted_for_everyone": False,
+            "reply_to_id":      p.reply_to_id or None,
+            "reply_to_preview": reply_to_preview,
+            "shared_post":      shared_post,
+            "shared_reel":      shared_reel,
+            "audio_url":        p.audio_url or None,
+            "audio_duration":   p.audio_duration or None,
+        }
+        await db.messages.insert_one(m.copy())
+        m.pop("_id", None)
+
+        # Keep direct messages in the same user-activity notification stream
+        # as likes, comments, follows, tags, and mentions.
+        message_preview = p.text.strip() if p.text and p.text.strip() else (
+            "📷 Photo" if p.photo_url else
+            ("GIF" if p.gif_url else
+            ("📎 Post" if p.shared_post_id or p.shared_reel_id else
+            ("🎤 Voice" if p.audio_url else "Message")))
+        )
+        await _persist_user_activity_notification(
+            p.to_user_id, u, "message", message=message_preview[:120], message_id=m["id"]
+        )
+
+        # ── Push to receiver via WebSocket ────────────────────────
+        # Receiver client will reply with a "delivered" ACK that upgrades
+        # the status to "delivered" (✓✓ grey) and notifies the sender.
+        await _ws_push(p.to_user_id, {"type": "new_message", "message": m})
+
+        return m
+
+    @api.get("/messages/conversations")
+    async def get_conversations(u=Depends(current_user)):
+        pipeline = [
+            {"$match": {
+                "$or": [{"from_id": u["id"]}, {"to_id": u["id"]}],
+                "deleted_for_everyone": {"$ne": True},
+                "deleted_for": {"$nin": [u["id"]]},
+            }},
+            {"$sort": {"created_at": -1}},
+            {"$project": {
+                "_id": 0,
+                "other_id": {"$cond": [{"$eq": ["$from_id", u["id"]]}, "$to_id", "$from_id"]},
+                "text": 1, "photo_url": 1, "gif_url": 1, "shared_post_id": 1, "shared_reel_id": 1, "audio_url": 1, "created_at": 1, "status": 1, "from_id": 1, "mood_color": 1,
+            }},
+            {"$group": {
+                "_id":         "$other_id",
+                "last_text":   {"$first": "$text"},
+                "last_photo":  {"$first": "$photo_url"},
+                "last_gif":    {"$first": "$gif_url"},
+                "last_shared_post": {"$first": "$shared_post_id"},
+                "last_shared_reel": {"$first": "$shared_reel_id"},
+                "last_audio":  {"$first": "$audio_url"},
+                "last_time":   {"$first": "$created_at"},
+                "last_status": {"$first": "$status"},
+                "last_from":   {"$first": "$from_id"},
+                "last_mood":   {"$first": "$mood_color"},
+            }},
+        ]
+        convs      = await db.messages.aggregate(pipeline).to_list(200)
+        user_ids   = [c["_id"] for c in convs]
+        pub = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+               "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1,
+               "followers": 1, "following": 1,
+               "is_badge_verified": 1, "is_online": 1, "last_seen": 1}
+        users_list = await db.users.find({"id": {"$in": user_ids}}, pub).to_list(200)
+        for uu in users_list:
+            uu["followers_count"] = len(uu.get("followers") or [])
+            uu["following_count"] = len(uu.get("following") or [])
+            uu.pop("followers", None)
+            uu.pop("following", None)
+        users_map  = {uu["id"]: uu for uu in users_list}
+
+        async def _unread(cid: str) -> int:
+            return await db.messages.count_documents({
+                "from_id": cid, "to_id": u["id"],
+                "status": {"$ne": "seen"},
+                "deleted_for_everyone": {"$ne": True},
+                "deleted_for": {"$nin": [u["id"]]},
+            })
+
+        unread_counts = await asyncio.gather(*[_unread(c["_id"]) for c in convs])
+        for c, uc in zip(convs, unread_counts):
+            c["user"]              = users_map.get(c["_id"], {})
+            c["unread"]            = uc
+            c["is_partner_online"] = c["_id"] in _ws_connections
+        convs.sort(key=lambda x: x.get("last_time", ""), reverse=True)
+        return {"conversations": convs}
+
+    @api.get("/messages/unread-count")
+    async def get_msg_unread_count(u=Depends(current_user)):
+        count = await db.messages.count_documents({
+            "to_id": u["id"],
+            "status": {"$ne": "seen"},
+            "deleted_for_everyone": {"$ne": True},
+        })
+        return {"unread_count": count}
+
+    @api.get("/messages")
+    async def list_messages(
+        with_user: Optional[str] = Query(None, max_length=64), skip: int = Query(0, ge=0, le=100000), limit: int = Query(50, ge=1, le=100),
+        u=Depends(current_user),
+    ):
+        if with_user:
+            q = {"$or": [
+                {"from_id": u["id"], "to_id": with_user},
+                {"from_id": with_user, "to_id": u["id"]},
+            ]}
+        else:
+            q = {"$or": [{"from_id": u["id"]}, {"to_id": u["id"]}]}
+        # Filter deleted messages at MongoDB level so skip/limit work on already-filtered results.
+        # This is the critical fix: previously, skip/limit ran first then Python filtered,
+        # meaning cleared messages could re-appear when the conversation was re-opened.
+        fq = {**q, "deleted_for": {"$ne": u["id"]}, "deleted_for_everyone": {"$ne": True}}
+        msgs  = await db.messages.find(fq, {"_id": 0}).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
+        total = await db.messages.count_documents(fq)
+        return {"messages": msgs, "total": total, "skip": skip, "limit": limit}
+
+    @api.delete("/messages/{msg_id}")
+    async def delete_message(msg_id: str, delete_for: str = "self", u=Depends(current_user)):
+        msg = await db.messages.find_one({"id": msg_id})
+        if not msg:
+            raise HTTPException(404, "Message not found")
+        if delete_for == "everyone":
+            if msg["from_id"] != u["id"]:
+                raise HTTPException(403, "Only sender can delete for everyone")
+            await db.messages.update_one(
+                {"id": msg_id},
+                {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None, "audio_url": None}}
+            )
+        else:
+            await db.messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
+        return {"ok": True}
+
+    @api.delete("/messages/conversations/{partner_id}")
+    async def delete_conversation(partner_id: str, u=Depends(current_user)):
+        """Soft-delete entire conversation for the current user only."""
+        await db.messages.update_many(
+            {"$or": [
+                {"from_id": u["id"], "to_id": partner_id},
+                {"from_id": partner_id, "to_id": u["id"]},
+            ]},
+            {"$addToSet": {"deleted_for": u["id"]}}
+        )
+        return {"ok": True}
+
+    @api.post("/messages/conversations/{partner_id}/seen")
+    async def mark_conversation_seen(partner_id: str, u=Depends(current_user)):
+        """REST fallback: bulk-mark messages seen (used when WS is unavailable)."""
+        unseen = await db.messages.find(
+            {
+                "from_id": partner_id,
+                "to_id": u["id"],
+                "status": {"$ne": "seen"},
+                "deleted_for_everyone": {"$ne": True},
+            },
+            {"_id": 0, "id": 1}
+        ).to_list(500)
+        ids = [m["id"] for m in unseen]
+        if ids:
+            await db.messages.update_many(
+                {"id": {"$in": ids}},
+                {"$set": {"status": "seen", "seen_at": now().isoformat()}}
+            )
+            await _ws_push(partner_id, {"type": "bulk_seen", "msg_ids": ids, "by_user_id": u["id"]})
+        return {"ok": True}
+
+    @api.patch("/users/me/timezone")
+    async def update_timezone(body: dict, u=Depends(current_user)):
+        offset = body.get("offset")
+        if offset is None: raise HTTPException(400, "offset required")
+        await db.users.update_one({"id": u["id"]}, {"$set": {"timezone_offset": float(offset)}})
+        return {"ok": True}
+
+    # ── Notifications ─────────────────────────────────────────────
+    @api.get("/notifications")
+    async def get_notifications(u=Depends(current_user)):
+        notifs = await db.notifications.find(
+            {"user_id": u["id"]}, {"_id": 0}
+        ).sort("created_at", -1).limit(100).to_list(100)
+        actor_ids = {
+            str(n.get("from_user_id") or n.get("from_id"))
+            for n in notifs
+            if n.get("from_user_id") or n.get("from_id")
+        }
+        if actor_ids:
+            actors = await db.users.find(
+                {"id": {"$in": list(actor_ids)}},
+                {"_id": 0, "id": 1, "name": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1},
+            ).to_list(len(actor_ids))
+            actor_map = {str(actor.get("id")): actor for actor in actors}
+            for notification in notifs:
+                actor_id = str(notification.get("from_user_id") or notification.get("from_id") or "")
+                actor = actor_map.get(actor_id)
+                if actor:
+                    notification["from_user_name"] = actor.get("name", notification.get("from_user_name", ""))
+                    notification["from_user_avatar"] = actor.get("avatar_photo")
+                    notification["from_user_bg"] = actor.get("avatar_bg")
+                    notification["from_user_letter"] = actor.get("avatar_letter")
+        unread_count = await db.notifications.count_documents({"user_id": u["id"], "read": False})
+        return {"notifications": notifs, "unread_count": unread_count}
+
+    @api.post("/notifications/{notif_id}/read")
+    async def mark_notification_read(notif_id: str, u=Depends(current_user)):
+        await db.notifications.update_one(
+            {"id": notif_id, "user_id": u["id"]}, {"$set": {"read": True}}
+        )
+        return {"ok": True}
+
+    @api.get("/notifications/vapid-key")
+    async def get_vapid_key(u=Depends(current_user)):
+        pub, _ = await get_vapid_keys()
+        return {"public_key": pub}
+
+    @api.post("/notifications/push-subscribe")
+    async def push_subscribe(req: Request, u=Depends(current_user)):
+        data = await req.json()
+        await db.push_subscriptions.update_one(
+            {"user_id": u["id"]},
+            {"$set": {"user_id": u["id"], "subscription": data, "updated_at": now().isoformat()}},
+            upsert=True
+        )
+        return {"ok": True}
+
+    @api.post("/notifications/read-all")
+    async def mark_all_notifications_read(u=Depends(current_user)):
+        await db.notifications.update_many(
+            {"user_id": u["id"], "read": False}, {"$set": {"read": True}}
+        )
+        return {"ok": True}
+
+    @api.delete("/notifications/{notif_id}")
+    async def delete_notification(notif_id: str, u=Depends(current_user)):
+        await db.notifications.delete_one({"id": notif_id, "user_id": u["id"]})
+        return {"ok": True}
+
+    @api.get("/notifications/unread-count")
+    async def get_notif_unread_count(u=Depends(current_user)):
+        count = await db.notifications.count_documents({"user_id": u["id"], "read": False})
+        return {"unread_count": count}
+
+    # ── Settings ──────────────────────────────────────────────────
+    @api.patch("/settings/notifications")
+    async def update_notifications_prefs(p: NotificationsPrefsIn, u=Depends(current_user)):
+        upd = {k: v for k, v in p.model_dump().items() if v is not None}
+        if upd:
+            await db.users.update_one(
+                {"id": u["id"]},
+                {"$set": {f"notifications_prefs.{k}": v for k, v in upd.items()}},
+            )
+        fresh = await db.users.find_one({"id": u["id"]}, {"_id": 0, "notifications_prefs": 1})
+        return fresh.get("notifications_prefs", {})
+
+    @api.patch("/settings/theme")
+    async def update_theme(p: ThemeIn, u=Depends(current_user)):
+        await db.users.update_one({"id": u["id"]}, {"$set": {"theme": p.theme}})
+        return {"theme": p.theme}
+
+    @api.post("/settings/change-password")
+    async def change_password(p: ChangePasswordIn, u=Depends(current_user)):
+        user_with_hash = await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 1})
+        if not user_with_hash or not await verifypw(p.current_password, user_with_hash.get("password_hash", "")):
+            raise HTTPException(400, "Current password is incorrect")
+        if len(p.new_password) < 6:
+            raise HTTPException(400, "New password must be at least 6 characters")
+        await db.users.update_one({"id": u["id"]}, {"$set": {"password_hash": await hashpw(p.new_password)}})
+        return {"message": "Password updated successfully"}
+
+    # ── Username check ────────────────────────────────────────────
+    @api.get("/check-username")
+    async def check_username(username: str, u=Depends(current_user)):
+        if not re.match(r'^[a-z0-9_]{3,30}$', username):
+            return {"available": False, "reason": "3-30 chars, only a-z 0-9 _"}
+        existing = await db.users.find_one({"username": username})
+        if existing and existing["id"] != u["id"]:
+            return {"available": False, "reason": "Already taken"}
+        return {"available": True, "reason": "Available!"}
+
+    # ── Translation ───────────────────────────────────────────────
+    TRANSLATE_LANG_MAP = {
+        "zh": "zh-CN", "en": "en", "hi": "hi", "ur": "ur", "es": "es",
+        "fr": "fr", "ar": "ar", "pt": "pt", "de": "de", "ja": "ja",
+        "ru": "ru", "bn": "bn", "id": "id", "tr": "tr",
+        "mr": "mr", "ta": "ta", "te": "te", "gu": "gu", "pa": "pa",
+        "ko": "ko", "it": "it", "nl": "nl", "pl": "pl", "vi": "vi",
+    }
+
+    def _detect_tone_hint(text: str) -> Optional[str]:
+        t = text.lower()
+        if any(w in t for w in ["please","kindly","would you","could you","sir","ma'am","madam","dear"]):
+            return "Formal tone — polite phrasing used"
+        if any(w in t for w in ["hey","yo","sup","lol","haha","bruh","bro","sis","wanna","gonna","kinda"]):
+            return "Informal tone — casual/slang phrasing"
+        if any(w in t for w in ["urgent","asap","immediately","now","hurry","quickly"]):
+            return "Urgent tone — time-sensitive message"
+        if text.endswith("?") or text.count("?") > 1:
+            return "Questioning tone — expecting a reply"
+        if any(w in t for w in ["sorry","apolog","forgive","excuse me","pardon"]):
+            return "Apologetic tone — expressing regret"
+        return None
+
+    async def _translate_plain_text(value: str, tl: str) -> str:
+        """Translate a caption segment while preserving its surrounding whitespace."""
+        if not value or not value.strip():
+            return value
+        leading = value[:len(value) - len(value.lstrip())]
+        trailing = value[len(value.rstrip()):]
+        core = value.strip()
+        translated = None
+
+        # MyMemory is fast when available.
+        try:
+            url = (
+                "https://api.mymemory.translated.world/get"
+                f"?q={urllib.parse.quote(core)}&langpair=autodetect|{tl}"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+            def _fetch_mymemory():
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    return _json.loads(resp.read().decode())
+            data = await asyncio.to_thread(_fetch_mymemory)
+            result = (data.get("responseData") or {}).get("translatedText", "")
+            if result and "MYMEMORY WARNING" not in result and result.strip() != core:
+                translated = result.strip()
+        except Exception as e:
+            logging.warning(f"MyMemory translation failed: {e}")
+
+        # LibreTranslate is the second fallback.
+        if not translated:
+            try:
+                lt_body = _json.dumps({"q": core, "source": "auto", "target": tl, "format": "text"}).encode()
+                lt_req = urllib.request.Request(
+                    "https://libretranslate.com/translate", data=lt_body,
+                    headers={"Content-Type": "application/json", "User-Agent": "PostApp/1.0"}, method="POST",
+                )
+                def _fetch_libretranslate():
+                    with urllib.request.urlopen(lt_req, timeout=6) as resp:
+                        return _json.loads(resp.read().decode())
+                data = await asyncio.to_thread(_fetch_libretranslate)
+                result = data.get("translatedText", "")
+                if result and result.strip() != core:
+                    translated = result.strip()
+            except Exception as e:
+                logging.warning(f"LibreTranslate fallback failed: {e}")
+
+        # Google Translate's public endpoint handles short prompts and non-Latin text
+        # when the two keyless services are unavailable.
+        if not translated:
+            try:
+                url = (
+                    "https://translate.googleapis.com/translate_a/single"
+                    f"?client=gtx&sl=auto&tl={urllib.parse.quote(tl)}&dt=t&q={urllib.parse.quote(core)}"
+                )
+                req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+                def _fetch_google():
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        return _json.loads(resp.read().decode())
+                data = await asyncio.to_thread(_fetch_google)
+                chunks = data[0] if isinstance(data, list) and data else []
+                result = "".join(
+                    str(chunk[0]) for chunk in chunks
+                    if isinstance(chunk, list) and chunk and chunk[0]
+                )
+                if result and result.strip() != core:
+                    translated = result.strip()
+            except Exception as e:
+                logging.warning(f"Google translation fallback failed: {e}")
+
+        return leading + (translated or core) + trailing
+
+    async def _translate_caption(text: str, tl: str) -> str:
+        # Translate hashtag words separately so providers cannot leave #tags untouched.
+        parts = re.split(r"(#[\w-]+)", text, flags=re.UNICODE)
+        if len(parts) == 1:
+            return await _translate_plain_text(text, tl)
+
+        async def translate_part(part: str) -> str:
+            if part.startswith("#") and len(part) > 1:
+                translated_tag = await _translate_plain_text(part[1:], tl)
+                translated_tag = re.sub(r"\s+", "_", translated_tag.strip()).lstrip("#")
+                return "#" + translated_tag if translated_tag else part
+            return await _translate_plain_text(part, tl)
+
+        translated_parts = await asyncio.gather(*(translate_part(part) for part in parts))
+        return "".join(translated_parts)
+
+    @api.post("/translate")
+    async def translate_endpoint(body: dict):
+        raw_text = body.get("text") or ""
+        if not isinstance(raw_text, str):
+            raise HTTPException(status_code=400, detail="Text must be a string.")
+        text = raw_text.strip()
+        if len(text) > 5000:
+            raise HTTPException(status_code=413, detail="Text is too long to translate.")
+        target = body.get("target", "en")
+        if not isinstance(target, str):
+            raise HTTPException(status_code=400, detail="Target language must be a string.")
+        target = target[:20]
+        include_tone = body.get("tone", False)
+        if not text:
+            return {"translated": text, "tone_hint": None}
+        tl = TRANSLATE_LANG_MAP.get(target, target)
+        # Versioned key prevents an older untranslated result from masking this fix.
+        cache_key = "caption-v2|" + tl + "||" + text
+        cached = _cache_get(cache_key)
+        if cached:
+            return {"translated": cached, "tone_hint": _detect_tone_hint(text) if include_tone else None}
+        translated = await _translate_caption(text, tl)
+        _cache_set(cache_key, translated)
+        return {"translated": translated, "tone_hint": _detect_tone_hint(text) if include_tone else None}
+
+
+    # ── Verification ─────────────────────────────────────────────────────
+
+    async def _is_admin(u=Depends(current_user)):
+        if not u.get("is_admin"):
+            raise HTTPException(403, "Admin access required")
+        return u
+
+    @api.post("/verification/request")
+    async def submit_verification_request(p: VerificationRequestIn, u=Depends(current_user)):
+        if u.get("is_badge_verified"):
+            raise HTTPException(400, "Your account is already verified")
+        existing_pending = await db.verification_requests.find_one({"user_id": u["id"], "status": "pending"})
+        if existing_pending:
+            raise HTTPException(400, "You already have a pending verification request")
+        similar = await db.users.find_one({
+            "is_badge_verified": True,
+            "$or": [
+                {"username": {"$regex": f"^{re.escape(u.get('username',''))}$", "$options": "i"}},
+                {"name": {"$regex": f"^{re.escape(p.full_name)}$", "$options": "i"}},
+            ]
+        })
+        req = {
+            "id": str(uuid.uuid4()),
+            "user_id": u["id"],
+            "user_name": u["name"],
+            "user_handle": u.get("handle", ""),
+            "user_username": u.get("username", ""),
+            "user_avatar_photo": u.get("avatar_photo"),
+            "user_avatar_bg": u.get("avatar_bg"),
+            "user_avatar_letter": u.get("avatar_letter"),
+            "full_name": p.full_name,
+            "category": p.category,
+            "id_proof_url": p.id_proof_url or "",
+            "social_links": p.social_links or "",
+            "status": "pending",
+            "flagged": bool(similar),
+            "flag_reason": (f"Similar name/username matches verified @{similar.get('username')}" if similar else None),
+            "submitted_at": now().isoformat(),
+            "reviewed_at": None,
+            "reject_reason": None,
+        }
+        await db.verification_requests.insert_one(req)
+        req.pop("_id", None)
+        return {"ok": True, "flagged": req["flagged"]}
+
+    @api.get("/verification/my-status")
+    async def my_verification_status(u=Depends(current_user)):
+        if u.get("is_badge_verified"):
+            return {
+                "status": "verified",
+                "category": u.get("verified_category") or u.get("category") or "",
+                "verified_at": u.get("badge_verified_at"),
+            }
+        req = await db.verification_requests.find_one(
+            {"user_id": u["id"]}, {"_id": 0}, sort=[("submitted_at", -1)]
+        )
+        if not req:
+            return {"status": "none"}
+        return {"status": req["status"], "category": req.get("category"), "reject_reason": req.get("reject_reason"), "submitted_at": req.get("submitted_at")}
+
+    @api.get("/admin/verification/requests")
+    async def admin_list_requests(status: Optional[str] = "pending", skip: int = Query(0, ge=0, le=10000), limit: int = Query(100, ge=1, le=200), admin=Depends(_is_admin)):
+        query = {} if status == "all" else {"status": status}
+        reqs = await db.verification_requests.find(query, {"_id": 0}).sort("submitted_at", -1).skip(skip).limit(limit).to_list(limit)
+        total = await db.verification_requests.count_documents(query)
+        return {"requests": reqs, "total": total}
+
+    @api.post("/admin/verification/approve/{request_id}")
+    async def admin_approve_request(request_id: str, admin=Depends(_is_admin)):
+        req = await db.verification_requests.find_one({"id": request_id})
+        if not req:
+            raise HTTPException(404, "Request not found")
+        if req["status"] != "pending":
+            raise HTTPException(400, f"Request is already {req['status']}")
+        now_str = now().isoformat()
+        category = req.get("category", "Public Figure")
+        uid = req["user_id"]
+        await db.users.update_one(
+            {"id": uid},
+            {"$set": {"is_badge_verified": True, "verified_category": category, "badge_verified_at": now_str, "username_locked": True}}
+        )
+        await db.posts.update_many({"user_id": uid}, {"$set": {"is_badge_verified": True, "verified_category": category}})
+        await db.verification_requests.update_one(
+            {"id": request_id},
+            {"$set": {"status": "approved", "reviewed_at": now_str, "reviewed_by": admin["id"]}}
+        )
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": uid,
+            "from_user_id": admin["id"], "from_user_name": "POST Team",
+            "type": "verification_approved",
+            "text": f"Congratulations! Your account is now verified as '{category}'. ✅",
+            "created_at": now_str, "read": False,
+        })
+        return {"ok": True}
+
+    @api.post("/admin/verification/reject/{request_id}")
+    async def admin_reject_request(request_id: str, p: AdminRejectIn, admin=Depends(_is_admin)):
+        req = await db.verification_requests.find_one({"id": request_id})
+        if not req:
+            raise HTTPException(404, "Request not found")
+        if req["status"] != "pending":
+            raise HTTPException(400, f"Request is already {req['status']}")
+        now_str = now().isoformat()
+        await db.verification_requests.update_one(
+            {"id": request_id},
+            {"$set": {"status": "rejected", "reject_reason": p.reason, "reviewed_at": now_str, "reviewed_by": admin["id"]}}
+        )
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": req["user_id"],
+            "from_user_id": admin["id"], "from_user_name": "POST Team",
+            "type": "verification_rejected",
+            "text": f"Your verification request was not approved. Reason: {p.reason}",
+            "created_at": now_str, "read": False,
+        })
+        return {"ok": True}
+
+    @api.post("/admin/verification/grant")
+    async def admin_grant_badge(p: AdminGrantIn, admin=Depends(_is_admin)):
+        target = await db.users.find_one({"id": p.user_id})
+        if not target:
+            raise HTTPException(404, "User not found")
+        now_str = now().isoformat()
+        await db.users.update_one(
+            {"id": p.user_id},
+            {"$set": {"is_badge_verified": True, "verified_category": p.category, "badge_verified_at": now_str, "username_locked": True}}
+        )
+        await db.posts.update_many({"user_id": p.user_id}, {"$set": {"is_badge_verified": True, "verified_category": p.category}})
+        await db.verification_requests.update_many(
+            {"user_id": p.user_id, "status": "pending"},
+            {"$set": {"status": "approved", "reviewed_at": now_str, "reviewed_by": admin["id"]}}
+        )
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": p.user_id,
+            "from_user_id": admin["id"], "from_user_name": "POST Team",
+            "type": "verification_approved",
+            "text": f"Congratulations! Your account is now verified as '{p.category}'. ✅",
+            "created_at": now_str, "read": False,
+        })
+        return {"ok": True}
+
+    @api.post("/admin/verification/revoke/{user_id}")
+    async def admin_revoke_badge(user_id: str, admin=Depends(_is_admin)):
+        target = await db.users.find_one({"id": user_id})
+        if not target:
+            raise HTTPException(404, "User not found")
+        await db.users.update_one(
+            {"id": user_id},
+            {"$unset": {"is_badge_verified": "", "verified_category": "", "badge_verified_at": "", "username_locked": ""}}
+        )
+        await db.posts.update_many({"user_id": user_id}, {"$unset": {"is_badge_verified": "", "verified_category": ""}})
+        return {"ok": True}
+
+    @api.get("/admin/users")
+    async def admin_list_users(q: Optional[str] = Query(None, max_length=100), skip: int = Query(0, ge=0, le=10000), limit: int = Query(50, ge=1, le=100), admin=Depends(_is_admin)):
+        query: dict = {}
+        if q:
+            query["$or"] = [
+                {"name": {"$regex": q, "$options": "i"}},
+                {"username": {"$regex": q, "$options": "i"}},
+                {"email": {"$regex": q, "$options": "i"}},
+            ]
+        users_list = await db.users.find(query, {"_id": 0, "password_hash": 0, "otp_hash": 0}).skip(skip).limit(limit).to_list(limit)
+        total = await db.users.count_documents(query)
+        return {"users": users_list, "total": total}
+
+    @api.post("/admin/users/{user_id}/toggle-admin")
+    async def admin_toggle_admin(user_id: str, admin=Depends(_is_admin)):
+        target = await db.users.find_one({"id": user_id})
+        if not target:
+            raise HTTPException(404, "User not found")
+        new_val = not target.get("is_admin", False)
+        await db.users.update_one({"id": user_id}, {"$set": {"is_admin": new_val}})
+        return {"ok": True, "is_admin": new_val}
+
+    # ── Health ────────────────────────────────────────────────────
+    @api.get("/")
+    async def root():
+        return {"status": "ok", "demo_mode": DEMO_MODE, "twilio": bool(TWILIO_SID), "version": "5.0"}
+
+    # ── Startup: indexes ──────────────────────────────────────────
+    @app.on_event("startup")
+    async def create_indexes():
+        # Each index is created independently — a name/option conflict on one
+        # (e.g. an older non-sparse "username_1" index already existing) must
+        # not abort the rest. Previously all calls shared a single try/except,
+        # so a conflict on an early index (users.username) silently skipped
+        # every index declared after it, including the newer world_reports /
+        # world_active indexes added for the Join World feature.
+        index_specs = [
+            (db.users, "id", {"unique": True, "background": True}),
+            (db.users, "username", {"unique": True, "sparse": True, "background": True}),
+            (db.users, "email", {"background": True}),
+            (db.users, "phone", {"background": True}),
+            (db.users, "handle", {"background": True}),
+            (db.posts, "user_id", {"background": True}),
+            (db.posts, [("created_at", -1)], {"background": True}),
+            (db.posts, "id", {"unique": True, "background": True}),
+            (db.messages, [("from_id", 1), ("to_id", 1)], {"background": True}),
+            (db.messages, [("created_at", 1)], {"background": True}),
+            (db.notifications, "user_id", {"background": True}),
+            (db.notifications, [("created_at", -1)], {"background": True}),
+            (db.follow_requests, [("from_id", 1), ("to_id", 1)], {"background": True}),
+            (db.follow_requests, "status", {"background": True}),
+            (db.friend_requests, [("from_id", 1), ("to_id", 1)], {"background": True}),
+            (db.friend_requests, "status", {"background": True}),
+            (db.email_otps, "email", {"background": True}),
+            (db.phone_otps, "phone", {"background": True}),
+            (db.account_deletions, "identifier", {"background": True}),
+            # Feed query indexes
+            (db.users, "is_badge_verified", {"background": True}),
+            (db.users, "is_private", {"background": True}),
+            (db.verification_requests, "user_id", {"background": True}),
+            (db.verification_requests, "status", {"background": True}),
+            (db.verification_requests, "id", {"unique": True, "sparse": True, "background": True}),
+            (db.users, "followers", {"background": True}),
+            (db.world_reports, [("created_at", -1)], {"background": True}),
+            (db.world_reports, "location_type", {"background": True}),
+            (db.world_reports, "id", {"unique": True, "sparse": True, "background": True}),
+            (db.world_active, "user_id", {"unique": True, "background": True}),
+            (db.world_active, "last_ping", {"background": True}),
+            (db.reel_mentions, [("reel_id", 1), ("target_user_id", 1)], {"unique": True, "background": True}),
+            (db.reel_mentions, [("target_user_id", 1), ("created_at", -1)], {"background": True}),
+        ]
+        ok_count = 0
+        for collection, keys, options in index_specs:
+            try:
+                await collection.create_index(keys, **options)
+                ok_count += 1
+            except Exception as e:
+                # Code 86 = IndexKeySpecsConflict: existing index has different options.
+                # Drop the old index and recreate with new specs.
+                details = getattr(e, "details", None)
+                detail_code = details.get("code") if isinstance(details, dict) else None
+                err_code = getattr(e, "code", None) or detail_code
+                if err_code == 86:
+                    try:
+                        index_name = options.get("name")
+                        if not index_name:
+                            if isinstance(keys, str):
+                                index_name = f"{keys}_1"
+                            else:
+                                index_name = "_".join(f"{k}_{v}" for k, v in keys)
+                        await collection.drop_index(index_name)
+                        await collection.create_index(keys, **options)
+                        ok_count += 1
+                        logging.info(f"Rebuilt conflicting index ({collection.name}.{keys})")
+                    except Exception as e2:
+                        logging.warning(f"Index rebuild failed ({collection.name}.{keys}): {e2}")
+                else:
+                    logging.warning(f"Index creation warning ({collection.name}.{keys}): {e}")
+        logging.info(f"✅ MongoDB indexes created ({ok_count}/{len(index_specs)})")
+
+    # ── Startup: make official account an admin + verified ──────────
+    @app.on_event("startup")
+    async def promote_official_account():
+        if not OFFICIAL_ACCOUNT_ID:
+            return
+        try:
+            result = await db.users.update_one(
+                {"id": OFFICIAL_ACCOUNT_ID},
+                {"$set": {
+                    "is_admin": True,
+                    "is_badge_verified": True,
+                    "verified_category": "Business / Brand",
+                    "badge_verified_at": now().isoformat(),
+                    "username_locked": True,
+                }},
+            )
+            if result.matched_count:
+                await db.posts.update_many(
+                    {"user_id": OFFICIAL_ACCOUNT_ID},
+                    {"$set": {"is_badge_verified": True, "verified_category": "Business / Brand"}},
+                )
+                logging.info("✅ Official account promoted to admin + verified badge")
+            else:
+                logging.warning("⚠️ OFFICIAL_ACCOUNT_ID set but no matching user found")
+        except Exception as e:
+            logging.warning(f"Official account admin promotion warning: {e}")
+
+    # ── Startup: seed demo users ──────────────────────────────────
+    @app.on_event("startup")
+    async def seed():
+        if await db.users.count_documents({"is_seed": True}) > 0:
+            return
+        WORLD = [
+            ("Aryan",  "@aryan_world",  "Mumbai, India",         "Photographer & traveller 📷", "Asia",     "#FFD600"),
+            ("Bella",  "@bella_creates","London, UK",            "Designer. Coffee lover ☕",    "Europe",   "#00C853"),
+            ("Carlos", "@carlos_global","Mexico City",           "Entrepreneur 🚀",             "Americas", "#29B6F6"),
+            ("Yuki",   "@yuki_jp",      "Tokyo, Japan",          "Manga artist 🎨",             "Asia",     "#00C853"),
+            ("Fatima", "@fatima_sa",    "Riyadh, Saudi Arabia",  "Writer & poet ✍️",            "Asia",     "#FF1744"),
+            ("Pierre", "@pierre_fr",    "Paris, France",         "Chef & food blogger 🥐",      "Europe",   "#FF1744"),
+            ("Lucas",  "@lucas_br",     "São Paulo, Brazil",     "Carnaval organizer 🎉",       "Americas", "#00C853"),
+            ("Chioma", "@chioma_ng",    "Lagos, Nigeria",        "Fashion designer 👗",         "Africa",   "#29B6F6"),
+            ("Jack",   "@jack_au",      "Sydney, Australia",     "Surfer & barista ☕",          "Oceania",  "#00C853"),
+            ("Soo-Jin","@soojin_kr",    "Seoul, South Korea",    "K-pop enthusiast 🎵",         "Asia",     "#FF1744"),
+            ("Anna",   "@anna_se",      "Stockholm, Sweden",     "Environmentalist 🌿",         "Europe",   "#29B6F6"),
+            ("Amara",  "@amara_ke",     "Nairobi, Kenya",        "Safari guide 🦁",             "Africa",   "#FFD600"),
+        ]
+        for name, handle, loc, about, continent, color in WORLD:
+            uid = str(uuid.uuid4())
+            await db.users.insert_one({
+                "id": uid, "email": f"{handle[1:]}@post.demo",
+                "username": handle[1:], "name": name, "handle": handle,
+                "is_verified": True, "is_seed": True, "avatar_bg": color,
+                "avatar_letter": name[0], "location": loc, "about": about, "continent": continent,
+                "created_at": now(), "followers": [], "following": [], "blocked_users": [],
+                "notifications_prefs": {"likes": True, "comments": True, "friend_requests": True, "messages": True, "mentions": True, "tags": True},
+            })
+        logging.info("✅ World users seeded")
+
+    # ── Self-ping keepalive (prevents Render free tier sleep) ────
+    # List holds a strong ref to the task — no nonlocal / global needed
+    _keepalive_holder = []
+
+    @app.on_event("startup")
+    async def keepalive_self_ping():
+        import urllib.request as _ur2
+        # Render only resets its 15-min inactivity/sleep timer on requests that
+        # arrive through its public edge — pinging 127.0.0.1 never reaches the
+        # edge, so it did NOT prevent the free-tier service from sleeping.
+        # RENDER_EXTERNAL_URL is auto-injected by Render with the real public
+        # URL (e.g. https://post-app-backend.onrender.com); use that instead,
+        # and only fall back to localhost when running outside Render.
+        external_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+        if external_url:
+            ping_url = f"{external_url}/api/ping"
+        else:
+            port = os.environ.get("PORT", "10000")
+            ping_url = f"http://127.0.0.1:{port}/api/ping"
+        logging.info(f"[KeepAlive] starting → {ping_url} every 10 min")
+
+        async def _ping_loop():
+            await asyncio.sleep(30)   # let server fully boot first
+            loop = asyncio.get_running_loop()   # correct for Python 3.10+
+            def _do_ping():
+                with _ur2.urlopen(ping_url, timeout=15):
+                    pass
+            while True:
+                try:
+                    await loop.run_in_executor(None, _do_ping)
+                    logging.info("[KeepAlive] ✅ ping OK — server awake")
+                except Exception as _pe:
+                    logging.warning(f"[KeepAlive] ⚠️ ping failed: {_pe}")
+                await asyncio.sleep(10 * 60)   # every 10 min — safe margin under 15 min limit
+
+        task = asyncio.ensure_future(_ping_loop())
+        _keepalive_holder.append(task)   # strong ref → GC can never collect this
+
+    # ── Shutdown ──────────────────────────────────────────────────
+    @app.on_event("shutdown")
+    async def shutdown():
+        client.close()
+
+    # ── Health / keep-alive ping ─────────────────────────────────
+    @api.get("/ping")
+    async def ping():
+        return {"ok": True}
+
+    # ── Join World ────────────────────────────────────────────────
+    _NEWS_NATIVE = {
+        "top": "general", "business": "business", "technology": "technology",
+        "sports": "sports", "health": "health", "science": "science",
+        "entertainment": "entertainment",
+    }
+    _NEWS_KEYWORDS = {
+        "politics": "politics OR government OR parliament OR election OR senate",
+        "economy": "economy OR inflation OR GDP OR recession OR economic policy",
+        "ai": '"artificial intelligence" OR "machine learning" OR GPT OR LLM OR OpenAI',
+        "infrastructure": '"infrastructure development" OR "smart city" OR highway OR railway OR metro',
+        "automobile": "electric vehicle OR EV OR car industry OR Tesla OR automotive OR automobile",
+        "manufacturing": "manufacturing OR factory OR industrial production OR supply chain",
+        "environment": "climate change OR environment OR carbon OR global warming OR pollution OR renewable energy",
+        "education": "education OR school OR university OR student OR curriculum OR learning",
+        "crime": "crime OR law enforcement OR court OR arrest OR verdict OR criminal justice",
+        "world-affairs": "diplomacy OR foreign policy OR UN OR summit OR bilateral OR treaty OR geopolitics",
+        "weather": "weather OR storm OR flood OR drought OR hurricane OR cyclone OR earthquake OR tsunami",
+        "startups": "startup OR venture capital OR IPO OR funding OR fintech OR unicorn OR entrepreneur",
+        "energy": "energy OR oil OR gas OR solar OR wind power OR nuclear OR electricity grid",
+    }
+
+    _news_cache: dict = {}
+    _NEWS_CACHE_TTL = 180  # 3 minutes
+    _NEWS_CACHE_MAX_ENTRIES = 128
+
+    def _news_cache_get(key):
+        now_mono = _time.monotonic()
+        entry = _news_cache.get(key)
+        if not entry:
+            return None
+        if now_mono - entry[1] >= _NEWS_CACHE_TTL:
+            _news_cache.pop(key, None)
+            return None
+        return entry[0]
+
+    def _news_cache_set(key, value):
+        now_mono = _time.monotonic()
+        for cached_key, (_, cached_at) in list(_news_cache.items()):
+            if now_mono - cached_at >= _NEWS_CACHE_TTL:
+                _news_cache.pop(cached_key, None)
+        if key not in _news_cache and len(_news_cache) >= _NEWS_CACHE_MAX_ENTRIES:
+            oldest_key = min(_news_cache, key=lambda cached_key: _news_cache[cached_key][1])
+            _news_cache.pop(oldest_key, None)
+        _news_cache[key] = (value, now_mono)
+
+    async def _fetch_news_articles(category: str, country: Optional[str], page_size: int = 20) -> list:
+        if not NEWS_API_KEY:
+            return []
+        loop = asyncio.get_running_loop()
+        def _do_fetch():
+            cat_lower = (category or "top").lower()
+            if cat_lower in _NEWS_NATIVE:
+                params: dict = {
+                    "apiKey": NEWS_API_KEY,
+                    "category": _NEWS_NATIVE[cat_lower],
+                    "pageSize": min(page_size * 3, 100),
+                    "language": "en",
+                }
+                if country:
+                    params["country"] = country.lower()[:2]
+                url = "https://newsapi.org/v2/top-headlines?" + urllib.parse.urlencode(params)
+            else:
+                kw = _NEWS_KEYWORDS.get(cat_lower, cat_lower)
+                if country:
+                    kw = f"({kw}) AND {country}"
+                params = {
+                    "apiKey": NEWS_API_KEY,
+                    "q": kw,
+                    "pageSize": min(page_size * 3, 100),
+                    "language": "en",
+                    "sortBy": "publishedAt",
+                }
+                url = "https://newsapi.org/v2/everything?" + urllib.parse.urlencode(params)
+            req = urllib.request.Request(url, headers={"User-Agent": "PostApp/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = _json.loads(resp.read())
+            return data.get("articles", [])
+        try:
+            articles = await loop.run_in_executor(None, _do_fetch)
+            filtered = [
+                a for a in articles
+                if a.get("urlToImage") and a.get("title") and "[Removed]" not in a.get("title", "")
+            ]
+            return filtered[:page_size]
+        except Exception as e:
+            logging.warning(f"[News] fetch failed: {e}")
+            return []
+
+    @api.get("/world/news")
+    async def world_news(
+        category: str = "top",
+        country: Optional[str] = None,
+        u=Depends(current_user),
+    ):
+        cache_key = f"news:{(category or 'top').lower()}:{(country or 'world').lower()}"
+        cached = _news_cache_get(cache_key)
+        if cached:
+            return cached
+        articles = await _fetch_news_articles(category, country, page_size=20)
+        result = {
+            "articles": [
+                {
+                    "title": a.get("title", ""),
+                    "description": a.get("description") or "",
+                    "url": a.get("url", ""),
+                    "image": a.get("urlToImage", ""),
+                    "source": (a.get("source") or {}).get("name", "Unknown"),
+                    "published_at": a.get("publishedAt", ""),
+                }
+                for a in articles
+            ],
+            "category": category,
+            "country": country,
+            "no_key": not bool(NEWS_API_KEY),
+        }
+        _news_cache_set(cache_key, result)
+        return result
+
+    @api.get("/world/active-count")
+    async def world_active_count(u=Depends(current_user)):
+        cutoff = (now() - timedelta(seconds=45)).isoformat()
+        count = await db.world_active.count_documents({"last_ping": {"$gte": cutoff}})
+        return {"count": count}
+
+    @api.post("/world/active-ping")
+    async def world_active_ping(u=Depends(current_user)):
+        await db.world_active.update_one(
+            {"user_id": u["id"]},
+            {"$set": {"user_id": u["id"], "last_ping": now().isoformat()}},
+            upsert=True,
+        )
+        cutoff = (now() - timedelta(seconds=45)).isoformat()
+        count = await db.world_active.count_documents({"last_ping": {"$gte": cutoff}})
+        return {"count": count}
+
+    class WorldReportIn(BaseModel):
+        text: str
+        photo_url: Optional[str] = None
+        location_type: str = "world"
+        location_label: Optional[str] = None
+
+    @api.get("/world/reports")
+    async def world_reports_list(
+        location_type: Optional[str] = None,
+        skip: int = Query(0, ge=0, le=10000),
+        limit: int = Query(20, ge=1, le=100),
+        u=Depends(current_user),
+    ):
+        query: dict = {"is_flagged": {"$ne": True}}
+        if location_type and location_type.lower() != "world":
+            query["location_type"] = location_type.upper()
+        reports = await db.world_reports.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        total = await db.world_reports.count_documents(query)
+        for r in reports:
+            r["is_liked"] = u["id"] in r.get("likes", [])
+            r["like_count"] = len(r.get("likes", []))
+            r["comment_count"] = len(r.get("comments", []))
+        return {"reports": reports, "total": total}
+
+    @api.post("/world/reports")
+    async def create_world_report(p: WorldReportIn, u=Depends(current_user)):
+        if not p.text or len(p.text.strip()) < 5:
+            raise HTTPException(400, "Report too short (min 5 chars)")
+        if len(p.text) > 2000:
+            raise HTTPException(400, "Report too long (max 2000 chars)")
+        loc_type = p.location_type.upper() if p.location_type and p.location_type.lower() != "world" else "world"
+        doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": u["id"],
+            "user_name": u["name"],
+            "user_handle": u["handle"],
+            "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo": u.get("avatar_photo"),
+            "photo_width": p.photo_width or None,
+            "photo_height": p.photo_height or None,
+            "aspect_ratio": p.aspect_ratio or (round(p.photo_width/p.photo_height,4) if p.photo_width and p.photo_height else None),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "verified_category": u.get("verified_category") or None,
+            "text": p.text.strip(),
+            "photo_url": p.photo_url or None,
+            "location_type": loc_type,
+            "location_label": p.location_label or ("World" if loc_type == "world" else loc_type),
+            "likes": [], "like_count": 0,
+            "comments": [], "comment_count": 0,
+            "flag_count": 0, "is_flagged": False,
+            "created_at": now().isoformat(),
+        }
+        await db.world_reports.insert_one(doc.copy())
+        doc.pop("_id", None)
+        doc["is_liked"] = False
+        return doc
+
+    @api.post("/world/reports/{report_id}/like")
+    async def like_world_report(report_id: str, u=Depends(current_user)):
+        report = await db.world_reports.find_one({"id": report_id})
+        if not report:
+            raise HTTPException(404, "Not found")
+        likes = report.get("likes", [])
+        if u["id"] in likes:
+            likes.remove(u["id"])
+            liked = False
+        else:
+            likes.append(u["id"])
+            liked = True
+        await db.world_reports.update_one({"id": report_id}, {"$set": {"likes": likes, "like_count": len(likes)}})
+        return {"liked": liked, "like_count": len(likes)}
+
+    @api.post("/world/reports/{report_id}/flag")
+    async def flag_world_report(report_id: str, u=Depends(current_user)):
+        report = await db.world_reports.find_one({"id": report_id})
+        if not report:
+            raise HTTPException(404, "Not found")
+        new_flag_count = report.get("flag_count", 0) + 1
+        await db.world_reports.update_one(
+            {"id": report_id},
+            {"$set": {"flag_count": new_flag_count, "is_flagged": new_flag_count >= 5}}
+        )
+        return {"ok": True}
+
+    @api.get("/world/reports/{report_id}/comments")
+    async def get_world_report_comments(report_id: str, u=Depends(current_user)):
+        report = await db.world_reports.find_one({"id": report_id}, {"comments": 1, "_id": 0})
+        if not report:
+            raise HTTPException(404, "Not found")
+        return {"comments": report.get("comments", [])}
+
+    @api.post("/world/reports/{report_id}/comments")
+    async def add_world_report_comment(report_id: str, body: dict, u=Depends(current_user)):
+        text = (body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(400, "Empty comment")
+        comment = {
+            "id": str(uuid.uuid4()),
+            "user_id": u["id"],
+            "user_name": u["name"],
+            "user_handle": u["handle"],
+            "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo": u.get("avatar_photo"),
+            "text": text,
+            "created_at": now().isoformat(),
+        }
+        await db.world_reports.update_one(
+            {"id": report_id},
+            {"$push": {"comments": comment}, "$inc": {"comment_count": 1}}
+        )
+        return comment
+
+    @api.delete("/world/reports/{report_id}")
+    async def delete_world_report(report_id: str, u=Depends(current_user)):
+        report = await db.world_reports.find_one({"id": report_id})
+        if not report:
+            raise HTTPException(404, "Not found")
+        if report["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Not your report")
+        await db.world_reports.delete_one({"id": report_id})
+        return {"ok": True}
+
+    # ── Reels ─────────────────────────────────────────────────────
+
+    @api.post("/reels/upload-signature")
+    async def sign_reel_upload(u=Depends(current_user)):
+        """Create a short-lived signature for direct browser -> Cloudinary reel uploads."""
+        cloud_name = CLOUDINARY_CLOUD_NAME
+        api_key = CLOUDINARY_API_KEY
+        api_secret = CLOUDINARY_API_SECRET
+        if not (cloud_name and api_key and api_secret) and CLOUDINARY_URL:
+            parsed = urllib.parse.urlparse(CLOUDINARY_URL)
+            cloud_name = parsed.hostname or ""
+            api_key = urllib.parse.unquote(parsed.username or "")
+            api_secret = urllib.parse.unquote(parsed.password or "")
+        if not (cloud_name and api_key and api_secret):
+            raise HTTPException(500, "Video hosting is not configured on the server")
+        timestamp = int(_time.time())
+        folder = "post-app/reels"
+        public_id = f"reel_{u['id']}_{uuid.uuid4().hex}"
+        sign_params = f"folder={folder}&public_id={public_id}&timestamp={timestamp}"
+        signature = _hl.sha1((sign_params + api_secret).encode("utf-8")).hexdigest()
+        return {
+            "upload_url": f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload",
+            "api_key": api_key,
+            "timestamp": timestamp,
+            "signature": signature,
+            "folder": folder,
+            "public_id": public_id,
+        }
+
+    @api.post("/reels/upload")
+    async def upload_reel_video(
+        file: UploadFile = File(...),
+        u=Depends(current_user),
+    ):
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Video hosting is not configured on the server")
+        if not file.content_type or not file.content_type.startswith("video/"):
+            raise HTTPException(400, "Please upload a valid video file")
+        upload_size = await _get_upload_size(file)
+        if upload_size > MAX_UPLOAD_VIDEO_BYTES:
+            raise HTTPException(400, "Video is too large. Max 100 MB.")
+        try:
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                file.file,
+                resource_type="video",
+                folder="post-app/reels",
+                public_id=f"reel_{u['id']}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception as e:
+            logging.exception("Cloudinary reel upload failed")
+            msg = str(e)
+            if "Invalid Signature" in msg or "String to sign" in msg:
+                raise HTTPException(500, "Video hosting is misconfigured (invalid Cloudinary credentials).")
+            raise HTTPException(502, "Video upload failed. Please try again.")
+        return {
+            "video_url": result.get("secure_url"),
+            "duration": result.get("duration"),
+        }
+
+    @api.post("/reels")
+    async def create_reel(body: dict, u=Depends(current_user)):
+        video_url      = (body.get("video_url") or "").strip()
+        photo_url      = (body.get("photo_url") or "").strip()
+        caption        = (body.get("caption") or "").strip()
+        audio_label    = (body.get("audio_label") or "Original Audio").strip()
+        duration       = int(body.get("duration") or 0)
+        category       = (body.get("category") or u.get("category") or "general").strip().lower()[:40] or "general"
+        tags_input     = body.get("tags") or body.get("hashtags") or []
+        if isinstance(tags_input, str):
+            tags_input = tags_input.split()
+        tags            = list(dict.fromkeys(str(tag).strip().lower().lstrip("#")[:40] for tag in tags_input if str(tag).strip()))[:20]
+        location       = (body.get("location") or "").strip() or None
+        tagged_users   = [h.lstrip("@") for h in (body.get("tagged_users") or []) if h][:20]
+        audience       = (body.get("audience") or "public").strip()
+        audience_users = [h.lstrip("@") for h in (body.get("audience_users") or []) if h][:100]
+        sticker_overlays = [{"id": s["id"], "url": s["url"], "xPct": float(s.get("xPct", 50)), "yPct": float(s.get("yPct", 50))} for s in (body.get("sticker_overlays") or []) if s.get("url")][:10]
+        text_overlays    = [{"id": t.get("id",""), "text": str(t.get("text",""))[:500], "xPct": float(t.get("xPct",50)), "yPct": float(t.get("yPct",50)), "color": str(t.get("color","#ffffff"))[:30], "size": int(t.get("size",22)), "font": str(t.get("font","Classic"))[:30], "bgColor": str(t.get("bgColor","transparent"))[:30]} for t in (body.get("text_overlays") or []) if t.get("text")][:20]
+        emoji_overlays   = [{"id": e.get("id",""), "emoji": str(e.get("emoji",""))[:8], "xPct": float(e.get("xPct",50)), "yPct": float(e.get("yPct",50)), "size": int(e.get("size",64))} for e in (body.get("emoji_overlays") or []) if e.get("emoji")][:20]
+        video_effect     = (body.get("video_effect") or "none").strip()[:20]
+        music_url        = (body.get("music_url") or "").strip() or None
+        try:
+            music_start_time = max(0.0, float(body.get("music_start_time") or 0))
+        except (TypeError, ValueError):
+            music_start_time = 0.0
+        try:
+            requested_music_clip = int(float(body.get("music_clip_duration") or 15))
+        except (TypeError, ValueError):
+            requested_music_clip = 15
+        music_clip_duration = max(1, min(30, requested_music_clip))
+        music_title      = (body.get("music_title") or "").strip() or None
+        music_artist     = (body.get("music_artist") or "").strip() or None
+        music_artwork    = (body.get("music_artwork") or "").strip() or None
+        if audience not in ("public", "friends", "only_show", "only_me"):
+            audience = "public"
+        is_photo_reel  = bool(photo_url) and not video_url
+        if not video_url and not photo_url:
+            raise HTTPException(400, "video_url or photo_url is required")
+        if not is_photo_reel and (duration < 1 or duration > MAX_POST_VIDEO_SECONDS):
+            raise HTTPException(400, f"Reel must be 1–{MAX_POST_VIDEO_SECONDS} seconds")
+        doc = {
+            "id":                str(uuid.uuid4()),
+            "user_id":           u["id"],
+            "user_name":         u["name"],
+            "user_handle":       u["handle"],
+            "avatar_bg":         u["avatar_bg"],
+            "avatar_letter":     u["avatar_letter"],
+            "avatar_photo":      u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "video_url":         video_url if not is_photo_reel else None,
+            "photo_url":         photo_url if is_photo_reel else None,
+            "caption":           caption,
+            "category":          category,
+            "tags":              tags,
+            "audio_label":       audio_label,
+            "duration":          duration if not is_photo_reel else 0,
+            "location":          location,
+            "tagged_users":      tagged_users,
+            "audience":          audience,
+            "audience_users":    audience_users if audience == "only_show" else [],
+            "likes":             [],
+            "saves":             [],
+            "shares":            [],
+            "comments":          [],
+            "comment_count":     0,
+            "view_count":        0,
+            "created_at":        now().isoformat(),
+            "sticker_overlays":  sticker_overlays,
+            "text_overlays":     text_overlays,
+            "emoji_overlays":    emoji_overlays,
+            "video_effect":      video_effect,
+            "music_url":         music_url,
+            "music_start_time":  music_start_time,
+            "music_clip_duration": music_clip_duration,
+            "music_title":       music_title,
+            "music_artist":      music_artist,
+            "music_artwork":     music_artwork,
+        }
+        await db.reels.insert_one(doc.copy())
+        doc.pop("_id", None)
+        doc["is_liked"]     = False
+        doc["like_count"]   = 0
+        doc["is_saved"]     = False
+        doc["save_count"]   = 0
+        doc["share_count"]  = 0
+        doc["is_following"] = False
+        return doc
+
+    @api.get("/reels")
+    async def list_reels(skip: int = Query(0, ge=0, le=10000), limit: int = Query(10, ge=1, le=50), u=Depends(current_user)):
+        blocked  = u.get("blocked_users", [])
+        muted    = u.get("muted_users", [])
+        excluded = list(set(blocked + muted))
+        following_ids = list(set(u.get("following", []) or []))
+        query: dict = {
+            "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
+            "$or": [
+                {"audience": {"$exists": False}},
+                {"audience": "public"},
+                {"user_id": u["id"]},
+                {"audience": "friends", "user_id": {"$in": following_ids}},
+                {"audience": "only_show", "audience_users": u["id"]},
+            ],
+        }
+        if excluded:
+            query["user_id"] = {"$nin": excluded}
+        reels_list = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        mention_rows = await db.reel_mentions.aggregate([
+            {"$match": {"reel_id": {"$in": [r["id"] for r in reels_list]}}},
+            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+        ]).to_list(limit) if reels_list else []
+        mention_counts = {row["_id"]: row["count"] for row in mention_rows}
+        mention_docs = {
+            doc["reel_id"]: doc
+            async for doc in db.reel_mentions.find(
+                {"target_user_id": u["id"], "reel_id": {"$in": [r["id"] for r in reels_list]}},
+                
+                {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1}
+            )
+        } if reels_list else {}
+        following_ids = set(u.get("following", []))
+        for r in reels_list:
+            likes = r.get("likes") or []
+            saves = r.get("saves") or []
+            shares = r.get("shares") or []
+
+            mention = mention_docs.get(r["id"])
+            r["is_mentioned"] = bool(mention)
+            r["mentioned_by"] = (
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
+                if mention else None
+            )
+            r["is_liked"]     = u["id"] in likes
+            r["like_count"]   = len(likes)
+            r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
+            r["is_saved"]     = u["id"] in saves
+            r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
+            r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
+            r["mention_count"] = mention_counts.get(r["id"], 0)
+            r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
+            r.pop("likes", None)
+            r.pop("saves", None)
+            r.pop("comments", None)
+        return {"reels": reels_list, "has_more": len(reels_list) == limit, "skip": skip, "limit": limit}
+
+
+
+    @api.get("/reels/{reel_id}/remixes")
+    async def list_reel_remixes(reel_id: str, u=Depends(current_user)):
+        """Return the source reel and public reels using the same audio."""
+        source = await db.reels.find_one({"id": reel_id}, {"_id": 0})
+        if not source:
+            raise HTTPException(404, "Reel not found")
+        excluded = set((u.get("blocked_users", []) or []) + (u.get("muted_users", []) or []))
+        if source.get("user_id") in excluded:
+            raise HTTPException(404, "Reel not found")
+        source_music_url = str(source.get("music_url") or "").strip()
+        source_title = str(source.get("music_title") or "").strip()
+        source_label = str(source.get("audio_label") or "").strip()
+        if source_music_url:
+            audio_match = {"music_url": source_music_url}
+        elif source_title:
+            audio_match = {"$or": [{"music_title": source_title}, {"audio_label": source_title}]}
+        elif source_label:
+            audio_match = {"$or": [{"audio_label": source_label}, {"music_title": source_label}]}
+        else:
+            audio_match = {"id": reel_id}
+        query = {
+            "$and": [
+                audio_match,
+                {"$or": [
+                    {"audience": {"$exists": False}},
+                    {"audience": "public"},
+                    {"user_id": u["id"]},
+                ]},
+            ],
+            "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
+        }
+        if excluded:
+            query["user_id"] = {"$nin": list(excluded)}
+        rows = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
+        if not any(str(row.get("id")) == str(reel_id) for row in rows):
+            rows.insert(0, source)
+        for row in rows:
+            embedded_views = row.get("views") if isinstance(row.get("views"), list) else []
+            row["view_count"] = max(len(embedded_views), int(row.get("view_count") or 0))
+            row.pop("likes", None)
+            row.pop("saves", None)
+            row.pop("comments", None)
+            row.pop("views", None)
+        source_view = next((row for row in rows if str(row.get("id")) == str(reel_id)), source)
+        return {
+            "source": source_view,
+            "reels": rows,
+            "total": len(rows),
+            "audio_title": source_title or source_label or "Original Audio",
+        }
+
+    @api.get("/reels/discover")
+    async def discover_reels(
+        skip: int = Query(0, ge=0, le=10000),
+        limit: int = Query(21, ge=1, le=50),
+        category: Optional[str] = None,
+        u=Depends(current_user),
+    ):
+        """Paginated discovery grid sorted by trending score (views*1 + likes*3 + comments*5 - age_decay)."""
+        blocked = u.get("blocked_users", [])
+        muted   = u.get("muted_users", [])
+        excluded = list(set(blocked + muted))
+        following_ids = list(set(u.get("following", []) or []))
+        query = {
+            "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
+            "$or": [
+                {"audience": {"$exists": False}},
+                {"audience": "public"},
+                {"user_id": u["id"]},
+                {"audience": "friends", "user_id": {"$in": following_ids}},
+                {"audience": "only_show", "audience_users": u["id"]},
+            ],
+        }
+        if excluded:
+            query["user_id"] = {"$nin": excluded}
+        if category and category.lower() != "all":
+            query["category"] = {"$regex": category, "$options": "i"}
+        pool_limit = min(limit * 6, 300)
+        reels_raw = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(0).limit(pool_limit).to_list(pool_limit)
+        mention_rows = await db.reel_mentions.aggregate([
+            {"$match": {"reel_id": {"$in": [r.get("id") for r in reels_raw if r.get("id")]}}},
+            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+        ]).to_list(pool_limit)
+        mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
+        def _score(r):
+            try:
+                created = r.get("created_at", "")
+                if created:
+                    from datetime import datetime, timezone as _tz
+                    if isinstance(created, str):
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    else:
+                        dt = created
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    age_hours = max(0, (datetime.now(_tz.utc) - dt).total_seconds() / 3600)
+                else:
+                    age_hours = 0
+            except Exception:
+                age_hours = 0
+            _va=r.get("views",[]); views=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+            likes = len(r.get("likes") or [])
+            comments = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
+            shares = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
+            saves = max(len(r.get("saves") or []), int(r.get("save_count") or 0))
+            mentions = mention_counts.get(r.get("id"), int(r.get("mention_count") or 0))
+            # Keep discovery consistent with the main Reels ranking signals.
+            return (views * 1 + likes * 3 + comments * 5 + mentions * 6
+                    + shares * 7 + saves * 8 - age_hours * 0.5)
+        reels_raw.sort(key=_score, reverse=True)
+        page = reels_raw[skip: skip + limit]
+        mention_docs = {
+            doc["reel_id"]: doc
+            async for doc in db.reel_mentions.find(
+                {"target_user_id": u["id"], "reel_id": {"$in": [r["id"] for r in page]}},
+                
+                {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1}
+            )
+        } if page else {}
+        following_ids = set(u.get("following", []))
+        for r in page:
+            likes = r.get("likes") or []
+            saves = r.get("saves") or []
+            shares = r.get("shares") or []
+
+            mention = mention_docs.get(r["id"])
+            r["is_mentioned"] = bool(mention)
+            r["mentioned_by"] = (
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
+                if mention else None
+            )
+            r["is_liked"]     = u["id"] in likes
+            r["like_count"]   = len(likes)
+            r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
+            r["is_saved"]     = u["id"] in saves
+            r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
+            r["share_count"]  = max(len(shares), int(r.get("share_count") or 0))
+            r["mention_count"] = mention_counts.get(r["id"], int(r.get("mention_count") or 0))
+            r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
+            _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+            r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
+        return {"reels": page, "has_more": (skip + limit) < len(reels_raw), "skip": skip, "limit": limit}
+
+    @api.post("/reels/{reel_id}/view")
+    async def view_reel(reel_id: str, body: Optional[dict] = None, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1, "category": 1})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        payload = body or {}
+        try:
+            watch_seconds = max(0.0, min(3600.0, float(payload.get("watch_seconds") or 0)))
+        except (TypeError, ValueError):
+            watch_seconds = 0.0
+        try:
+            completion_ratio = max(0.0, min(1.0, float(payload.get("completion_ratio") or 0)))
+        except (TypeError, ValueError):
+            completion_ratio = 0.0
+        category = str(payload.get("category") or reel.get("category") or "general").strip().lower()[:40] or "general"
+        await db.reels.update_one(
+            {"id": reel_id},
+            {"$addToSet": {"views": u["id"]}, "$inc": {"view_count": 1}},
+        )
+        await db.reel_view_events.insert_one({
+            "user_id": u["id"],
+            "reel_id": reel_id,
+            "creator_id": reel.get("user_id"),
+            "category": category,
+            "watch_seconds": watch_seconds,
+            "completion_ratio": completion_ratio,
+            "event_at": now().isoformat(),
+        })
+        await db.reel_rank_stats.update_one(
+            {"reel_id": reel_id},
+            {"$inc": {"total_views": 1, "completion_sum": completion_ratio, "watch_seconds_sum": watch_seconds},
+             "$set": {"reel_id": reel_id, "updated_at": now().isoformat()}},
+            upsert=True,
+        )
+        return {"ok": True}
+
+    @api.get("/search")
+    async def unified_search(
+        q: str = Query("", max_length=200),
+        type: str = Query("all", max_length=20),
+        skip: int = Query(0, ge=0, le=10000),
+        limit: int = Query(20, ge=1, le=50),
+        u=Depends(current_user),
+    ):
+        """Unified search: reels (by caption/hashtag/audio), users, hashtags."""
+        q = q.strip()
+        if not q:
+            return {"reels": [], "users": [], "hashtags": []}
+        blocked  = u.get("blocked_users", [])
+        muted    = u.get("muted_users", [])
+        excluded = list(set(blocked + muted))
+        search_type = type.lower()
+        results = {"reels": [], "users": [], "hashtags": []}
+
+        if search_type in ("all", "reels"):
+            reel_q = {"$or": [
+                {"caption": {"$regex": q, "$options": "i"}},
+                {"hashtags": {"$regex": q, "$options": "i"}},
+                {"audio_label": {"$regex": q, "$options": "i"}},
+                {"category": {"$regex": q, "$options": "i"}},
+            ]}
+            if excluded:
+                reel_q["user_id"] = {"$nin": excluded}
+            reels_found = await db.reels.find(reel_q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+            following_ids = set(u.get("following", []))
+            for r in reels_found:
+                likes = r.get("likes") or []
+                saves = r.get("saves") or []
+                r["is_liked"]     = u["id"] in likes
+                r["like_count"]   = len(likes)
+                r["comment_count"] = max(len(r.get("comments") or []), int(r.get("comment_count") or 0))
+                r["is_saved"]     = u["id"] in saves
+                r["save_count"]   = max(len(saves), int(r.get("save_count") or 0))
+                r["share_count"]  = max(len(r.get("shares") or []), int(r.get("share_count") or 0))
+                r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
+                _va=r.get("views",[]); r["view_count"]=max(len(_va) if isinstance(_va,list) else 0, int(r.get("view_count") or 0))
+                r.pop("likes", None); r.pop("saves", None); r.pop("comments", None); r.pop("views", None)
+            results["reels"] = reels_found
+
+        if search_type in ("all", "users"):
+            user_q = {
+                "$or": [
+                    {"handle": {"$regex": q, "$options": "i"}},
+                    {"name": {"$regex": q, "$options": "i"}},
+                ],
+                "is_deleted": {"$ne": True},
+            }
+            if excluded:
+                user_q["id"] = {"$nin": excluded}
+            users_found = await db.users.find(user_q, {"_id": 0, "password": 0, "email": 0, "phone": 0}).limit(limit).to_list(limit)
+            following_ids = set(u.get("following", []))
+            for usr in users_found:
+                usr["is_following"] = usr["id"] in following_ids
+            results["users"] = [_apply_dob_visibility(profile, u["id"]) for profile in users_found]
+
+        if search_type in ("all", "hashtags"):
+            pipeline = [
+                {"$match": {"hashtags.0": {"$exists": True}}},
+                {"$unwind": "$hashtags"},
+                {"$match": {"hashtags": {"$regex": q, "$options": "i"}}},
+                {"$group": {"_id": "$hashtags", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+                {"$limit": 20},
+                {"$project": {"_id": 0, "tag": "$_id", "count": 1}},
+            ]
+            results["hashtags"] = await db.reels.aggregate(pipeline).to_list(20)
+
+        return results
+
+    @api.post("/reels/{reel_id}/like")
+    async def like_reel(reel_id: str, body: dict = None, u=Depends(current_user)):
+        """Apply an idempotent like state and return the authoritative count.
+
+        The client sends the desired state instead of asking the endpoint to
+        toggle. That makes safe retries possible when a mobile connection or a
+        cold-started backend drops the response after the write already landed.
+        Requests without a desired state retain the legacy toggle behavior.
+        """
+        reel = await db.reels.find_one({"id": reel_id}, {"likes": 1, "user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+
+        likes = reel.get("likes") or []
+        requested_state = body.get("liked") if isinstance(body, dict) else None
+        if not isinstance(requested_state, bool):
+            requested_state = u["id"] not in likes
+
+        if requested_state:
+            await db.reels.update_one(
+                {"id": reel_id},
+                {"$addToSet": {"likes": u["id"]}},
+            )
+        else:
+            await db.reels.update_one(
+                {"id": reel_id},
+                {"$pull": {"likes": u["id"]}},
+            )
+
+        # Read after the atomic write so concurrent users always receive the
+        # current source-of-truth count, not a count from a stale pre-read.
+        updated = await db.reels.find_one({"id": reel_id}, {"likes": 1, "_id": 0})
+        authoritative_likes = (updated or {}).get("likes") or []
+        like_count = len(authoritative_likes)
+
+        # Ranking already reads the source likes array. Keep the aggregate rank
+        # stats current as well, without allowing a stats-write problem to turn
+        # a successful like into a UI error.
+        try:
+            await db.reel_rank_stats.update_one(
+                {"reel_id": reel_id},
+                {"$set": {"reel_id": reel_id, "likes": like_count, "updated_at": now().isoformat()}},
+                upsert=True,
+            )
+        except Exception:
+            logging.exception("Could not refresh like rank stats for reel %s", reel_id)
+        if requested_state and reel.get("user_id") != u["id"]:
+            await _persist_user_activity_notification(
+                reel["user_id"], u, "like", reel_id=reel_id
+            )
+
+        return {"liked": u["id"] in authoritative_likes, "like_count": like_count}
+
+    @api.post("/reels/{reel_id}/save")
+    async def save_reel(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"saves": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        saves = reel.get("saves", [])
+        was_saved = u["id"] in saves
+        if was_saved:
+            await db.reels.update_one({"id": reel_id}, {"$pull": {"saves": u["id"]}})
+            return {"saved": False, "save_count": max(0, len(saves) - 1)}
+        await db.reels.update_one({"id": reel_id}, {"$addToSet": {"saves": u["id"]}})
+        return {"saved": True, "save_count": len(saves) + 1}
+
+    @api.get("/reels/{reel_id}/comments")
+    async def get_reel_comments(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        comments = reel.get("comments", []) or []
+        user_ids = {c.get("user_id") for c in comments if c.get("user_id")}
+        for comment in comments:
+            user_ids.update(r.get("user_id") for r in (comment.get("replies") or []) if r.get("user_id"))
+        verified_users = await db.users.find(
+            {"id": {"$in": list(user_ids)}},
+            {"_id": 0, "id": 1, "is_badge_verified": 1},
+        ).to_list(len(user_ids)) if user_ids else []
+        verified_map = {str(profile.get("id")): bool(profile.get("is_badge_verified")) for profile in verified_users}
+        for comment in comments:
+            comment["is_badge_verified"] = verified_map.get(str(comment.get("user_id")), bool(comment.get("is_badge_verified")))
+            for reply in comment.get("replies") or []:
+                reply["is_badge_verified"] = verified_map.get(str(reply.get("user_id")), bool(reply.get("is_badge_verified")))
+        return {"comments": comments}
+
+    @api.post("/reels/{reel_id}/share")
+    async def share_reel(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"shares": 1, "share_count": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        result = await db.reels.update_one(
+            {"id": reel_id, "shares": {"$ne": u["id"]}},
+            {"$addToSet": {"shares": u["id"]}},
+        )
+        updated = await db.reels.find_one({"id": reel_id}, {"shares": 1, "share_count": 1, "_id": 0})
+        shares = (updated or reel).get("shares") or []
+        share_count = max(len(shares), int((updated or reel).get("share_count") or 0))
+        return {"shared": result.modified_count > 0, "share_count": share_count}
+
+    @api.post("/reels/{reel_id}/comments")
+    async def add_reel_comment(reel_id: str, body: dict, u=Depends(current_user)):
+        text = (body.get("text") or "").strip()
+        gif_url = (body.get("gif_url") or "").strip() or None
+        if not text and not gif_url:
+            raise HTTPException(400, "Empty comment")
+        reel = await db.reels.find_one({"id": reel_id}, {"user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        comment = {
+            "id":            str(uuid.uuid4()),
+            "user_id":       u["id"],
+            "user_name":     u["name"],
+            "user_handle":   u["handle"],
+            "avatar_bg":     u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo":  u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "text":          text,
+            "gif_url":       gif_url,
+            "created_at":    now().isoformat(),
+        }
+        await db.reels.update_one(
+            {"id": reel_id},
+            {"$push": {"comments": comment}, "$inc": {"comment_count": 1}}
+        )
+        if reel.get("user_id") != u["id"]:
+            await _persist_user_activity_notification(
+                reel["user_id"], u, "comment", reel_id=reel_id
+            )
+        return comment
+
+    @api.delete("/reels/{reel_id}/comments/{comment_id}")
+    async def delete_reel_comment(reel_id: str, comment_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        comment = next((c for c in reel.get("comments", []) if c["id"] == comment_id), None)
+        if not comment:
+            raise HTTPException(404, "Comment not found")
+        if comment["user_id"] != u["id"] and reel["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Not allowed")
+        await db.reels.update_one(
+            {"id": reel_id},
+            {"$pull": {"comments": {"id": comment_id}}, "$inc": {"comment_count": -1}}
+        )
+        return {"ok": True}
+
+
+    @api.post("/reels/{reel_id}/comments/{comment_id}/like")
+    async def like_reel_comment(reel_id: str, comment_id: str, body: dict = None, u=Depends(current_user)):
+        """Persist an explicit like/dislike state and return canonical likes."""
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        comment = next((c for c in reel.get("comments", []) if str(c.get("id")) == str(comment_id)), None)
+        if not comment:
+            raise HTTPException(404, "Comment not found")
+        user_id = str(u["id"])
+        existing_likes = [str(like_id) for like_id in (comment.get("likes") or [])]
+        requested_state = body.get("liked") if isinstance(body, dict) else None
+        if not isinstance(requested_state, bool):
+            requested_state = user_id not in existing_likes
+        # $addToSet/$pull makes the operation idempotent, so retries cannot
+        # duplicate a like or remove another user's like.
+        update = {"$addToSet": {"comments.$.likes": user_id}} if requested_state else {"$pull": {"comments.$.likes": user_id}}
+        await db.reels.update_one({"id": reel_id, "comments.id": comment_id}, update)
+        updated = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        updated_comment = next((c for c in (updated or {}).get("comments", []) if str(c.get("id")) == str(comment_id)), None)
+        authoritative_likes = [str(like_id) for like_id in ((updated_comment or {}).get("likes") or [])]
+        if requested_state and comment.get("user_id") != u["id"]:
+            await _persist_user_activity_notification(
+                comment["user_id"], u, "like", reel_id=reel_id, comment_id=comment_id
+            )
+        return {
+            "liked": user_id in authoritative_likes,
+            "like_count": len(authoritative_likes),
+            "likes": authoritative_likes,
+        }
+
+    @api.post("/reels/{reel_id}/comments/{comment_id}/replies")
+    async def add_reel_comment_reply(reel_id: str, comment_id: str, body: dict, u=Depends(current_user)):
+        text = (body.get("text") or "").strip()
+        gif_url = (body.get("gif_url") or "").strip() or None
+        if not text and not gif_url:
+            raise HTTPException(400, "Empty reply")
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        parent_comment = next((c for c in reel.get("comments", []) if str(c.get("id")) == str(comment_id)), None)
+        if not parent_comment:
+            raise HTTPException(404, "Comment not found")
+        reply = {
+            "id":            str(uuid.uuid4()),
+            "user_id":       u["id"],
+            "user_name":     u["name"],
+            "user_handle":   u["handle"],
+            "avatar_bg":     u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo":  u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "text":          text,
+            "gif_url":       gif_url,
+            "created_at":    now().isoformat(),
+        }
+        await db.reels.update_one(
+            {"id": reel_id, "comments.id": comment_id},
+            {"$push": {"comments.$.replies": reply}}
+        )
+        if parent_comment.get("user_id") != u["id"]:
+            await _persist_user_activity_notification(
+                parent_comment["user_id"], u, "comment", reel_id=reel_id, comment_id=comment_id
+            )
+        return reply
+
+    @api.delete("/reels/{reel_id}/comments/{comment_id}/replies/{reply_id}")
+    async def delete_reel_comment_reply(reel_id: str, comment_id: str, reply_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        comment = next((c for c in reel.get("comments", []) if c["id"] == comment_id), None)
+        if not comment:
+            raise HTTPException(404, "Comment not found")
+        reply = next((r for r in comment.get("replies", []) if r["id"] == reply_id), None)
+        if not reply:
+            raise HTTPException(404, "Reply not found")
+        if reply["user_id"] != u["id"] and reel["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Not allowed")
+        await db.reels.update_one(
+            {"id": reel_id, "comments.id": comment_id},
+            {"$pull": {"comments.$.replies": {"id": reply_id}}}
+        )
+        return {"ok": True}
+
+    @api.delete("/reels/{reel_id}")
+    async def delete_reel(reel_id: str, u=Depends(current_user)):
+        reel = await db.reels.find_one({"id": reel_id}, {"user_id": 1, "_id": 0})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        if reel["user_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Not your reel")
+        await db.reels.delete_one({"id": reel_id})
+        await db.reel_mentions.delete_many({"reel_id": reel_id})
+        await db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id})
+        return {"ok": True}
+
+    @api.post("/reels/{reel_id}/report")
+    async def report_reel(reel_id: str, body: dict, u=Depends(current_user)):
+        reason = (body.get("reason") or "").strip()
+        if not reason: raise HTTPException(400, "Reason required")
+        reel = await db.reels.find_one({"id": reel_id})
+        if not reel: raise HTTPException(404, "Reel not found")
+        already = await db.reports.find_one({"reel_id": reel_id, "reported_by": u["id"]})
+        if already: return {"ok": True, "already": True}
+        await db.reports.insert_one({"id": str(uuid.uuid4()), "reel_id": reel_id, "reported_by": u["id"], "reported_user_id": reel.get("user_id"), "reason": reason, "created_at": now().isoformat(), "status": "pending", "type": "reel"})
+        return {"ok": True}
+
+
+    # ── Group Chat ─────────────────────────────────────────────────
+    class GroupIn(BaseModel):
+        name: str
+        member_ids: List[str] = []
+        avatar_color: Optional[str] = None
+        avatar_photo: Optional[str] = None
+
+    class GroupMessageIn(BaseModel):
+        text: str = ""
+        photo_url: Optional[str] = None
+        gif_url: Optional[str] = None
+        shared_post_id: Optional[str] = None
+        shared_reel_id: Optional[str] = None
+        reply_to_id: Optional[str] = None
+        audio_url: Optional[str] = None
+        audio_duration: Optional[int] = None
+
+    @api.post("/groups")
+    async def create_group(p: GroupIn, u=Depends(current_user)):
+        name = p.name.strip()
+        if not name:
+            raise HTTPException(400, "Group name required")
+        members = list(set([u["id"]] + p.member_ids))
+        doc = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "avatar_color": p.avatar_color or "#FFD600",
+            "avatar_letter": name[0].upper(),
+            "avatar_photo": p.avatar_photo or None,
+            "creator_id": u["id"],
+            "admins": [u["id"]],
+            "members": members,
+            "created_at": now().isoformat(),
+            "last_message": None,
+            "last_message_at": now().isoformat(),
+        }
+        await db.groups.insert_one(doc.copy())
+        doc.pop("_id", None)
+        return doc
+
+    @api.get("/groups")
+    async def list_groups(u=Depends(current_user)):
+        grps = await db.groups.find({"members": u["id"]}, {"_id": 0}).sort("last_message_at", -1).to_list(100)
+        result = []
+        for g in grps:
+            unread = await db.group_messages.count_documents({
+                "group_id": g["id"], "seen_by": {"$ne": u["id"]}, "from_id": {"$ne": u["id"]}
+            })
+            g["unread"] = unread
+            result.append(g)
+        return {"groups": result}
+
+    @api.get("/groups/{group_id}")
+    async def get_group(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        member_docs = await db.users.find(
+            {"id": {"$in": g["members"]}},
+            {"_id": 0, "id": 1, "name": 1, "handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1, "bio": 1, "is_online": 1, "is_badge_verified": 1}
+        ).to_list(200)
+        g["member_details"] = member_docs
+        return g
+
+    @api.post("/groups/{group_id}/avatar")
+    async def upload_group_avatar(group_id: str, file: UploadFile = File(...), u=Depends(current_user)):
+        """Upload group avatar image to Cloudinary and save URL."""
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("admins", []): raise HTTPException(403, "Only admins can change avatar")
+        if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) and not CLOUDINARY_URL:
+            raise HTTPException(500, "Image hosting not configured")
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(400, "Please upload a valid image file")
+        upload_size = await _get_upload_size(file)
+        if upload_size <= 0:
+            raise HTTPException(400, "Image file is empty")
+        if upload_size > 10 * 1024 * 1024:
+            raise HTTPException(400, "Image too large. Max 10MB.")
+        # _get_upload_size rewinds the stream; rewind once more immediately before
+        # handing it to Cloudinary so the complete selected image is uploaded.
+        file.file.seek(0)
+        try:
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                file.file, resource_type="image",
+                folder="post-app/group-avatars",
+                public_id=f"group_{group_id}_{uuid.uuid4().hex}",
+                overwrite=False,
+            )
+        except Exception:
+            logging.exception("Group avatar upload failed")
+            raise HTTPException(502, "Image upload failed. Please try again.")
+        photo_url = result.get("secure_url") or result.get("url")
+        if not photo_url:
+            raise HTTPException(502, "Image upload did not return a URL")
+        update_result = await db.groups.update_one({"id": group_id}, {"$set": {"avatar_photo": photo_url}})
+        if not update_result.matched_count:
+            raise HTTPException(404, "Group not found")
+        return {"ok": True, "group_id": group_id, "avatar_photo": photo_url}
+
+    @api.patch("/groups/{group_id}")
+    async def update_group(group_id: str, body: dict, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("admins", []): raise HTTPException(403, "Only admins can edit group")
+        upd = {}
+        if "name" in body and body["name"].strip():
+            upd["name"] = body["name"].strip()
+            upd["avatar_letter"] = body["name"].strip()[0].upper()
+        if "avatar_color" in body: upd["avatar_color"] = body["avatar_color"]
+        if "avatar_photo" in body: upd["avatar_photo"] = body["avatar_photo"]
+        if upd: await db.groups.update_one({"id": group_id}, {"$set": upd})
+        return {"ok": True}
+
+    @api.post("/groups/{group_id}/members")
+    async def add_group_member(group_id: str, body: dict, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1, "members": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("admins", []): raise HTTPException(403, "Only admins can add members")
+        new_uid = body.get("user_id")
+        if not new_uid: raise HTTPException(400, "user_id required")
+        if new_uid == u["id"]: raise HTTPException(400, "You are already in the group")
+        if new_uid in g.get("members", []): return {"ok": True, "already_member": True}
+        connected_ids = set((u.get("followers") or []) + (u.get("following") or []))
+        if new_uid not in connected_ids: raise HTTPException(403, "You can only add your followers, following, or mutual connections")
+        target = await db.users.find_one({"id": new_uid}, {"_id": 0, "id": 1, "is_badge_verified": 1, "followers": 1})
+        if not target: raise HTTPException(404, "User not found")
+        if target.get("is_badge_verified") and not u.get("is_badge_verified") and u["id"] not in (target.get("followers") or []):
+            raise HTTPException(403, "Verified users can only be added when they follow you")
+        await db.groups.update_one({"id": group_id}, {"$addToSet": {"members": new_uid}})
+        return {"ok": True}
+
+    @api.delete("/groups/{group_id}/members/{member_id}")
+    async def remove_group_member(group_id: str, member_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "admins": 1, "creator_id": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("admins", []) and member_id != u["id"]:
+            raise HTTPException(403, "Not allowed")
+        await db.groups.update_one({"id": group_id}, {"$pull": {"members": member_id, "admins": member_id}})
+        return {"ok": True}
+
+    @api.delete("/groups/{group_id}")
+    async def delete_group(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "creator_id": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if g["creator_id"] != u["id"] and not u.get("is_admin"):
+            raise HTTPException(403, "Only creator can delete group")
+        await db.groups.delete_one({"id": group_id})
+        await db.group_messages.delete_many({"group_id": group_id})
+        return {"ok": True}
+
+    @api.get("/groups/{group_id}/messages")
+    async def get_group_messages(group_id: str, skip: int = Query(0, ge=0, le=100000), limit: int = Query(40, ge=1, le=100), u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        msgs = await db.group_messages.find(
+            {"group_id": group_id, "deleted_for": {"$ne": u["id"]}}, {"_id": 0}
+        ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        msgs.reverse()
+        await db.group_messages.update_many(
+            {"group_id": group_id, "from_id": {"$ne": u["id"]}, "seen_by": {"$ne": u["id"]}},
+            {"$addToSet": {"seen_by": u["id"]}}
+        )
+        return {"messages": msgs, "has_more": len(msgs) == limit}
+
+    @api.post("/groups/{group_id}/messages")
+    async def send_group_message(group_id: str, p: GroupMessageIn, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "name": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        if not p.text.strip() and not p.photo_url and not p.gif_url and not p.shared_post_id and not p.shared_reel_id and not p.audio_url:
+            raise HTTPException(400, "Message cannot be empty")
+        reply_to_preview = None
+        if p.reply_to_id:
+            ref = await db.group_messages.find_one({"id": p.reply_to_id}, {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "photo_url": 1})
+            if ref:
+                reply_to_preview = {"id": p.reply_to_id, "from_name": ref.get("from_name",""), "from_id": ref.get("from_id",""), "text": (ref.get("text") or "")[:120], "has_photo": bool(ref.get("photo_url"))}
+        shared_post = None
+        if p.shared_post_id:
+            sp = await db.posts.find_one({"id": p.shared_post_id}, {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1, "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1})
+            if sp:
+                shared_post = {"id": sp["id"], "content": (sp.get("content") or "")[:200], "photo_url": sp.get("photo_url") or ((sp.get("photo_urls") or [None])[0]), "user_name": sp.get("user_name",""), "user_handle": sp.get("user_handle",""), "avatar_bg": sp.get("avatar_bg",""), "avatar_letter": sp.get("avatar_letter",""), "avatar_photo": sp.get("avatar_photo"), "type": "post"}
+        doc = {
+            "id": str(uuid.uuid4()), "group_id": group_id,
+            "from_id": u["id"], "from_name": u["name"], "from_handle": u["handle"],
+            "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"),
+            "text": p.text.strip(), "photo_url": p.photo_url, "gif_url": p.gif_url or None,
+            "audio_url": p.audio_url or None, "audio_duration": p.audio_duration or None,
+            "reply_to_preview": reply_to_preview, "shared_post": shared_post,
+            "seen_by": [u["id"]], "reactions": {}, "deleted_for": [], "created_at": now().isoformat(),
+        }
+        await db.group_messages.insert_one(doc.copy())
+        doc.pop("_id", None)
+        last_text = p.text.strip() or ("🎤 Voice" if p.audio_url else ("📷 Photo" if p.photo_url else ("GIF" if p.gif_url else ("📎 Post" if p.shared_post_id else ""))))
+        await db.groups.update_one({"id": group_id}, {"$set": {"last_message": last_text, "last_message_at": now().isoformat(), "last_from_name": u["name"]}})
+        for mid in [m for m in g.get("members", []) if m != u["id"]]:
+            await _persist_user_activity_notification(
+                mid, u, "group_message", from_id=u["id"], from_name=u["name"],
+                group_id=group_id, group_name=g.get("name", "Group"), message=last_text[:80]
+            )
+        return doc
+
+    # ── Group – leave / clear chat / invite link ──────────────────
+    # NOTE: literal-path routes (/leave, /clear, /invite-link) must be defined
+    # BEFORE any parametric routes (/{msg_id}) so FastAPI matches them correctly.
+
+    @api.post("/groups/{group_id}/leave")
+    async def leave_group(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "creator_id": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(400, "Not a member")
+        await db.groups.update_one({"id": group_id}, {"$pull": {"members": u["id"], "admins": u["id"]}})
+        await db.group_messages.insert_one({
+            "id": str(uuid.uuid4()), "group_id": group_id,
+            "from_id": u["id"], "from_name": u["name"],
+            "text": f"{u['name']} left the group",
+            "is_system": True, "created_at": now().isoformat(),
+            "seen_by": [], "reactions": {}, "deleted_for": [],
+        })
+        return {"ok": True}
+
+    @api.post("/groups/{group_id}/clear-chat")
+    async def clear_group_chat(group_id: str, u=Depends(current_user)):
+        """Clear chat for current user only (soft delete)."""
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        await db.group_messages.update_many(
+            {"group_id": group_id},
+            {"$addToSet": {"deleted_for": u["id"]}}
+        )
+        return {"ok": True}
+
+    @api.get("/groups/{group_id}/invite-link")
+    async def get_group_invite_link(group_id: str, u=Depends(current_user)):
+        g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1, "invite_code": 1})
+        if not g: raise HTTPException(404, "Group not found")
+        if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
+        invite_code = g.get("invite_code")
+        if not invite_code:
+            invite_code = str(uuid.uuid4())[:8].upper()
+            await db.groups.update_one({"id": group_id}, {"$set": {"invite_code": invite_code}})
+        frontend_url = os.environ.get("FRONTEND_URL", "https://post-app-frontend-xd7v.onrender.com")
+        return {"invite_code": invite_code, "invite_link": f"{frontend_url}?join={invite_code}"}
+
+    @api.post("/groups/join")
+    async def join_group_via_invite(body: dict, u=Depends(current_user)):
+        invite_code = (body.get("invite_code") or "").strip().upper()
+        if not invite_code: raise HTTPException(400, "invite_code required")
+        g = await db.groups.find_one({"invite_code": invite_code}, {"_id": 0})
+        if not g: raise HTTPException(404, "Invalid invite link")
+        if u["id"] in g.get("members", []):
+            return {"group": g, "already_member": True}
+        await db.groups.update_one({"id": g["id"]}, {"$addToSet": {"members": u["id"]}})
+        await db.group_messages.insert_one({
+            "id": str(uuid.uuid4()), "group_id": g["id"],
+            "from_id": u["id"], "from_name": u["name"],
+            "text": f"{u['name']} joined via invite link",
+            "is_system": True, "created_at": now().isoformat(),
+            "seen_by": [], "reactions": {}, "deleted_for": [],
+        })
+        g["members"] = g.get("members", []) + [u["id"]]
+        return {"group": g, "already_member": False}
+
+    @api.delete("/groups/{group_id}/messages/{msg_id}")
+    async def delete_group_message(group_id: str, msg_id: str, body: dict = None, u=Depends(current_user)):
+        body = body or {}
+        msg = await db.group_messages.find_one({"id": msg_id, "group_id": group_id})
+        if not msg: raise HTTPException(404, "Message not found")
+        if body.get("delete_for") == "everyone" and msg["from_id"] == u["id"]:
+            await db.group_messages.update_one({"id": msg_id}, {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None, "audio_url": None}})
+        else:
+            await db.group_messages.update_one({"id": msg_id}, {"$addToSet": {"deleted_for": u["id"]}})
+        return {"ok": True}
+
+    # ── Call Signaling (WebRTC polling) ───────────────────────────
+    _call_state: dict = {}
+    _CALL_STATE_MAX = 200
+    _CALL_SIGNAL_MAX_COUNT = 200
+    _CALL_SIGNAL_MAX_BYTES = 256 * 1024
+    _CALL_SIGNAL_MAX_ONE_BYTES = 32 * 1024
+
+    def _prune_call_state():
+        current = now()
+        for call_id, call in list(_call_state.items()):
+            status = call.get("status")
+            ttl = 300 if status in ("ended", "declined") else 120 if status == "ringing" else 4 * 60 * 60 if status == "active" else 600
+            try:
+                age = (current - datetime.fromisoformat(call["created_at"])).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                age = float("inf")
+            if age > ttl:
+                _call_state.pop(call_id, None)
+        if len(_call_state) >= _CALL_STATE_MAX:
+            closed = sorted(
+                (item for item in _call_state.items() if item[1].get("status") in ("ended", "declined")),
+                key=lambda item: item[1].get("created_at", ""),
+            )
+            for call_id, _ in closed:
+                if len(_call_state) < _CALL_STATE_MAX:
+                    break
+                _call_state.pop(call_id, None)
+
+    def _public_call(call):
+        return {
+            key: ([{name: value for name, value in signal.items() if name != "_bytes"} for signal in value]
+                  if key == "signals" else value)
+            for key, value in call.items() if key != "_signal_bytes"
+        }
+
+    async def _require_call_participant(call, user_id: str):
+        if user_id in (call.get("from_id"), call.get("to_user_id")):
+            return
+        group_id = call.get("group_id")
+        if group_id:
+            group = await db.groups.find_one({"id": group_id, "members": user_id}, {"_id": 1})
+            if group:
+                return
+        raise HTTPException(status_code=403, detail="Not a participant in this call.")
+
+    @api.get("/calls/ice-servers")
+    async def get_ice_servers(u=Depends(current_user)):
+        import urllib.request, json as _json
+        api_key = os.environ.get("METERED_API_KEY", "")
+        if not api_key:
+            # fallback to Google STUN only
+            return {"iceServers": [{"urls": "stun:stun.l.google.com:19302"}]}
+        try:
+            url = f"https://post.metered.live/api/v1/turn/credentials?apiKey={api_key}"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = _json.loads(resp.read().decode())
+            return {"iceServers": data}
+        except Exception:
+            return {"iceServers": [{"urls": "stun:stun.l.google.com:19302"}]}
+
+
+
+    @api.post("/calls/initiate")
+    async def initiate_call(body: dict, u=Depends(current_user)):
+        to_user_id = body.get("to_user_id")
+        call_type = body.get("call_type", "voice")
+        group_id = body.get("group_id")
+        if not to_user_id and not group_id: raise HTTPException(400, "to_user_id or group_id required")
+        if group_id:
+            group = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
+            if not group or u["id"] not in group.get("members", []):
+                raise HTTPException(status_code=403, detail="Not a member of this group.")
+        _prune_call_state()
+        if len(_call_state) >= _CALL_STATE_MAX:
+            raise HTTPException(status_code=503, detail="Call capacity is temporarily full. Try again shortly.")
+        call_id = str(uuid.uuid4())
+        _call_state[call_id] = {"id": call_id, "from_id": u["id"], "from_name": u["name"], "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"), "to_user_id": to_user_id, "group_id": group_id, "call_type": call_type, "status": "ringing", "signals": [], "_signal_bytes": 0, "created_at": now().isoformat(), "ended_at": None}
+        return {"call_id": call_id, "status": "ringing"}
+
+    @api.get("/calls/{call_id}")
+    async def get_call_state(call_id: str, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
+        return _public_call(call)
+
+    @api.post("/calls/{call_id}/signal")
+    async def add_call_signal(call_id: str, body: dict, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
+        signal_type = str(body.get("type") or "")[:50]
+        signal_data = body.get("data")
+        try:
+            signal_size = len(_json.dumps(signal_data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) + len(signal_type.encode("utf-8"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid call signal.")
+        if signal_size > _CALL_SIGNAL_MAX_ONE_BYTES:
+            raise HTTPException(status_code=413, detail="Call signal is too large.")
+        call["signals"].append({"from_id": u["id"], "type": signal_type, "data": signal_data, "ts": now().isoformat(), "_bytes": signal_size})
+        call["_signal_bytes"] = call.get("_signal_bytes", 0) + signal_size
+        while len(call["signals"]) > _CALL_SIGNAL_MAX_COUNT or call["_signal_bytes"] > _CALL_SIGNAL_MAX_BYTES:
+            removed = call["signals"].pop(0)
+            call["_signal_bytes"] = max(0, call["_signal_bytes"] - removed.get("_bytes", 0))
+        return {"ok": True}
+
+    @api.get("/calls/{call_id}/signals")
+    async def get_call_signals(call_id: str, since: int = Query(0, ge=0, le=200), u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
+        my_signals = [
+            {key: value for key, value in signal.items() if key != "_bytes"}
+            for signal in call["signals"][since:] if signal["from_id"] != u["id"]
+        ]
+        return {"signals": my_signals, "total": len(call["signals"])}
+
+    @api.post("/calls/{call_id}/answer")
+    async def answer_call(call_id: str, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
+        call["status"] = "active"
+        return {"ok": True}
+
+    @api.post("/calls/{call_id}/end")
+    async def end_call(call_id: str, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
+        call["status"] = "ended"
+        call["ended_at"] = now().isoformat()
+        return {"ok": True}
+
+    @api.post("/calls/{call_id}/decline")
+    async def decline_call(call_id: str, u=Depends(current_user)):
+        call = _call_state.get(call_id)
+        if not call: raise HTTPException(404, "Call not found")
+        await _require_call_participant(call, u["id"])
+        call["status"] = "declined"
+        return {"ok": True}
+
+    @api.get("/calls/incoming/check")
+    async def check_incoming_call(u=Depends(current_user)):
+        _prune_call_state()
+        for call_id, call in list(_call_state.items()):
+            if call["to_user_id"] == u["id"] and call["status"] == "ringing":
+                age = (now() - datetime.fromisoformat(call["created_at"])).total_seconds()
+                if age > 60:
+                    call["status"] = "ended"
+                    call["ended_at"] = now().isoformat()
+                else: return {"call": _public_call(call)}
+        return {"call": None}
+
+
+    # ── GIF proxy (Giphy) ─────────────────────────────────────────────────────
+    @api.get("/gifs")
+    async def gif_proxy(q: str = Query("", max_length=200), limit: int = Query(30, ge=1, le=50)):
+        import httpx
+        GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
+        if not GIPHY_KEY:
+            return {"gifs": [], "error": "GIPHY_API_KEY not configured on server"}
+        params = {"api_key": GIPHY_KEY, "limit": limit, "rating": "pg"}
+        if q.strip():
+            endpoint = "https://api.giphy.com/v1/gifs/search"
+            params["q"] = q.strip()
+        else:
+            endpoint = "https://api.giphy.com/v1/gifs/trending"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(endpoint, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300]
+            logging.error(f"Giphy /gifs HTTP {e.response.status_code}: {body}")
+            return {"gifs": [], "error": f"Giphy error {e.response.status_code}: {body}"}
+        except Exception as e:
+            logging.error(f"Giphy /gifs fetch failed: {e}")
+            return {"gifs": [], "error": str(e)}
+        gifs = []
+        for g in data.get("data", []):
+            try:
+                imgs = g.get("images", {})
+                preview = (imgs.get("fixed_width_small") or imgs.get("fixed_width") or {}).get("url", "")
+                full = (imgs.get("fixed_width") or {}).get("url", "")
+                if full:
+                    gifs.append({"id": g["id"], "title": g.get("title", ""), "preview": preview or full, "full": full})
+            except Exception:
+                pass
+        return {"gifs": gifs}
+
+    # ── Stickers proxy (Giphy) ────────────────────────────────────────────────
+    @api.get("/stickers")
+    async def sticker_proxy(q: str = Query("", max_length=200), limit: int = Query(30, ge=1, le=50)):
+        import httpx
+        GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
+        if not GIPHY_KEY:
+            return {"stickers": [], "error": "GIPHY_API_KEY not configured on server"}
+        params = {"api_key": GIPHY_KEY, "limit": limit, "rating": "pg"}
+        if q.strip():
+            endpoint = "https://api.giphy.com/v1/stickers/search"
+            params["q"] = q.strip()
+        else:
+            endpoint = "https://api.giphy.com/v1/stickers/trending"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(endpoint, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300]
+            logging.error(f"Giphy /stickers HTTP {e.response.status_code}: {body}")
+            return {"stickers": [], "error": f"Giphy error {e.response.status_code}: {body}"}
+        except Exception as e:
+            logging.error(f"Giphy /stickers fetch failed: {e}")
+            return {"stickers": [], "error": str(e)}
+        stickers = []
+        for g in data.get("data", []):
+            try:
+                imgs = g.get("images", {})
+                preview = (imgs.get("fixed_width_small") or imgs.get("fixed_width") or {}).get("url", "")
+                full = (imgs.get("fixed_width") or {}).get("url", "")
+                if full:
+                    stickers.append({"id": g["id"], "title": g.get("title", ""), "preview": preview or full, "full": full})
+            except Exception:
+                pass
+        return {"stickers": stickers}
+
+    # ── Security helpers ──────────────────────────────────────────────────────
+    def _parse_device_name(ua: str) -> str:
+        """Extract human-readable device name from User-Agent."""
+        ua_lower = ua.lower()
+        if "iphone" in ua_lower: return "iPhone"
+        if "ipad" in ua_lower: return "iPad"
+        if "android" in ua_lower:
+            # Android browsers expose the model between the version and Build/.
+            match = re.search(r"Android[^;)]*;\s*(?:[a-z]{2}-[A-Z]{2};\s*)?([^;)]+?)(?:\s+Build[/;]|;wv|\))", ua)
+            if match:
+                model = re.sub(r"\s+Build.*$", "", match.group(1)).replace("_", " ").strip()
+                if model and model.lower() not in {"wv", "mobile", "tablet"}: return model
+            return "Android Mobile" if "mobile" in ua_lower else "Android Tablet"
+        if "windows" in ua_lower: return "Windows PC"
+        if "macintosh" in ua_lower or "mac os" in ua_lower: return "Mac"
+        if "linux" in ua_lower: return "Linux PC"
+        if ua.strip(): return ua[:40]
+        return "Unknown device"
+
+    # ── Security & Sessions endpoints ─────────────────────────────────────────
+    @api.get("/security/sessions")
+    async def get_security_sessions(request: Request, u=Depends(current_user)):
+        current_sid = u.get("_current_session_id")
+        if current_sid:
+            current_metadata = await asyncio.to_thread(_session_metadata, request)
+            if current_metadata.get("location") != "Unknown location":
+                await db.sessions.update_one(
+                    {"id": current_sid, "user_id": u["id"]},
+                    {"$set": current_metadata},
+                )
+        sessions = await db.sessions.find(
+            {"user_id": u["id"]}, {"_id": 0}
+        ).sort("last_active", -1).to_list(50)
+        for s in sessions:
+            s["is_current"] = (s.get("id") == current_sid)
+        return {"sessions": sessions}
+
+    @api.delete("/security/sessions/{session_id}")
+    async def revoke_security_session(session_id: str, u=Depends(current_user)):
+        if session_id == "all":
+            current_sid = u.get("_current_session_id")
+            query = {"user_id": u["id"]}
+            if current_sid:
+                query["id"] = {"$ne": current_sid}
+            await db.sessions.delete_many(query)
+            return {"ok": True}
+        session = await db.sessions.find_one({"id": session_id, "user_id": u["id"]})
+        if not session:
+            raise HTTPException(404, "Session not found")
+        await db.sessions.delete_one({"id": session_id, "user_id": u["id"]})
+        return {"ok": True}
+
+
+    # ── Our Planet: public Earth explorer adapters ───────────────────────────
+    _PLANET_CONTACT_EMAIL = os.environ.get("OUR_PLANET_CONTACT_EMAIL", "support@postbluom.online").strip()
+    _PLANET_UA = f"PostApp-OurPlanet/1.0 ({_PLANET_CONTACT_EMAIL})"
+    _PLANET_CACHE = {}
+    _PLANET_CACHE_TTL = 1800
+    _PLANET_CACHE_MAX_ENTRIES = 128
+
+    def _planet_cache_get(key):
+        now_mono = _time.monotonic()
+        entry = _PLANET_CACHE.get(key)
+        if not entry:
+            return None
+        if now_mono - entry[0] >= _PLANET_CACHE_TTL:
+            _PLANET_CACHE.pop(key, None)
+            return None
+        return entry[1]
+
+    def _planet_cache_set(key, value):
+        now_mono = _time.monotonic()
+        for cached_key, (cached_at, _) in list(_PLANET_CACHE.items()):
+            if now_mono - cached_at >= _PLANET_CACHE_TTL:
+                _PLANET_CACHE.pop(cached_key, None)
+        if key not in _PLANET_CACHE and len(_PLANET_CACHE) >= _PLANET_CACHE_MAX_ENTRIES:
+            oldest_key = min(_PLANET_CACHE, key=lambda cached_key: _PLANET_CACHE[cached_key][0])
+            _PLANET_CACHE.pop(oldest_key, None)
+        _PLANET_CACHE[key] = (now_mono, value)
+
+    _PLANET_NOMINATIM_LOCK = _threading.Lock()
+    _PLANET_NOMINATIM_LAST = 0.0
+    _PLANET_NOMINATIM = "https://nominatim.openstreetmap.org/search"
+    _PLANET_WIKI = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+    _PLANET_COMMONS = "https://commons.wikimedia.org/w/api.php"
+    _PLANET_GBIF = "https://api.gbif.org/v1/species/match"
+    _PLANET_NASA = "https://cmr.earthdata.nasa.gov/search/granules.json"
+    _PLANET_ARCGIS = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
+    _PLANET_NASA_KEY = os.environ.get("NASA_API_KEY", "").strip()
+    _PLANET_GFW_KEY = os.environ.get("GFW_API_KEY", "").strip()
+
+    from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+    def _planet_weather(lat, lon):
+        if lat is None or lon is None: return {}
+        return _planet_get_json("https://api.open-meteo.com/v1/forecast", {"latitude":lat,"longitude":lon,"current_weather":"true","daily":"temperature_2m_max,temperature_2m_min,precipitation_sum","timezone":"auto"}, 10)
+
+    def _planet_power(lat, lon):
+        if lat is None or lon is None: return {}
+        return _planet_get_json("https://power.larc.nasa.gov/api/temporal/climatology/point", {"parameters":"T2M,PRECTOTCORR,ALLSKY_SFC_SW_DWN","community":"RE","longitude":lon,"latitude":lat,"format":"JSON"}, 12)
+
+    def _planet_gfw(lat, lon):
+        if lat is None or lon is None or not _PLANET_GFW_KEY: return {}
+        try:
+            lat, lon = float(lat), float(lon)
+            west, east = max(-180.0, lon - 0.5), min(180.0, lon + 0.5)
+            south, north = max(-90.0, lat - 0.5), min(90.0, lat + 0.5)
+            geometry = {"type":"Polygon","coordinates":[[[west,south],[east,south],[east,north],[west,north],[west,south]]]}
+            sql = "SELECT SUM(area__ha) AS loss_ha FROM data"
+            return _planet_post_json("https://data-api.globalforestwatch.org/dataset/umd_tree_cover_loss/latest/query/json", {"sql":sql,"geometry":geometry}, 15, {"x-api-key":_PLANET_GFW_KEY})
+        except (TypeError, ValueError): return {}
+
+    def _planet_nasa_library(query):
+        if not _PLANET_NASA_KEY: return {}
+        data = _planet_get_json("https://images-api.nasa.gov/search", {"q":query,"media_type":"image"}, 15)
+        item = (data.get("collection",{}).get("items") or [{}])[0]
+        return {"nasa_image_url":((item.get("links") or [{}])[0]).get("href")} if item else {}
+
+    def _planet_addons(query, lat, lon):
+        with _ThreadPoolExecutor(max_workers=4) as pool:
+            jobs = {
+                "weather": pool.submit(_planet_weather, lat, lon),
+                "power": pool.submit(_planet_power, lat, lon),
+                "gfw": pool.submit(_planet_gfw, lat, lon),
+                "nasa": pool.submit(_planet_nasa_library, query),
+            }
+            data = {name:job.result() for name,job in jobs.items()}
+        weather, power, gfw = data["weather"] or {}, data["power"] or {}, data["gfw"] or {}
+        current, daily = weather.get("current_weather") or {}, weather.get("daily") or {}
+        parameter = (power.get("properties") or {}).get("parameter") or {}
+        climate=[]
+        if current:
+            climate.append(f"Live conditions: {current.get('temperature','—')}°C, wind {current.get('windspeed','—')} km/h")
+            highs, lows, rain = daily.get("temperature_2m_max") or [], daily.get("temperature_2m_min") or [], daily.get("precipitation_sum") or []
+            if highs or lows: climate.append(f"Today's forecast: {highs[0] if highs else '—'}°C high / {lows[0] if lows else '—'}°C low")
+            if rain: climate.append(f"Precipitation today: {rain[0]} mm")
+        if parameter:
+            climate.extend([f"Long-term temperature: {parameter.get('T2M',{}).get('ANN','—')}°C",f"Average precipitation: {parameter.get('PRECTOTCORR',{}).get('ANN','—')} mm/day",f"Average solar energy: {parameter.get('ALLSKY_SFC_SW_DWN',{}).get('ANN','—')} kWh/m²/day"])
+        environment=None
+        if _PLANET_GFW_KEY:
+            try:
+                row=(gfw.get("data") or [{}])[0]
+                value=row.get("loss_ha") or row.get("sum(area__ha)")
+                environment=f"Tree cover loss in the surrounding area: {round(float(value)):,} hectares." if value is not None else "Global Forest Watch returned no tree-cover-loss record for this location."
+            except (AttributeError,TypeError,ValueError): environment="Global Forest Watch returned no tree-cover-loss record for this location."
+        sources=[]
+        if current: sources.append("Open-Meteo")
+        if parameter: sources.append("NASA POWER")
+        if data["nasa"].get("nasa_image_url"): sources.append("NASA Image Library")
+        if _PLANET_GFW_KEY and gfw: sources.append("Global Forest Watch")
+        return {"nasa_image_url":data["nasa"].get("nasa_image_url"),"climate":"\\n".join(climate) or None,"environment":environment,"source_suffix":(" + "+" + ".join(sources)) if sources else ""}
+
+
+    def _planet_get_json(url, params=None, timeout=10, extra_headers=None):
+        try:
+            if params:
+                url += "?" + urllib.parse.urlencode(params, doseq=True)
+            request_headers = {"User-Agent": _PLANET_UA, "Accept": "application/json"}
+            if extra_headers:
+                request_headers.update(extra_headers)
+            req = urllib.request.Request(url, headers=request_headers)
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return _json.loads(response.read(4_000_000).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _planet_post_json(url, payload, timeout=10, extra_headers=None):
+        try:
+            # urllib normalizes x-api-key to X-api-key; GFW's gateway requires the lowercase header.
+            import http.client as _http_client
+            request_headers = {"User-Agent": _PLANET_UA, "Accept": "application/json", "Content-Type": "application/json"}
+            if extra_headers:
+                request_headers.update(extra_headers)
+            body = _json.dumps(payload).encode("utf-8")
+            for _attempt in range(2):
+                parsed = urllib.parse.urlsplit(url)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += "?" + parsed.query
+                connection = _http_client.HTTPSConnection(parsed.netloc, timeout=timeout)
+                connection.request("POST", path, body=body, headers=request_headers)
+                response = connection.getresponse()
+                raw = response.read(4_000_000)
+                if response.status in (301, 302, 307, 308) and response.getheader("location"):
+                    url = urllib.parse.urljoin(url, response.getheader("location"))
+                    connection.close()
+                    continue
+                connection.close()
+                if response.status >= 400:
+                    return {}
+                return _json.loads(raw.decode("utf-8"))
+            return {}
+        except Exception:
+            return {}
+
+    def _planet_geo(query):
+        global _PLANET_NOMINATIM_LAST
+        with _PLANET_NOMINATIM_LOCK:
+            pause = 1.0 - (_time.time() - _PLANET_NOMINATIM_LAST)
+            if pause > 0:
+                _time.sleep(pause)
+            data = _planet_get_json(_PLANET_NOMINATIM, {"q": query, "format": "json", "limit": 1}, 10)
+            _PLANET_NOMINATIM_LAST = _time.time()
+        try:
+            item = data[0]
+            return {"lat": float(item["lat"]), "lon": float(item["lon"]), "display": item.get("display_name", ""), "osm_class": item.get("class"), "osm_type": item.get("type")}
+        except (IndexError, KeyError, TypeError, ValueError):
+            return {}
+
+    def _planet_wiki(query):
+        data = _planet_get_json(_PLANET_WIKI + urllib.parse.quote(query.replace(" ", "_")), timeout=10)
+        if data.get("type") == "disambiguation" or not data.get("title"):
+            return {}
+        return {"title": data.get("title"), "extract": data.get("extract"), "description": (data.get("description") or "").lower(), "thumbnail": (data.get("thumbnail") or {}).get("source"), "page_url": (data.get("content_urls") or {}).get("desktop", {}).get("page")}
+
+    def _planet_photo(query):
+        data = _planet_get_json(_PLANET_COMMONS, {"action":"query", "generator":"search", "gsrsearch":query + " filetype:bitmap", "gsrnamespace":6, "gsrlimit":3, "prop":"imageinfo", "iiprop":"url|extmetadata", "iiurlwidth":1400, "format":"json"}, 12)
+        for page in (data.get("query", {}).get("pages", {}) or {}).values():
+            info = (page.get("imageinfo") or [{}])[0]
+            meta = info.get("extmetadata") or {}
+            artist = (meta.get("Artist") or {}).get("value", "")
+            return {"photo_url": info.get("thumburl") or info.get("url"), "photo_credit": __import__("html").unescape(str(artist))}
+        return {}
+
+    def _planet_bio(query):
+        data = _planet_get_json(_PLANET_GBIF, {"name": query}, 10)
+        if data.get("usageKey") and data.get("matchType") != "NONE":
+            return {"scientific": data.get("scientificName"), "key": data.get("usageKey")}
+        return {}
+
+    def _planet_nasa(query):
+        data = _planet_get_json(_PLANET_NASA, [("keyword", query), ("page_size", 3), ("sort_key[]", "-start_date")], 12)
+        entry = (data.get("feed", {}).get("entry") or [{}])[0]
+        for link in entry.get("links", []):
+            marker = ((link.get("title") or "") + " " + (link.get("type") or "")).lower()
+            if any(word in marker for word in ("image", "browse", "thumbnail")):
+                return {"satellite_desc": entry.get("summary"), "source_url": entry.get("id"), "satellite_url": link.get("href")}
+        return {}
+
+    def _planet_satellite(lat, lon):
+        if lat is None or lon is None:
+            return None
+        params = {"bbox": f"{lon-0.2},{lat-0.2},{lon+0.2},{lat+0.2}", "bboxSR":4326, "imageSR":4326, "size":"800,500", "format":"jpg", "f":"image"}
+        return _PLANET_ARCGIS + "?" + urllib.parse.urlencode(params)
+
+    _PLANET_TYPES = {("waterway","river"):"River", ("waterway","stream"):"River", ("natural","water"):"Lake", ("place","ocean"):"Ocean / Sea", ("place","sea"):"Ocean / Sea", ("natural","peak"):"Mountain / Peak", ("natural","ridge"):"Mountain / Range", ("natural","wood"):"Forest", ("landuse","forest"):"Forest", ("natural","desert"):"Desert", ("place","country"):"Country / Region", ("boundary","administrative"):"Country / Region", ("place","city"):"City", ("place","town"):"Town"}
+    _PLANET_WORDS = [("river","River"), ("mountain range","Mountain / Range"), ("mountain","Mountain / Peak"), ("ocean","Ocean / Sea"), ("sea","Ocean / Sea"), ("rainforest","Forest"), ("forest","Forest"), ("desert","Desert"), ("lake","Lake"), ("country","Country / Region"), ("city","City")]
+
+    def _planet_type(bio, geo_data, wiki_data):
+        if bio:
+            return "Species"
+        mapped = _PLANET_TYPES.get((geo_data.get("osm_class"), geo_data.get("osm_type")))
+        if mapped:
+            return mapped
+        for word, label in _PLANET_WORDS:
+            if word in (wiki_data.get("description") or ""):
+                return label
+        return "Place / Geographic Feature" if geo_data else "Earth Entity"
+
+    def _planet_profile(query):
+        key = " ".join(query.strip().lower().split())
+        cached_profile = _planet_cache_get(key)
+        if cached_profile is not None:
+            return cached_profile
+        geo_data = _planet_geo(query)
+        bio = _planet_bio(query)
+        wiki_data = _planet_wiki(query)
+        photo = _planet_photo(query)
+        nasa = _planet_nasa(query)
+        satellite_url = _planet_satellite(geo_data.get("lat"), geo_data.get("lon"))
+        addons = _planet_addons(query, geo_data.get("lat"), geo_data.get("lon"))
+        result = {
+            "id": "earth-" + _hl.sha1(key.encode("utf-8")).hexdigest()[:16],
+            "name": wiki_data.get("title") or query,
+            "entity_type": _planet_type(bio, geo_data, wiki_data),
+            "description": wiki_data.get("extract") or geo_data.get("display") or f"Explore detailed Earth information about {query}.",
+            "lat": geo_data.get("lat"), "lon": geo_data.get("lon"),
+            "photo_url": photo.get("photo_url") or wiki_data.get("thumbnail"), "photo_credit": photo.get("photo_credit"),
+            "satellite_url": satellite_url,
+            "nasa_image_url": addons.get("nasa_image_url"),
+            "sections": {
+                "geography": geo_data.get("display") or "Coordinates, terrain, boundaries and nearby places when available.",
+                "satellite": nasa.get("satellite_desc") or ("Satellite view centered on this location." if satellite_url else "No location found to generate a satellite view."),
+                "photos": photo.get("photo_credit") or ("Wikipedia" if wiki_data.get("thumbnail") else "Real source photographs when available."),
+                "water": "Hydrology, water level, discharge and water-quality data when available.",
+                "environment": addons.get("environment") or "Ecosystems, land cover, vegetation and environmental observations when available.",
+                "biodiversity": f"Scientific name: {bio.get('scientific')}" if bio else "Species and biodiversity observations when available.",
+                "climate": addons.get("climate") or "Temperature, rainfall, climate normals and trends when available.",
+                "events": "Earthquakes, floods, fires, storms and other events when available.",
+                "culture": "Nearby cities, protected places, landmarks and cultural information when available.",
+                "statistics": "Provider-specific measurements, counts and trends when available.",
+                "history": "Historical satellite/data records when available.",
+                "ai": "Earth AI can summarize returned data, compare dates and explain the entity with source citations.",
+            },
+            "related": [query + " map", query + " photos", query + " satellite", query + " biodiversity"],
+            "source": "Wikipedia + Wikimedia Commons + OpenStreetMap + GBIF + Esri World Imagery" + (" + NASA Earthdata" if nasa.get("satellite_desc") else "") + addons.get("source_suffix", ""),
+            "source_url": wiki_data.get("page_url") or nasa.get("source_url"),
+        }
+        _planet_cache_set(key, result)
+        return result
+
+    @api.get("/our-planet/search")
+    async def our_planet_search(q: str = Query("", max_length=200)):
+        clean_query = q.strip()
+        return {"results": [] if not clean_query else [await asyncio.to_thread(_planet_profile, clean_query)]}
+
+    @api.get("/our-planet/health")
+    async def our_planet_health():
+        return {"ok": True, "feature": "universal-earth-profiles", "providers": ["Wikipedia", "Wikimedia Commons", "OpenStreetMap/Nominatim", "GBIF", "Open-Meteo", "NASA POWER", "NASA Earthdata", "NASA Image Library", "Esri World Imagery", "Global Forest Watch"],
+            "configured": {"nasa_api": bool(_PLANET_NASA_KEY), "global_forest_watch": bool(_PLANET_GFW_KEY)}}
+
+
+
+    # ===================================================================
+    # REELS RECOMMENDATION ALGORITHM (schema-compatible, live signals)
+    # ===================================================================
+    # This lives on the existing /api router so the frontend can later call
+    # GET /api/reels/feed without adding another service or database client.
+    REELS_ALGO_PAGE_SIZE = 20
+    REELS_ALGO_LOOKBACK_DAYS = 7
+    REELS_ALGO_SEEN_LOOKBACK_DAYS = 7
+    REELS_ALGO_QUICK_SKIP_SECONDS = 2.0
+    REELS_ALGO_QUICK_SKIP_MIN_COUNT = 3
+    REELS_ALGO_VIRAL_MIN_VIEWS_1H = 500
+    REELS_ALGO_VIRAL_RATIO = 0.15
+    REELS_ALGO_TASK = None
+
+    _REELS_WEIGHTS = {
+        "A": {"completion_rate": 0.35, "engagement_rate": 0.30, "recency": 0.15, "affinity": 0.05, "velocity": 0.15},
+        "B": {"completion_rate": 0.30, "engagement_rate": 0.35, "recency": 0.15, "affinity": 0.05, "velocity": 0.15},
+    }
+
+    def _reels_parse_datetime(value):
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return now()
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _reels_category(reel):
+        return str(reel.get("category") or "general").strip().lower()[:40] or "general"
+
+    def _reels_tags(reel):
+        raw = reel.get("tags") or reel.get("hashtags") or []
+        if isinstance(raw, str):
+            raw = raw.split()
+        return [str(tag).strip().lower().lstrip("#")[:40] for tag in raw if str(tag).strip()][:20]
+
+    def _reels_user_can_see(reel, user_id, following_ids):
+        owner_id = str(reel.get("user_id") or "")
+        if owner_id == user_id:
+            return True
+        audience = reel.get("audience") or "public"
+        if audience == "only_me":
+            return False
+        if audience == "friends" and owner_id not in following_ids:
+            return False
+        if audience == "only_show" and user_id not in (reel.get("audience_users") or []):
+            return False
+        return True
+
+    async def _reels_user_categories(user_id, days=14, limit=5):
+        since = (now() - timedelta(days=days)).isoformat()
+        rows = await db.reel_view_events.aggregate([
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}}},
+            {"$group": {"_id": "$category", "watch_seconds": {"$sum": "$watch_seconds"}}},
+            {"$sort": {"watch_seconds": -1}},
+            {"$limit": limit},
+        ]).to_list(length=limit)
+        learned = [row["_id"] for row in rows if row.get("_id")]
+        profile = await db.users.find_one({"id": user_id}, {"_id": 0, "onboarding_categories": 1})
+        onboarding = [
+            str(category).strip().lower()[:40]
+            for category in (profile or {}).get("onboarding_categories", [])
+            if str(category).strip()
+        ]
+        return list(dict.fromkeys(onboarding + learned))[:limit]
+
+    async def _reels_session_categories(user_id):
+        since = (now() - timedelta(minutes=5)).isoformat()
+        rows = await db.reel_view_events.aggregate([
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}}},
+            {"$group": {"_id": "$category", "watch_seconds": {"$sum": "$watch_seconds"}}},
+            {"$sort": {"watch_seconds": -1}},
+            {"$limit": 3},
+        ]).to_list(length=3)
+        return [row["_id"] for row in rows if row.get("_id")]
+
+    async def _reels_active_hour_categories(user_id):
+        since = (now() - timedelta(days=14)).isoformat()
+        current_hour = now().hour
+        rows = await db.reel_view_events.find(
+            {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$nin": [None, ""]}},
+            {"_id": 0, "category": 1, "watch_seconds": 1, "event_at": 1},
+        ).to_list(2000)
+        totals = {}
+        for row in rows:
+            if _reels_parse_datetime(row.get("event_at")).hour != current_hour:
+                continue
+            category = row.get("category")
+            totals[category] = totals.get(category, 0.0) + float(row.get("watch_seconds") or 0)
+        return [category for category, _ in sorted(totals.items(), key=lambda item: item[1], reverse=True)[:3]]
+
+    async def _reels_seen_ids(user_id, reel_ids):
+        if not reel_ids:
+            return set()
+        since = (now() - timedelta(days=REELS_ALGO_SEEN_LOOKBACK_DAYS)).isoformat()
+        return set(await db.reel_view_events.distinct(
+            "reel_id",
+            {"user_id": user_id, "reel_id": {"$in": reel_ids}, "event_at": {"$gte": since}},
+        ))
+
+    async def _reels_negative_signals(user_id, reel_ids, creator_ids, categories):
+        not_interested = set(await db.reel_feedback.distinct(
+            "reel_id",
+            {"user_id": user_id, "action": "not_interested", "reel_id": {"$in": reel_ids}},
+        )) if reel_ids else set()
+        hidden_creators = set(await db.reel_feedback.distinct(
+            "creator_id",
+            {"user_id": user_id, "action": {"$in": ["report", "hide_creator"]}, "creator_id": {"$in": creator_ids}},
+        )) if creator_ids else set()
+        since = (now() - timedelta(days=3)).isoformat()
+        quick_rows = await db.reel_view_events.aggregate([
+            {"$match": {"user_id": user_id, "event_at": {"$gte": since}, "category": {"$in": categories}, "watch_seconds": {"$lt": REELS_ALGO_QUICK_SKIP_SECONDS}}},
+            {"$group": {"_id": "$category", "skip_count": {"$sum": 1}}},
+            {"$match": {"skip_count": {"$gte": REELS_ALGO_QUICK_SKIP_MIN_COUNT}}},
+        ]).to_list(len(categories)) if categories else []
+        return {
+            "not_interested_ids": not_interested,
+            "hidden_creator_ids": hidden_creators,
+            "quick_skip_categories": {row["_id"] for row in quick_rows if row.get("_id")},
+        }
+
+    async def _reels_positive_signals(user_id, reel_ids):
+        if not reel_ids:
+            return set()
+        return set(await db.reel_feedback.distinct(
+            "reel_id",
+            {"user_id": user_id, "action": "interested", "reel_id": {"$in": reel_ids}},
+        ))
+
+    async def _reels_liked_creators(user_id):
+        liked_reels = await db.reels.find({"likes": user_id}, {"_id": 0, "user_id": 1}).to_list(100)
+        return {row.get("user_id") for row in liked_reels if row.get("user_id")}
+
+    async def _reels_similar_user_reels(user_id):
+        liked = await db.reels.find({"likes": user_id}, {"_id": 0, "id": 1}).to_list(100)
+        liked_ids = [row.get("id") for row in liked if row.get("id")]
+        if not liked_ids:
+            return set()
+        liked_docs = await db.reels.find({"id": {"$in": liked_ids}}, {"_id": 0, "likes": 1}).to_list(100)
+        similar_users = set()
+        for row in liked_docs:
+            similar_users.update(row.get("likes") or [])
+        similar_users.discard(user_id)
+        if not similar_users:
+            return set()
+        recommendations = await db.reels.find(
+            {"likes": {"$in": list(similar_users)}, "id": {"$nin": liked_ids}},
+            {"_id": 0, "id": 1},
+        ).limit(100).to_list(100)
+        return {row.get("id") for row in recommendations if row.get("id")}
+
+    async def _reels_live_stats(reel_ids):
+        if not reel_ids:
+            return {}
+        stats = {}
+        stored = await db.reel_rank_stats.find({"reel_id": {"$in": reel_ids}}, {"_id": 0}).to_list(len(reel_ids))
+        for row in stored:
+            stats[row["reel_id"]] = dict(row)
+        all_time = await db.reel_view_events.aggregate([
+            {"$match": {"reel_id": {"$in": reel_ids}}},
+            {"$group": {
+                "_id": "$reel_id",
+                "total_views": {"$sum": 1},
+                "completion_sum": {"$sum": "$completion_ratio"},
+                "watch_seconds_sum": {"$sum": "$watch_seconds"},
+            }},
+        ]).to_list(len(reel_ids))
+        for row in all_time:
+            reel_stats = stats.setdefault(row["_id"], {})
+            total_views = int(row.get("total_views") or 0)
+            reel_stats["total_views"] = max(int(reel_stats.get("total_views") or 0), total_views)
+            reel_stats["completion_sum"] = float(row.get("completion_sum") or 0)
+            reel_stats["watch_seconds_sum"] = float(row.get("watch_seconds_sum") or 0)
+            reel_stats["avg_completion"] = float(row.get("completion_sum") or 0) / max(total_views, 1)
+        since = (now() - timedelta(hours=1)).isoformat()
+        hourly = await db.reel_view_events.aggregate([
+            {"$match": {"reel_id": {"$in": reel_ids}, "event_at": {"$gte": since}}},
+            {"$group": {
+                "_id": "$reel_id",
+                "views_1h": {"$sum": 1},
+                "watch_seconds_1h": {"$sum": "$watch_seconds"},
+            }},
+        ]).to_list(len(reel_ids))
+        for row in hourly:
+            stats.setdefault(row["_id"], {}).update({
+                "views_1h": int(row.get("views_1h") or 0),
+                "watch_seconds_1h": float(row.get("watch_seconds_1h") or 0),
+            })
+        return stats
+
+    def _reels_diversify(items, page_size):
+        result, pool, categories = [], list(items), []
+        last_creator = None
+        while pool and len(result) < page_size:
+            selected = None
+            for index, item in enumerate(pool):
+                category = item.get("category") or "general"
+                creator = item.get("user_id")
+                category_ok = categories[-2:].count(category) < 2
+                creator_ok = creator != last_creator
+                if category_ok and creator_ok:
+                    selected = index
+                    break
+            if selected is None:
+                selected = 0
+            chosen = pool.pop(selected)
+            result.append(chosen)
+            categories.append(chosen.get("category") or "general")
+            last_creator = chosen.get("user_id")
+        return result
+
+    @api.get("/reels/feed")
+    async def get_algorithmic_reels_feed(
+        page: int = Query(0, ge=0),
+        limit: int = Query(REELS_ALGO_PAGE_SIZE, ge=1, le=50),
+        q: str = Query("", max_length=200),
+        u=Depends(current_user),
+    ):
+        user_id = u["id"]
+        limit = min(limit, 50)
+        now_utc = now()
+        cutoff = now_utc - timedelta(days=REELS_ALGO_LOOKBACK_DAYS)
+        following_ids = set(u.get("following") or [])
+        pending_follow_ids = {
+            row["to_id"]
+            for row in await db.follow_requests.find(
+                {"from_id": u["id"], "status": "pending"},
+                {"_id": 0, "to_id": 1},
+            ).to_list(5000)
+        }
+        excluded_users = set((u.get("blocked_users") or []) + (u.get("muted_users") or []))
+        # Rank compact metadata for the candidate pool; media and embedded
+        # engagement arrays are loaded only for the final page below.
+        def _reel_array_size(field):
+            return {"$size": {"$cond": [{"$isArray": field}, field, []]}}
+
+        def _reel_count_value(field):
+            return {"$convert": {"input": field, "to": "long", "onError": 0, "onNull": 0}}
+
+        raw_candidates = await db.reels.aggregate([
+            {"$match": {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}}},
+            {"$sort": {"created_at": -1}},
+            {"$limit": 2000},
+            {"$project": {
+                "_id": 0,
+                "id": 1,
+                "user_id": 1,
+                "category": 1,
+                "caption": 1,
+                "audio_label": 1,
+                "hashtags": 1,
+                "tags": 1,
+                "audience": 1,
+                "audience_users": 1,
+                "created_at": 1,
+                "duration": 1,
+                "mention_count": 1,
+                "_rank_view_count": {"$max": [_reel_array_size("$views"), _reel_count_value("$view_count")]},
+                "_rank_like_count": _reel_array_size("$likes"),
+                "_rank_comment_count": {"$max": [_reel_array_size("$comments"), _reel_count_value("$comment_count")]},
+                "_rank_comment_likes": {"$reduce": {
+                    "input": {"$cond": [{"$isArray": "$comments"}, "$comments", []]},
+                    "initialValue": 0,
+                    "in": {"$add": ["$$value", _reel_array_size("$$this.likes")]},
+                }},
+                "_rank_share_count": {"$max": [_reel_array_size("$shares"), _reel_count_value("$share_count")]},
+                "_rank_save_count": {"$max": [_reel_array_size("$saves"), _reel_count_value("$save_count")]},
+            }},
+        ]).to_list(2000)
+
+        # Search keeps the same eligibility and scoring model as the main feed,
+        # but narrows the candidate pool to the requested search term first.
+        search_term = str(q or "").strip().lower()
+        if search_term:
+            normalized_term = search_term.lstrip("#")
+            def _matches_search(reel):
+                text_fields = (
+                    reel.get("caption"),
+                    reel.get("audio_label"),
+                    reel.get("category"),
+                )
+                if any(search_term in str(value or "").lower() for value in text_fields):
+                    return True
+                raw_tags = reel.get("hashtags") or []
+                if isinstance(raw_tags, str):
+                    raw_tags = raw_tags.split()
+                return any(
+                    normalized_term and normalized_term in str(tag).strip().lower().lstrip("#")
+                    for tag in raw_tags
+                )
+            raw_candidates = [reel for reel in raw_candidates if _matches_search(reel)]
+
+        # Recency is a ranking signal, never an availability gate. The old
+        # hard cutoff made an otherwise healthy feed return [] as soon as a
+        # user's content was older than seven days. Keep recent reels first
+        # while retaining every eligible reel as a real fallback pool.
+        recent_candidates = []
+        older_candidates = []
+        for reel in raw_candidates:
+            created_at = _reels_parse_datetime(reel.get("created_at"))
+            owner_id = str(reel.get("user_id") or "")
+            if owner_id in excluded_users:
+                continue
+            if not _reels_user_can_see(reel, user_id, following_ids):
+                continue
+            if created_at >= cutoff:
+                recent_candidates.append(reel)
+            else:
+                older_candidates.append(reel)
+        candidates = recent_candidates + older_candidates
+        if not candidates:
+            return {"page": page, "limit": limit, "reels": [], "has_more": False, "ab_group": "A", "algorithm": "reels_v1"}
+
+        candidate_ids = list(dict.fromkeys(
+            reel.get("id") for reel in candidates if reel.get("id")
+        ))
+        candidate_creator_ids = list(dict.fromkeys(
+            reel.get("user_id") for reel in candidates if reel.get("user_id")
+        ))
+        candidate_categories = list(dict.fromkeys(_reels_category(reel) for reel in candidates))
+        seen_ids, negative = await asyncio.gather(
+            _reels_seen_ids(user_id, candidate_ids),
+            _reels_negative_signals(user_id, candidate_ids, candidate_creator_ids, candidate_categories),
+        )
+        filtered = [
+            reel for reel in candidates
+            if reel.get("id") not in negative["not_interested_ids"]
+            and reel.get("user_id") not in negative["hidden_creator_ids"]
+        ]
+        unseen = [reel for reel in filtered if reel.get("id") not in seen_ids]
+        if unseen:
+            filtered = unseen
+        if not filtered:
+            filtered = candidates
+
+        reel_ids = [reel.get("id") for reel in filtered if reel.get("id")]
+        (
+            live_stats,
+            top_category_rows,
+            liked_creators,
+            similar_reel_ids,
+            positive_reel_ids,
+            session_category_rows,
+            active_hour_category_rows,
+            active_tags,
+            mention_rows,
+        ) = await asyncio.gather(
+            _reels_live_stats(reel_ids),
+            _reels_user_categories(user_id),
+            _reels_liked_creators(user_id),
+            _reels_similar_user_reels(user_id),
+            _reels_positive_signals(user_id, candidate_ids),
+            _reels_session_categories(user_id),
+            _reels_active_hour_categories(user_id),
+            db.trending_tags.find({"active": True}, {"_id": 0, "tag": 1, "boost": 1}).to_list(100),
+            db.reel_mentions.aggregate([
+                {"$match": {"reel_id": {"$in": reel_ids}}},
+                {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+            ]).to_list(len(reel_ids)),
+        )
+        top_categories = set(top_category_rows)
+        session_categories = set(session_category_rows)
+        active_hour_categories = set(active_hour_category_rows)
+        tag_boosts = {str(row.get("tag")): float(row.get("boost") or 0) for row in active_tags if row.get("tag")}
+        mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
+        ab_group = "A" if int(_hl.md5(user_id.encode()).hexdigest(), 16) % 2 == 0 else "B"
+        weights = _REELS_WEIGHTS[ab_group]
+        scored = []
+
+        for reel in filtered:
+            reel_id = reel.get("id")
+            if not reel_id:
+                continue
+            stats = live_stats.get(reel_id, {})
+            total_views = max(int(reel.get("_rank_view_count") or 0), int(stats.get("total_views") or 0), 1)
+            observed_views = max(int(stats.get("total_views") or 0), 1)
+            completion_sum = float(stats.get("completion_sum") or 0)
+            completion = completion_sum / observed_views if completion_sum else float(stats.get("avg_completion") or 0)
+            avg_watch_seconds = float(stats.get("watch_seconds_sum") or 0) / observed_views
+            duration_seconds = max(float(reel.get("duration") or 0), 1.0)
+            watch_time_score = min(1.0, avg_watch_seconds / duration_seconds) if reel.get("duration") else completion
+            completion_quality = max(0.0, min(1.0, completion * 0.70 + watch_time_score * 0.30))
+            likes = int(reel.get("_rank_like_count") or 0)
+            comments = int(reel.get("_rank_comment_count") or 0)
+            comment_likes = int(reel.get("_rank_comment_likes") or 0)
+            shares = int(reel.get("_rank_share_count") or 0)
+            saves = int(reel.get("_rank_save_count") or 0)
+            mentions = mention_counts.get(reel_id, int(reel.get("mention_count") or 0))
+            # Documented intent order: share > save > comment > comment-like > like.
+            engagement_points = likes + comments * 3 + comment_likes + mentions * 2 + shares * 5 + saves * 4
+            engagement = engagement_points / total_views
+            hours_old = max(0.0, (now_utc - _reels_parse_datetime(reel.get("created_at"))).total_seconds() / 3600)
+            recency = 1.0 / (1.0 + hours_old)
+            category = _reels_category(reel)
+            affinity = 1 if reel.get("user_id") in liked_creators else 0
+            hourly_views = int(stats.get("views_1h") or 0)
+            velocity = hourly_views / max(total_views, 1)
+            velocity_score = min(1.0, velocity * 4.0)
+            is_viral = hourly_views >= REELS_ALGO_VIRAL_MIN_VIEWS_1H and velocity >= REELS_ALGO_VIRAL_RATIO
+            score = (
+                weights["completion_rate"] * completion_quality
+                + weights["engagement_rate"] * engagement
+                + weights["recency"] * recency
+                + weights["affinity"] * affinity
+                + weights["velocity"] * velocity_score
+            )
+            if category in top_categories:
+                score += 50
+            if reel.get("user_id") in liked_creators:
+                score += 30
+            if reel_id in similar_reel_ids:
+                score += 40
+            if reel_id in positive_reel_ids:
+                score += 20
+            if category in session_categories:
+                score += 35
+            if category in active_hour_categories:
+                score += 25
+            score += sum(tag_boosts.get(tag, 0) for tag in _reels_tags(reel))
+            if is_viral:
+                score += 1000
+            if category in negative["quick_skip_categories"]:
+                score -= 30
+            scored.append({
+                **reel,
+                "category": category,
+                "score": score,
+                "is_viral": is_viral,
+                "mention_count": mentions,
+                "ranking_signals": {
+                    "views": total_views,
+                    "likes": likes,
+                    "comments": comments,
+                    "comment_likes": comment_likes,
+                    "mentions": mentions,
+                    "shares": shares,
+                    "saves": saves,
+                    "engagement_points": engagement_points,
+                    "engagement_rate": round(float(engagement), 6),
+                    "completion_rate": round(float(completion_quality), 6),
+                    "avg_watch_seconds": round(float(avg_watch_seconds), 3),
+                    "velocity_1h": round(float(velocity), 6),
+                },
+            })
+
+        viral = sorted([item for item in scored if item["is_viral"]], key=lambda item: item["score"], reverse=True)
+        normal = sorted([item for item in scored if not item["is_viral"]], key=lambda item: item["score"], reverse=True)
+        ordered = (viral[:3] + viral[3:] + normal) if page == 0 else (viral[3:] + normal)
+        exploration_count = max(1, int(limit * 0.15))
+        main_slot_count = max(1, limit - exploration_count)
+        start = page * main_slot_count
+        main_slice = ordered[start:start + main_slot_count]
+        main_ids = {item.get("id") for item in main_slice}
+        exploration = [
+            item for item in scored
+            if item.get("id") not in main_ids
+            and (int(item.get("_rank_view_count") or 0) < 10
+                 or (now_utc - _reels_parse_datetime(item.get("created_at"))).days <= 30)
+        ]
+        random.Random(f"{user_id}:{page}").shuffle(exploration)
+        combined = main_slice + exploration[:exploration_count]
+        final_items = _reels_diversify(combined, limit)
+        final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
+        full_reels = await db.reels.find(
+            {"id": {"$in": final_reel_ids}}, {"_id": 0},
+        ).to_list(len(final_reel_ids)) if final_reel_ids else []
+        full_reels_by_id = {reel.get("id"): reel for reel in full_reels if reel.get("id")}
+        ranking_fields = (
+            "_rank_view_count", "_rank_like_count", "_rank_comment_count",
+            "_rank_comment_likes", "_rank_share_count", "_rank_save_count",
+            "category", "score", "is_viral", "mention_count", "ranking_signals",
+        )
+        hydrated_items = []
+        for item in final_items:
+            full_reel = full_reels_by_id.get(item.get("id"))
+            if not full_reel:
+                continue
+            ranking_data = {key: item[key] for key in ranking_fields if key in item}
+            item.update(full_reel)
+            item.update(ranking_data)
+            hydrated_items.append(item)
+        final_items = hydrated_items
+        final_reel_ids = [item.get("id") for item in final_items if item.get("id")]
+        mention_docs = {}
+        if final_reel_ids:
+            mention_docs = {
+                doc["reel_id"]: doc
+                async for doc in db.reel_mentions.find(
+                    {"target_user_id": user_id, "reel_id": {"$in": final_reel_ids}},
+                    {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1},
+                )
+            }
+        response_reels = []
+        for item in final_items:
+            mention = mention_docs.get(item.get("id"))
+            mentioned_by = (
+                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
+                if mention else None
+            )
+            shaped = _reel_to_feed_item(item, bool(mention), mentioned_by)
+            shaped.update({
+                # Keep the Reels tab relationship state identical to Home/Profile.
+                "is_following": item.get("user_id") in following_ids or item.get("user_id") == u["id"],
+                "is_follow_pending": item.get("user_id") in pending_follow_ids,
+                "category": item.get("category") or "general",
+                "score": round(float(item.get("score") or 0), 6),
+                "is_liked": user_id in (item.get("likes") or []),
+                "like_count": len(item.get("likes") or []),
+                "is_saved": user_id in (item.get("saves") or []),
+                "save_count": max(len(item.get("saves") or []), int(item.get("save_count") or 0)),
+                "comment_count": max(len(item.get("comments") or []), int(item.get("comment_count") or 0)),
+                "share_count": max(len(item.get("shares") or []), int(item.get("share_count") or 0)),
+                "view_count": max(len(item.get("views") or []), int(item.get("view_count") or 0)),
+                "mention_count": int(item.get("mention_count") or 0),
+                "ranking_signals": item.get("ranking_signals") or {},
+                "is_viral": bool(item.get("is_viral")),
+                "algorithm": "reels_v1",
+            })
+            response_reels.append(shaped)
+        return {
+            "page": page,
+            "limit": limit,
+            "reels": response_reels,
+            "has_more": start + main_slot_count < len(ordered),
+            "ab_group": ab_group,
+            "algorithm": "reels_v1",
+        }
+
+    @api.post("/reels/feedback")
+    async def submit_reels_feedback(body: dict, u=Depends(current_user)):
+        action = str(body.get("action") or "").strip().lower()
+        if action not in {"interested", "not_interested", "report", "hide_creator"}:
+            raise HTTPException(400, "action must be interested, not_interested, report, or hide_creator")
+        reel_id = str(body.get("reel_id") or "").strip()
+        if not reel_id:
+            raise HTTPException(400, "reel_id is required")
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        await db.reel_feedback.update_one(
+            {"user_id": u["id"], "reel_id": reel_id, "action": action},
+            {"$set": {"user_id": u["id"], "reel_id": reel_id, "creator_id": reel.get("user_id"), "action": action, "created_at": now().isoformat()}},
+            upsert=True,
+        )
+        return {"status": "ok", "action": action}
+
+    @api.post("/reels/onboarding")
+    async def save_reels_onboarding(body: dict, u=Depends(current_user)):
+        raw_categories = body.get("categories") or []
+        if isinstance(raw_categories, str):
+            raw_categories = [raw_categories]
+        categories = list(dict.fromkeys(str(item).strip().lower()[:40] for item in raw_categories if str(item).strip()))[:20]
+        await db.users.update_one({"id": u["id"]}, {"$set": {"onboarding_categories": categories}})
+        return {"status": "ok", "categories": categories}
+
+    @api.post("/reels/ab-metric")
+    async def log_reels_ab_metric(body: dict, u=Depends(current_user)):
+        event = str(body.get("event") or "").strip().lower()[:60]
+        if not event:
+            raise HTTPException(400, "event is required")
+        group = str(body.get("group") or "A").strip().upper()
+        if group not in {"A", "B"}:
+            group = "A"
+        await db.ab_test_events.insert_one({"user_id": u["id"], "group": group, "event": event, "created_at": now().isoformat()})
+        return {"status": "ok"}
+
+    async def _refresh_reels_rank_stats():
+        # Compute aggregate counts in Mongo so large embedded reaction arrays
+        # are not copied into the application process every refresh cycle.
+        def _array_size(field):
+            return {"$size": {"$cond": [{"$isArray": field}, field, []]}}
+
+        def _count_value(field):
+            return {"$convert": {"input": field, "to": "long", "onError": 0, "onNull": 0}}
+
+        rows = await db.reels.aggregate([
+            {"$match": {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}}},
+            {"$limit": 2000},
+            {"$project": {
+                "_id": 0,
+                "id": 1,
+                "mention_count": 1,
+                "content_views": {"$max": [_array_size("$views"), _count_value("$view_count")]},
+                "likes": _array_size("$likes"),
+                "comments": _array_size("$comments"),
+                "comment_likes": {"$reduce": {
+                    "input": {"$cond": [{"$isArray": "$comments"}, "$comments", []]},
+                    "initialValue": 0,
+                    "in": {"$add": ["$$value", _array_size("$$this.likes")]},
+                }},
+                "shares": _array_size("$shares"),
+                "saves": _array_size("$saves"),
+            }},
+        ]).to_list(2000)
+        reel_ids = [r.get("id") for r in rows if r.get("id")]
+        mention_rows = await db.reel_mentions.aggregate([
+            {"$match": {"reel_id": {"$in": reel_ids}}},
+            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
+        ]).to_list(len(reel_ids))
+        mention_counts = {row["_id"]: int(row.get("count") or 0) for row in mention_rows}
+        for reel in rows:
+            reel_id = reel.get("id")
+            if not reel_id:
+                continue
+            await db.reel_rank_stats.update_one(
+                {"reel_id": reel_id},
+                {"$set": {
+                    "reel_id": reel_id,
+                    "content_views": int(reel.get("content_views") or 0),
+                    "likes": int(reel.get("likes") or 0),
+                    "comments": int(reel.get("comments") or 0),
+                    "comment_likes": int(reel.get("comment_likes") or 0),
+                    "shares": int(reel.get("shares") or 0),
+                    "saves": int(reel.get("saves") or 0),
+                    "mentions": mention_counts.get(reel_id, int(reel.get("mention_count") or 0)),
+                    "updated_at": now().isoformat(),
+                }},
+                upsert=True,
+            )
+
+    async def _reels_algorithm_worker():
+        while True:
+            try:
+                await _refresh_reels_rank_stats()
+            except Exception:
+                logging.exception("Reels rank refresh failed")
+            await asyncio.sleep(600)
+
+    @app.on_event("startup")
+    async def start_reels_algorithm_worker():
+        global REELS_ALGO_TASK
+        try:
+            await db.reel_view_events.create_index([("user_id", 1), ("event_at", -1)])
+            await db.reel_view_events.create_index([("reel_id", 1), ("event_at", -1)])
+            await db.reel_rank_stats.create_index("reel_id", unique=True)
+            await db.reel_feedback.create_index([("user_id", 1), ("reel_id", 1), ("action", 1)], unique=True)
+        except Exception:
+            logging.exception("Reels algorithm index setup failed")
+        if REELS_ALGO_TASK is None or REELS_ALGO_TASK.done():
+            REELS_ALGO_TASK = asyncio.create_task(_reels_algorithm_worker())
+
+    # Register all routes
+    app.include_router(api)
+    app.include_router(ai_router, prefix="/api/ai", tags=["ai-agent"])
+    app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
+    app.include_router(library_router, prefix="/api/library", tags=["library"])
+
+    print("==> [DIAG] server.py loaded OK — app is ready", file=_sys.stderr, flush=True)
+
+except Exception as _boot_err:
+    print(f"==> [DIAG] FATAL BOOT ERROR: {type(_boot_err).__name__}: {_boot_err}", file=_sys.stderr, flush=True)
+    _tb.print_exc(file=_sys.stderr)
+    _sys.exit(1)
+
