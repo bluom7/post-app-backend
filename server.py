@@ -1352,64 +1352,110 @@ postbluom.online"""
 
     # ── Profile ───────────────────────────────────────────────────
     @api.patch("/profile")
-    async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
-        upd = {k: v for k, v in p.model_dump().items() if v is not None}
-        for field in ("dob_month_day_visibility", "dob_year_visibility"):
-            if field in upd and upd[field] not in _DOB_VISIBILITY_OPTIONS:
-                raise HTTPException(400, "Invalid birthday visibility")
-        if "username" in upd:
-            if u.get("username_locked") and upd["username"] != u.get("username"):
-                raise HTTPException(400, "Verified accounts cannot change their username")
-            try:
-                await ensure_username_unique(upd["username"], exclude_uid=u["id"])
-            except ValueError as e:
-                raise HTTPException(400, str(e))
-            upd["handle"] = f"@{upd['username']}"
-        if upd:
-            await db.users.update_one({"id": u["id"]}, {"$set": upd})
-
-            # Build denormalized updates and run them in the background
-            # so the response returns immediately to the client
-            post_upd = {}
-            if "name" in upd: post_upd["user_name"] = upd["name"]
-            if "handle" in upd: post_upd["user_handle"] = upd["handle"]
-            if "avatar_bg" in upd: post_upd["avatar_bg"] = upd["avatar_bg"]
-            if "avatar_letter" in upd: post_upd["avatar_letter"] = upd["avatar_letter"]
-            if "avatar_photo" in upd: post_upd["avatar_photo"] = upd["avatar_photo"]
-
-            comment_upd = {}
-            if "name" in upd: comment_upd["comments.$[c].user_name"] = upd["name"]
-            if "handle" in upd: comment_upd["comments.$[c].user_handle"] = upd["handle"]
-            if "avatar_bg" in upd: comment_upd["comments.$[c].avatar_bg"] = upd["avatar_bg"]
-            if "avatar_letter" in upd: comment_upd["comments.$[c].avatar_letter"] = upd["avatar_letter"]
-            if "avatar_photo" in upd: comment_upd["comments.$[c].avatar_photo"] = upd["avatar_photo"]
-
-            msg_upd = {}
-            if "name" in upd: msg_upd["from_name"] = upd["name"]
-            if "avatar_bg" in upd: msg_upd["avatar_bg"] = upd["avatar_bg"]
-            if "avatar_photo" in upd: msg_upd["avatar_photo"] = upd["avatar_photo"]
-
-            uid = u["id"]
-            async def _bg():
+        async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
+            # Keep explicit nulls so users can remove their avatar or cover photo.
+            upd = p.model_dump(exclude_unset=True)
+            for field in ("avatar_photo", "cover_photo", "profile_video", "cover_video"):
+                value = upd.get(field)
+                if isinstance(value, str) and value.strip().lower().startswith("data:"):
+                    raise HTTPException(400, "Upload profile media before saving; inline data URLs are not accepted.")
+            for field in ("dob_month_day_visibility", "dob_year_visibility"):
+                if field in upd and upd[field] not in _DOB_VISIBILITY_OPTIONS:
+                    raise HTTPException(400, "Invalid birthday visibility")
+            if "username" in upd:
+                if u.get("username_locked") and upd["username"] != u.get("username"):
+                    raise HTTPException(400, "Verified accounts cannot change their username")
                 try:
-                    if post_upd:
-                        await db.posts.update_many({"user_id": uid}, {"$set": post_upd})
-                    if comment_upd:
-                        await db.posts.update_many(
-                            {"comments.user_id": uid},
-                            {"$set": comment_upd},
-                            array_filters=[{"c.user_id": uid}],
-                        )
-                    if msg_upd:
-                        await db.messages.update_many({"from_id": uid}, {"$set": msg_upd})
-                except Exception:
-                    pass
-            asyncio.create_task(_bg())
+                    await ensure_username_unique(upd["username"], exclude_uid=u["id"])
+                except ValueError as e:
+                    raise HTTPException(400, str(e))
+                upd["handle"] = f"@{upd['username']}"
 
-        return await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+            if upd:
+                uid = u["id"]
+                old_handle = u.get("handle") or ""
+                await db.users.update_one({"id": uid}, {"$set": upd})
+
+                owner_fields = {}
+                comment_fields = {}
+                message_fields = {}
+                notification_fields = {}
+                mention_fields = {}
+                for source, target in (("name", "user_name"), ("handle", "user_handle"),
+                                       ("avatar_bg", "avatar_bg"), ("avatar_letter", "avatar_letter"),
+                                       ("avatar_photo", "avatar_photo")):
+                    if source in upd:
+                        owner_fields[target] = upd[source]
+                        comment_fields[target] = upd[source]
+                if "name" in upd:
+                    message_fields["from_name"] = upd["name"]
+                    notification_fields["from_user_name"] = upd["name"]
+                    mention_fields["source_user_name"] = upd["name"]
+                if "handle" in upd:
+                    message_fields["from_handle"] = upd["handle"]
+                    mention_fields["source_user_handle"] = upd["handle"]
+                if "avatar_bg" in upd:
+                    message_fields["from_avatar_bg"] = upd["avatar_bg"]
+                    message_fields["avatar_bg"] = upd["avatar_bg"]
+                    notification_fields["from_user_bg"] = upd["avatar_bg"]
+                    mention_fields["source_user_bg"] = upd["avatar_bg"]
+                if "avatar_letter" in upd:
+                    message_fields["from_avatar_letter"] = upd["avatar_letter"]
+                    message_fields["avatar_letter"] = upd["avatar_letter"]
+                    notification_fields["from_user_letter"] = upd["avatar_letter"]
+                    mention_fields["source_user_letter"] = upd["avatar_letter"]
+                if "avatar_photo" in upd:
+                    message_fields["from_avatar_photo"] = upd["avatar_photo"]
+                    message_fields["avatar_photo"] = upd["avatar_photo"]
+                    notification_fields["from_user_avatar"] = upd["avatar_photo"]
+                    mention_fields["source_user_avatar"] = upd["avatar_photo"]
+
+                sync_operations = []
+                if owner_fields:
+                    sync_operations.extend([
+                        db.posts.update_many({"user_id": uid}, {"$set": owner_fields}),
+                        db.reels.update_many({"user_id": uid}, {"$set": owner_fields}),
+                        db.world_reports.update_many({"user_id": uid}, {"$set": owner_fields}),
+                    ])
+                if comment_fields:
+                    post_comment_fields = {f"comments.$[c].{key}": value for key, value in comment_fields.items()}
+                    reel_comment_fields = {f"comments.$[c].{key}": value for key, value in comment_fields.items()}
+                    report_comment_fields = {f"comments.$[c].{key}": value for key, value in comment_fields.items()}
+                    reply_fields = {f"comments.$[c].replies.$[r].{key}": value for key, value in comment_fields.items()}
+                    sync_operations.extend([
+                        db.posts.update_many({"comments.user_id": uid}, {"$set": post_comment_fields}, array_filters=[{"c.user_id": uid}]),
+                        db.reels.update_many({"comments.user_id": uid}, {"$set": reel_comment_fields}, array_filters=[{"c.user_id": uid}]),
+                        db.reels.update_many({"comments.replies.user_id": uid}, {"$set": reply_fields}, array_filters=[{"c.replies.user_id": uid}, {"r.user_id": uid}]),
+                        db.world_reports.update_many({"comments.user_id": uid}, {"$set": report_comment_fields}, array_filters=[{"c.user_id": uid}]),
+                    ])
+                if message_fields:
+                    sync_operations.extend([
+                        db.messages.update_many({"from_id": uid}, {"$set": message_fields}),
+                        db.group_messages.update_many({"from_id": uid}, {"$set": message_fields}),
+                    ])
+                if notification_fields:
+                    sync_operations.append(db.notifications.update_many({"from_user_id": uid}, {"$set": notification_fields}))
+                if mention_fields:
+                    sync_operations.append(db.reel_mentions.update_many({"source_user_id": uid}, {"$set": mention_fields}))
+                if owner_fields and old_handle:
+                    shared_post_fields = {f"shared_post.{key}": value for key, value in owner_fields.items()}
+                    shared_reel_fields = {f"shared_reel.{key}": value for key, value in owner_fields.items()}
+                    for collection in (db.messages, db.group_messages):
+                        sync_operations.append(collection.update_many({"shared_post.user_handle": old_handle}, {"$set": shared_post_fields}))
+                        sync_operations.append(collection.update_many({"shared_reel.user_handle": old_handle}, {"$set": shared_reel_fields}))
+
+                if sync_operations:
+                    results = await asyncio.gather(*sync_operations, return_exceptions=True)
+                    errors = [result for result in results if isinstance(result, Exception)]
+                    if errors:
+                        for error in errors:
+                            logging.error("Profile snapshot sync failed for user %s: %s", uid, error)
+                        raise HTTPException(503, "Profile was saved, but some avatar copies did not update. Please save the profile again to retry.")
+
+            return await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
 
 
-    @api.get("/data/activity-log")
+        @api.get("/data/activity-log")
     async def get_activity_log(u=Depends(current_user)):
         """Return the signed-in user's recent posts and comments with safe display metadata."""
         def public_profile(profile):
@@ -2345,7 +2391,8 @@ postbluom.online"""
         c = {
             "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
-            "avatar_letter": u["avatar_letter"], "text": p.text,
+            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
+            "text": p.text,
             "created_at": now().isoformat(),
         }
         await db.posts.update_one({"id": pid}, {"$push": {"comments": c}})
@@ -2486,7 +2533,7 @@ postbluom.online"""
         message = {
             "id": message_id,
             "from_id": u["id"],
-            "from_name": u["name"],
+            "from_name": u["name"], "from_handle": u["handle"], "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"),
             "to_id": friend_id,
             "text": "",
             "photo_url": None,
@@ -3068,7 +3115,7 @@ postbluom.online"""
         m = {
             "id":               str(uuid.uuid4()),
             "from_id":          u["id"],
-            "from_name":        u["name"],
+            "from_name": u["name"], "from_handle": u["handle"], "from_avatar_bg": u["avatar_bg"], "from_avatar_letter": u["avatar_letter"], "from_avatar_photo": u.get("avatar_photo"),
             "to_id":            p.to_user_id,
             "text":             p.text,
             "photo_url":        p.photo_url,
