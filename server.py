@@ -2219,7 +2219,7 @@ postbluom.online"""
                 pass
         return doc
 
-    def _reel_to_feed_item(r: dict, mentioned: bool = False, mentioned_by: Optional[dict] = None) -> dict:
+    def _reel_to_feed_item(r: dict, mentioned: bool = False, mentioned_by: Optional[dict] = None, compact_comments: bool = False) -> dict:
         """Shapes a raw `reels` doc so it can sit alongside `posts` docs in the
         home feed / profile grid — same field names the frontend post card and
         PostMedia component already know how to render (video_url, content,
@@ -2229,6 +2229,12 @@ postbluom.online"""
         likes_ids = r.get("likes", [])
         views_raw = r.get("views", [])
         view_count = len(set(views_raw)) if isinstance(views_raw, list) else 0
+        comments = r.get("comments", [])
+        comments = comments if isinstance(comments, list) else []
+        try:
+            comment_count = max(len(comments), int(r.get("comment_count") or 0), int(r.get("comments_count") or 0))
+        except (TypeError, ValueError):
+            comment_count = len(comments)
         return {
             "id": r["id"],
             "user_id": r["user_id"],
@@ -2266,7 +2272,9 @@ postbluom.online"""
             "audience": "public",
             "comments_enabled": True,
             "likes": [{"user_id": uid, "color": "#FF3B30"} for uid in likes_ids],
-            "comments": r.get("comments", []),
+            "comments": [] if compact_comments else comments,
+            "comment_count": comment_count,
+            "comments_count": comment_count,
             # Keep raw viewer IDs out of the feed; expose the real aggregate count.
             "views": [],
             "views_count": view_count,
@@ -2381,14 +2389,56 @@ postbluom.online"""
             ]
             if feed:
                 visible_author_filters.insert(0, {"user_id": {"$in": feed_visible_user_ids}})
-            posts_task = db.posts.aggregate([
+            posts_pipeline = [
                 {"$match": query},
                 {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
                 {"$match": {"$or": visible_author_filters}},
                 {"$sort": {"created_at": -1}},
                 {"$limit": fetch_n},
-                {"$project": {"_id": 0, "_author": 0}},
-            ]).to_list(fetch_n)
+            ]
+            if feed:
+                # Keep legacy text posts visible, but never serialize inline media,
+                # growing comment arrays, or every historical viewer ID to the API.
+                inline_media = {}
+                for field in ("photo_url", "video_url", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"):
+                    field_path = "$" + field
+                    inline_media[field] = {"$cond": [
+                        {"$regexMatch": {"input": {"$convert": {"input": field_path, "to": "string", "onError": "", "onNull": ""}}, "regex": "^data:"}},
+                        "",
+                        field_path,
+                    ]}
+                safe_photo_urls = {"$cond": [{"$isArray": "$photo_urls"}, "$photo_urls", []]}
+                inline_media["photo_urls"] = {"$filter": {
+                    "input": safe_photo_urls,
+                    "as": "media_url",
+                    "cond": {"$not": [{"$regexMatch": {"input": {"$convert": {"input": "$$media_url", "to": "string", "onError": "", "onNull": ""}}, "regex": "^data:"}}]},
+                }}
+                safe_views = {"$cond": [{"$isArray": "$views"}, "$views", []]}
+                is_viewed_expr = {"$in": [u["id"], safe_views]}
+                view_count_expr = {"$max": [
+                    {"$size": safe_views},
+                    {"$convert": {"input": "$views_count", "to": "long", "onError": 0, "onNull": 0}},
+                    {"$convert": {"input": "$view_count", "to": "long", "onError": 0, "onNull": 0}},
+                ]}
+                comment_count_expr = {"$max": [
+                    {"$size": {"$cond": [{"$isArray": "$comments"}, "$comments", []]}},
+                    {"$convert": {"input": "$comment_count", "to": "long", "onError": 0, "onNull": 0}},
+                    {"$convert": {"input": "$comments_count", "to": "long", "onError": 0, "onNull": 0}},
+                ]}
+                inline_media.update({
+                    "views": {"$cond": [is_viewed_expr, [u["id"]], []]},
+                    "views_count": view_count_expr,
+                    "view_count": view_count_expr,
+                    "is_viewed": is_viewed_expr,
+                })
+                posts_pipeline.extend([
+                    {"$addFields": inline_media},
+                    {"$addFields": {"comment_count": comment_count_expr, "comments_count": comment_count_expr}},
+                    {"$project": {"_id": 0, "_author": 0, "comments": 0}},
+                ])
+            else:
+                posts_pipeline.append({"$project": {"_id": 0, "_author": 0}})
+            posts_task = db.posts.aggregate(posts_pipeline).to_list(fetch_n)
         else:
             posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
         if include_reels:
@@ -2423,14 +2473,26 @@ postbluom.online"""
                     ]}
 
                     def _feed_reel_pipeline(base_query, result_limit):
-                        return [
+                        pipeline = [
                             {"$match": base_query},
                             {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
                             {"$match": reel_visibility},
                             {"$sort": {"created_at": -1}},
                             {"$limit": result_limit},
-                            {"$project": {"_id": 0, "_author": 0}},
                         ]
+                        if feed:
+                            comment_count_expr = {"$max": [
+                                {"$size": {"$cond": [{"$isArray": "$comments"}, "$comments", []]}},
+                                {"$convert": {"input": "$comment_count", "to": "long", "onError": 0, "onNull": 0}},
+                                {"$convert": {"input": "$comments_count", "to": "long", "onError": 0, "onNull": 0}},
+                            ]}
+                            pipeline.extend([
+                                {"$addFields": {"comment_count": comment_count_expr, "comments_count": comment_count_expr}},
+                                {"$project": {"_id": 0, "_author": 0, "comments": 0}},
+                            ])
+                        else:
+                            pipeline.append({"$project": {"_id": 0, "_author": 0}})
+                        return pipeline
 
                     normal_query = {"$and": [legacy_media_filter, reel_safety]}
                     mentioned_query = {"$and": [
@@ -2483,7 +2545,7 @@ postbluom.online"""
                 {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
                 if mention else None
             )
-            feed_item = _reel_to_feed_item(reel, bool(mention), mentioned_by)
+            feed_item = _reel_to_feed_item(reel, bool(mention), mentioned_by, compact_comments=feed)
             if mention and mention.get("created_at"):
                 # A repost is a new feed event. Sort it by repost time rather
                 # than the original reel upload time.
@@ -2493,7 +2555,7 @@ postbluom.online"""
         merged = posts_raw + merged_reels
         merged.sort(key=lambda d: d.get("created_at") or "", reverse=True)
         posts = merged[skip:skip + limit]
-        unviewed_ids = [p["id"] for p in posts if not p.get("is_reel") and u["id"] not in p.get("views", [])]
+        unviewed_ids = [p["id"] for p in posts if not p.get("is_reel") and not p.get("is_viewed")]
         if unviewed_ids:
             # Fire-and-forget: don't block the response for view tracking
             async def _mark_viewed():
@@ -4509,6 +4571,11 @@ postbluom.online"""
         following_ids = list(set(u.get("following", []) or []))
         query: dict = {
             "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
+            "$nor": [
+                {"video_url": {"$regex": "^data:"}},
+                {"photo_url": {"$regex": "^data:"}},
+                {"photo_urls": {"$elemMatch": {"$regex": "^data:"}}},
+            ],
             "$or": [
                 {"audience": {"$exists": False}},
                 {"audience": "public"},
@@ -6194,7 +6261,14 @@ postbluom.online"""
             return {"$convert": {"input": field, "to": "long", "onError": 0, "onNull": 0}}
 
         raw_candidates = await db.reels.aggregate([
-            {"$match": {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}}},
+            {"$match": {
+                "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
+                "$nor": [
+                    {"video_url": {"$regex": "^data:"}},
+                    {"photo_url": {"$regex": "^data:"}},
+                    {"photo_urls": {"$elemMatch": {"$regex": "^data:"}}},
+                ],
+            }},
             {"$sort": {"created_at": -1}},
             {"$limit": 2000},
             {"$project": {
@@ -6428,7 +6502,7 @@ postbluom.online"""
                 "share_count": {"$max": [_reel_array_size("$shares"), _reel_count_value("$share_count")]},
                 "view_count": _reel_unique_array_size("$views"),
             }},
-            {"$project": {"_id": 0, "likes": 0, "saves": 0, "shares": 0, "views": 0}},
+            {"$project": {"_id": 0, "likes": 0, "saves": 0, "shares": 0, "views": 0, "comments": 0}},
         ]).to_list(len(final_reel_ids)) if final_reel_ids else []
         full_reels_by_id = {reel.get("id"): reel for reel in full_reels if reel.get("id")}
         ranking_fields = (
@@ -6463,7 +6537,7 @@ postbluom.online"""
                 {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
                 if mention else None
             )
-            shaped = _reel_to_feed_item(item, bool(mention), mentioned_by)
+            shaped = _reel_to_feed_item(item, bool(mention), mentioned_by, compact_comments=True)
             shaped.update({
                 # Keep the Reels tab relationship state identical to Home/Profile.
                 "is_following": item.get("user_id") in following_ids or item.get("user_id") == u["id"],
