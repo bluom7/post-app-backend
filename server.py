@@ -2612,7 +2612,7 @@ postbluom.online"""
 
     @api.post("/posts/{pid}/like")
     async def like_post(pid: str, p: LikeIn, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1})
         if not post: raise HTTPException(404, "Not found")
         # Atomic: first remove any existing like from this user, then add new one if color given.
         # Avoids race condition where two simultaneous requests overwrite each other's likes.
@@ -2633,7 +2633,7 @@ postbluom.online"""
 
     @api.post("/posts/{pid}/comments")
     async def add_comment(pid: str, p: CommentIn, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1, "comments_enabled": 1})
         if not post: raise HTTPException(404, "Post not found")
         if not post.get("comments_enabled", True):
             raise HTTPException(403, "Comments are turned off for this post")
@@ -2655,10 +2655,18 @@ postbluom.online"""
 
     @api.delete("/posts/{pid}/comments/{cid}")
     async def delete_comment(pid: str, cid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
-        if not post: raise HTTPException(404, "Post not found")
-        comment = next((c for c in post.get("comments", []) if c["id"] == cid), None)
-        if not comment: raise HTTPException(404, "Comment not found")
+        post = await db.posts.find_one(
+            {"id": pid, "comments.id": cid},
+            {"_id": 0, "user_id": 1, "comments": {"$elemMatch": {"id": cid}}},
+        )
+        if not post:
+            exists = await db.posts.find_one({"id": pid}, {"_id": 0, "id": 1})
+            if not exists:
+                raise HTTPException(404, "Post not found")
+            raise HTTPException(404, "Comment not found")
+        comment = (post.get("comments") or [None])[0]
+        if not comment:
+            raise HTTPException(404, "Comment not found")
         if comment["user_id"] != u["id"] and post["user_id"] != u["id"]:
             raise HTTPException(403, "Cannot delete")
         await db.posts.update_one({"id": pid}, {"$pull": {"comments": {"id": cid}}})
@@ -2671,7 +2679,7 @@ postbluom.online"""
 
     @api.post("/posts/{pid}/save")
     async def save_post(pid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "saves": 1})
         if not post: raise HTTPException(404, "Post not found")
         if u["id"] in (post.get("saves") or []):
             await db.posts.update_one({"id": pid}, {"$pull": {"saves": u["id"]}})
