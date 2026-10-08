@@ -419,6 +419,125 @@ try:
                 del _trans_cache[k]
         _trans_cache[key] = (value, _time.monotonic())
 
+    def _safe_media_expr(value_expr):
+        return {"$cond": [
+            {"$eq": [{"$type": value_expr}, "string"]},
+            {"$cond": [
+                {"$regexMatch": {"input": value_expr, "regex": "^data:", "options": "i"}},
+                None, value_expr,
+            ]},
+            value_expr,
+        ]}
+
+    def _safe_media_array_expr(array_expr):
+        return {"$cond": [
+            {"$isArray": array_expr},
+            {"$filter": {
+                "input": array_expr,
+                "as": "media_item",
+                "cond": {"$cond": [
+                    {"$eq": [{"$type": "$$media_item"}, "string"]},
+                    {"$not": [{"$regexMatch": {"input": "$$media_item", "regex": "^data:", "options": "i"}}]},
+                    True,
+                ]},
+            }},
+            array_expr,
+        ]}
+
+    def _safe_media_overlay_expr(array_expr):
+        return {"$cond": [
+            {"$isArray": array_expr},
+            {"$filter": {
+                "input": array_expr,
+                "as": "overlay",
+                "cond": {"$cond": [
+                    {"$and": [
+                        {"$eq": [{"$type": "$$overlay"}, "object"]},
+                        {"$eq": [{"$type": "$$overlay.url"}, "string"]},
+                    ]},
+                    {"$not": [{"$regexMatch": {"input": "$$overlay.url", "regex": "^data:", "options": "i"}}]},
+                    True,
+                ]},
+            }},
+            array_expr,
+        ]}
+
+    def _safe_media_object_expr(object_expr):
+        return {"$cond": [
+            {"$eq": [{"$type": object_expr}, "object"]},
+            {"$mergeObjects": [object_expr, {"avatar_photo": _safe_media_expr(object_expr + ".avatar_photo")}]},
+            object_expr,
+        ]}
+
+    def _safe_media_object_array_expr(array_expr):
+        return {"$cond": [
+            {"$isArray": array_expr},
+            {"$map": {"input": array_expr, "as": "embedded_user", "in": _safe_media_object_expr("$$embedded_user")}},
+            array_expr,
+        ]}
+
+    def _safe_media_comments_expr(array_expr):
+        replies = _safe_media_object_array_expr("$$comment.replies")
+        safe_comment = {"$cond": [
+            {"$eq": [{"$type": "$$comment"}, "object"]},
+            {"$mergeObjects": [
+                "$$comment",
+                {"avatar_photo": _safe_media_expr("$$comment.avatar_photo"), "replies": replies},
+            ]},
+            "$$comment",
+        ]}
+        return {"$cond": [
+            {"$isArray": array_expr},
+            {"$map": {"input": array_expr, "as": "comment", "in": safe_comment}},
+            array_expr,
+        ]}
+
+    def _safe_media_sanitize_stage(scalar_fields=(), array_fields=(), overlay_fields=(), comment_fields=()):
+        updates = {}
+        for field in scalar_fields:
+            updates[field] = _safe_media_expr("$" + field)
+        for field in array_fields:
+            updates[field] = _safe_media_array_expr("$" + field)
+        for field in overlay_fields:
+            updates[field] = _safe_media_overlay_expr("$" + field)
+        for field in comment_fields:
+            updates[field] = _safe_media_comments_expr("$" + field)
+        return {"$set": updates}
+
+    async def _safe_media_find(collection, query, scalar_fields=(), array_fields=(), overlay_fields=(), comment_fields=(), projection=None, sort=None, skip=0, limit=100):
+        pipeline = [{"$match": query}]
+        if sort:
+            pipeline.append({"$sort": sort})
+        if skip:
+            pipeline.append({"$skip": skip})
+        if limit is not None:
+            pipeline.append({"$limit": limit})
+        pipeline.append(_safe_media_sanitize_stage(scalar_fields, array_fields, overlay_fields, comment_fields))
+        if projection:
+            pipeline.append({"$project": projection})
+        return await collection.aggregate(pipeline).to_list(limit)
+
+    async def _safe_media_find_one(collection, query, **options):
+        rows = await _safe_media_find(collection, query, limit=1, **options)
+        return rows[0] if rows else None
+
+    async def _safe_user_find_one(query, projection=None):
+        rows = await _safe_media_find(
+            db.users, query,
+            scalar_fields=("avatar_photo", "cover_photo", "profile_video", "cover_video"),
+            projection=projection or {"_id": 0, "password_hash": 0, "otp_hash": 0},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def _safe_user_find(query, projection=None, sort=None, skip=0, limit=100):
+        return await _safe_media_find(
+            db.users, query,
+            scalar_fields=("avatar_photo", "cover_photo", "profile_video", "cover_video"),
+            projection=projection or {"_id": 0, "password_hash": 0, "otp_hash": 0},
+            sort=sort, skip=skip, limit=limit,
+        )
+
     # ── Auth helpers ─────────────────────────────────────────────
     async def raw_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
         if not creds:
@@ -429,7 +548,7 @@ try:
             sid = payload.get("sid")
         except Exception:
             raise HTTPException(401, "Invalid token")
-        u = await db.users.find_one({"id": uid}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+        u = await _safe_user_find_one({"id": uid})
         if not u:
             raise HTTPException(401, "User not found")
         if sid:
@@ -1414,7 +1533,7 @@ postbluom.online"""
                     pass
             asyncio.create_task(_bg())
 
-        return await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+        return await _safe_user_find_one({"id": u["id"]})
 
 
     @api.get("/data/activity-log")
@@ -1425,31 +1544,36 @@ postbluom.online"""
             return {"id":profile.get("id"),"name":profile.get("name"),"handle":profile.get("handle"),"username":profile.get("username"),"avatar_photo":profile.get("avatar_photo"),"avatar_bg":profile.get("avatar_bg"),"avatar_letter":profile.get("avatar_letter"),"is_badge_verified":bool(profile.get("is_badge_verified"))}
         actor = public_profile(u)
         posts = []
-        async for post in db.posts.find({"user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"photo_url":1,"photo_urls":1,"video_url":1}).sort("created_at",-1).limit(50):
+        owned_posts = await _safe_media_find(db.posts, {"user_id": u["id"]}, scalar_fields=("photo_url", "video_url"), array_fields=("photo_urls",), projection={"_id": 0, "id": 1, "content": 1, "created_at": 1, "photo_url": 1, "photo_urls": 1, "video_url": 1}, sort={"created_at": -1}, limit=50)
+        for post in owned_posts:
             posts.append({"id":post.get("id"),"type":"post","content":post.get("content") or "(media post)","created_at":post.get("created_at"),"author":actor,"has_media":bool(post.get("photo_url") or post.get("photo_urls") or post.get("video_url")),"media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
         comments=[]; owner_ids=set()
-        async for post in db.posts.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"comments":1,"photo_url":1,"photo_urls":1}):
+        commented_posts = await _safe_media_find(db.posts, {"comments.user_id": u["id"]}, scalar_fields=("photo_url",), array_fields=("photo_urls",), comment_fields=("comments",), projection={"_id": 0, "id": 1, "content": 1, "created_at": 1, "user_id": 1, "comments": 1, "photo_url": 1, "photo_urls": 1}, limit=200)
+        for post in commented_posts:
             owner_id=post.get("user_id")
             if owner_id: owner_ids.add(owner_id)
             for comment in post.get("comments",[]):
                 if comment.get("user_id")==u["id"]:
                     comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id,"target_media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
-        async for reel in db.reels.find({"comments.user_id":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"comments":1,"photo_url":1}):
+        commented_reels = await _safe_media_find(db.reels, {"comments.user_id": u["id"]}, scalar_fields=("photo_url",), comment_fields=("comments",), projection={"_id": 0, "id": 1, "caption": 1, "created_at": 1, "user_id": 1, "comments": 1, "photo_url": 1}, limit=200)
+        for reel in commented_reels:
             owner_id=reel.get("user_id")
             if owner_id: owner_ids.add(owner_id)
             for comment in reel.get("comments",[]):
                 if comment.get("user_id")==u["id"]:
                     comments.append({"id":comment.get("id"),"type":"comment","comment":comment.get("text", ""),"created_at":comment.get("created_at"),"actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
         like_items=[]
-        async for post in db.posts.find({"likes.user_id":u["id"]},{"_id":0,"id":1,"content":1,"created_at":1,"user_id":1,"photo_url":1,"photo_urls":1}):
+        liked_posts = await _safe_media_find(db.posts, {"likes.user_id": u["id"]}, scalar_fields=("photo_url",), array_fields=("photo_urls",), projection={"_id": 0, "id": 1, "content": 1, "created_at": 1, "user_id": 1, "photo_url": 1, "photo_urls": 1}, limit=200)
+        for post in liked_posts:
             owner_id=post.get("user_id")
             if owner_id: owner_ids.add(owner_id)
             like_items.append({"id":"post:"+post.get("id"),"type":"like","actor":actor,"target_type":"post","target_id":post.get("id"),"target_content":post.get("content") or "(media post)","target_created_at":post.get("created_at"),"target_user_id":owner_id,"target_media_url":(post.get("photo_urls") or [post.get("photo_url")])[0] if (post.get("photo_urls") or post.get("photo_url")) else None})
-        async for reel in db.reels.find({"likes":u["id"]},{"_id":0,"id":1,"caption":1,"created_at":1,"user_id":1,"photo_url":1}):
+        liked_reels = await _safe_media_find(db.reels, {"likes": u["id"]}, scalar_fields=("photo_url",), projection={"_id": 0, "id": 1, "caption": 1, "created_at": 1, "user_id": 1, "photo_url": 1}, limit=200)
+        for reel in liked_reels:
             owner_id=reel.get("user_id")
             if owner_id: owner_ids.add(owner_id)
             like_items.append({"id":"reel:"+reel.get("id"),"type":"like","actor":actor,"target_type":"reel","target_id":reel.get("id"),"target_content":reel.get("caption") or "(reel)","target_created_at":reel.get("created_at"),"target_user_id":owner_id,"target_media_url":reel.get("photo_url")})
-        owners=await db.users.find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1,"is_badge_verified":1}).to_list(len(owner_ids)) if owner_ids else []
+        owners=await _safe_user_find({"id":{"$in":list(owner_ids)}},{"_id":0,"id":1,"name":1,"handle":1,"username":1,"avatar_photo":1,"avatar_bg":1,"avatar_letter":1,"is_badge_verified":1},limit=len(owner_ids)) if owner_ids else []
         owner_map={profile.get("id"):public_profile(profile) for profile in owners}
         for item in comments: item["target_author"]=owner_map.get(item.get("target_user_id"))
         comments.sort(key=lambda item:item.get("created_at") or "",reverse=True)
@@ -1515,9 +1639,9 @@ postbluom.online"""
     async def get_blocked_users(u=Depends(current_user)):
         ids = u.get("blocked_users", [])
         if not ids: return []
-        users = await db.users.find(
-            {"id": {"$in": ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}
-        ).to_list(len(ids))
+        users = await _safe_user_find(
+            {"id": {"$in": ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}, limit=len(ids)
+        )
         return [_apply_dob_visibility(profile, u["id"]) for profile in users]
 
     @api.get("/users/me/follow-requests")
@@ -1528,7 +1652,7 @@ postbluom.online"""
         from_ids = [r["from_id"] for r in pending]
         PUBLIC = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
                   "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1, "location": 1, "about": 1}
-        users_list = await db.users.find({"id": {"$in": from_ids}}, PUBLIC).to_list(500) if from_ids else []
+        users_list = await _safe_user_find({"id": {"$in": from_ids}}, PUBLIC, limit=500) if from_ids else []
         users_map  = {u2["id"]: u2 for u2 in users_list}
         for r in pending:
             r["from_user"] = users_map.get(r["from_id"], {})
@@ -1563,15 +1687,15 @@ postbluom.online"""
                 {"username": {"$regex": q, "$options": "i"}},
                 {"location": {"$regex": q, "$options": "i"}},
             ]
-        users = await db.users.find(
-            query, {"_id": 0, "password_hash": 0, "otp_hash": 0}
-        ).skip(skip).limit(limit).to_list(limit)
+        users = await _safe_user_find(
+            query, {"_id": 0, "password_hash": 0, "otp_hash": 0}, skip=skip, limit=limit
+        )
         total = await db.users.count_documents(query)
         return {"users": [_apply_dob_visibility(profile, u["id"]) for profile in users], "total": total, "skip": skip, "limit": limit}
 
     @api.get("/users/{user_id}")
     async def get_user(user_id: str, u=Depends(current_user)):
-        user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0, "otp_hash": 0})
+        user = await _safe_user_find_one({"id": user_id})
         if not user: raise HTTPException(404, "User not found")
         is_self      = user_id == u["id"]
         is_follower  = u["id"] in user.get("followers", [])
@@ -1637,7 +1761,7 @@ postbluom.online"""
     @api.post("/users/{user_id}/follow")
     async def follow_user(user_id: str, u=Depends(current_user)):
         if user_id == u["id"]: raise HTTPException(400, "Can't follow yourself")
-        target = await db.users.find_one({"id": user_id})
+        target = await _safe_user_find_one({"id": user_id})
         if not target: raise HTTPException(404, "User not found")
         if u["id"] in target.get("blocked_users", []) or user_id in u.get("blocked_users", []): raise HTTPException(403, "Action not allowed")
         if target.get("is_private"):
@@ -1659,22 +1783,22 @@ postbluom.online"""
 
     @api.get("/users/{user_id}/followers")
     async def get_followers(user_id: str, u=Depends(current_user)):
-        user = await db.users.find_one({"id": user_id})
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "followers": 1, "following": 1})
         if not user: raise HTTPException(404, "User not found")
-        profiles = await db.users.find(
+        profiles = await _safe_user_find(
             {"id": {"$in": user.get("followers", [])}},
-            {"_id": 0, "password_hash": 0, "otp_hash": 0},
-        ).to_list(500)
+            {"_id": 0, "password_hash": 0, "otp_hash": 0}, limit=500,
+        )
         return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
 
     @api.get("/users/{user_id}/following")
     async def get_following(user_id: str, u=Depends(current_user)):
-        user = await db.users.find_one({"id": user_id})
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "followers": 1, "following": 1})
         if not user: raise HTTPException(404, "User not found")
-        profiles = await db.users.find(
+        profiles = await _safe_user_find(
             {"id": {"$in": user.get("following", [])}},
-            {"_id": 0, "password_hash": 0, "otp_hash": 0},
-        ).to_list(500)
+            {"_id": 0, "password_hash": 0, "otp_hash": 0}, limit=500,
+        )
         return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
 
     # ── Follow Requests (private accounts) ───────────────────────
@@ -1756,8 +1880,8 @@ postbluom.online"""
         # File seek/tell is blocking for disk-backed uploads; keep it off the event loop.
         return await asyncio.to_thread(_measure_upload_size, file)
 
-    CLOUDINARY_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
-    _cloudinary_upload_semaphore = asyncio.Semaphore(2)
+    CLOUDINARY_UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024
+    _cloudinary_upload_semaphore = asyncio.Semaphore(1)
 
     async def _upload_large_to_cloudinary(file, **options):
         """Upload video/audio in bounded chunks and limit concurrent transfers."""
@@ -2008,16 +2132,28 @@ postbluom.online"""
             conditions.append({field + ".url": {"$regex": "^data:image/", "$options": "i"}})
         return {"$or": conditions} if conditions else {"_id": {"$exists": False}}
 
-    async def _migrate_collection_media(collection, video_fields=(), image_fields=(), image_array_fields=(), overlay_fields=()):
+    def _migration_value(doc, dotted_field):
+        value = doc
+        for part in dotted_field.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
+
+    async def _migrate_collection_media(collection, video_fields=(), image_fields=(), image_array_fields=(), overlay_fields=(), max_documents=25, after_id=None):
         projection = {"_id": 0, "id": 1}
         for field in tuple(video_fields) + tuple(image_fields) + tuple(image_array_fields) + tuple(overlay_fields):
             projection[field] = 1
-        result = {"documents_migrated": 0, "documents_failed": 0, "media_migrated": 0, "media_failed": 0}
-        cursor = collection.find(
-            _legacy_media_query(video_fields, image_fields, image_array_fields, overlay_fields), projection
-        ).batch_size(1)
+        result = {"documents_migrated": 0, "documents_failed": 0, "media_migrated": 0, "media_failed": 0, "batch_count": 0, "last_scanned_id": None, "has_more": False}
+        query = _legacy_media_query(video_fields, image_fields, image_array_fields, overlay_fields)
+        if after_id is not None:
+            query = {"$and": [query, {"id": {"$gt": after_id}}]}
+        cursor = collection.find(query, projection).sort("id", 1).batch_size(1).limit(max_documents)
         async for doc in cursor:
             doc_id = doc.get("id")
+            result["batch_count"] += 1
+            if doc_id is not None:
+                result["last_scanned_id"] = str(doc_id)
             if doc_id is None:
                 result["documents_failed"] += 1
                 result["media_failed"] += 1
@@ -2030,7 +2166,7 @@ postbluom.online"""
             image_cache = {}
 
             for field in video_fields:
-                value = doc.get(field)
+                value = _migration_value(doc, field)
                 if isinstance(value, str) and value.lstrip().lower().startswith("data:video/"):
                     if value not in video_cache:
                         video_cache[value] = await _migrate_one_video(value, f"legacy_{safe_id}_{field}")
@@ -2049,7 +2185,7 @@ postbluom.online"""
                 return image_cache[value]
 
             for field in image_fields:
-                value = doc.get(field)
+                value = _migration_value(doc, field)
                 if isinstance(value, str) and value.lstrip().lower().startswith("data:image/"):
                     new_url = await migrate_image(value, f"legacy_{safe_id}_{field}")
                     if new_url:
@@ -2114,7 +2250,13 @@ postbluom.online"""
             if failed:
                 result["documents_failed"] += 1
                 result["media_failed"] += failed
+        if result["batch_count"] == max_documents and result["last_scanned_id"] is not None:
+            more_query = _legacy_media_query(video_fields, image_fields, image_array_fields, overlay_fields)
+            more_query = {"$and": [more_query, {"id": {"$gt": result["last_scanned_id"]}}]}
+            result["has_more"] = bool(await collection.find_one(more_query, {"_id": 0, "id": 1}))
         return result
+
+    _media_migration_lock = asyncio.Lock()
 
     @api.post("/admin/migrate-videos-to-cloudinary")
     @api.post("/admin/migrate-legacy-media-to-cloudinary")
@@ -2123,35 +2265,99 @@ postbluom.online"""
             raise HTTPException(403, "Not authorized")
         if not ((CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET) or CLOUDINARY_URL):
             raise HTTPException(500, "Media hosting is not configured on the server")
+        if _media_migration_lock.locked():
+            raise HTTPException(409, "A media migration is already running")
+        try:
+            cursor_payload = await request.json()
+        except Exception:
+            cursor_payload = {}
+        after_ids = cursor_payload.get("after_ids", {}) if isinstance(cursor_payload, dict) else {}
+        if not isinstance(after_ids, dict):
+            after_ids = {}
 
-        posts = await _migrate_collection_media(
-            db.posts,
-            video_fields=("video_url",),
-            image_fields=("photo_url", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"),
-            image_array_fields=("photo_urls",),
-            overlay_fields=("sticker_overlays",),
-        )
-        reels = await _migrate_collection_media(
-            db.reels,
-            video_fields=("video_url",),
-            image_fields=("photo_url", "music_artwork", "thumbnail_url"),
-            overlay_fields=("sticker_overlays",),
-        )
-        users = await _migrate_collection_media(
-            db.users,
-            video_fields=("profile_video", "cover_video"),
-            image_fields=("avatar_photo", "cover_photo"),
-        )
+        async with _media_migration_lock:
+            specs = {
+                "posts": (db.posts, {"video_fields": ("video_url",), "image_fields": ("photo_url", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"), "image_array_fields": ("photo_urls",), "overlay_fields": ("sticker_overlays",)}),
+                "reels": (db.reels, {"video_fields": ("video_url",), "image_fields": ("photo_url", "music_artwork", "thumbnail_url"), "overlay_fields": ("sticker_overlays",)}),
+                "users": (db.users, {"video_fields": ("profile_video", "cover_video"), "image_fields": ("avatar_photo", "cover_photo")}),
+                "groups": (db.groups, {"image_fields": ("avatar_photo",)}),
+                "messages": (db.messages, {"image_fields": ("photo_url", "gif_url", "audio_url", "from_avatar_photo", "shared_post.photo_url", "shared_post.avatar_photo", "shared_reel.video_url", "shared_reel.avatar_photo")}),
+                "group_messages": (db.group_messages, {"image_fields": ("photo_url", "gif_url", "audio_url", "from_avatar_photo", "shared_post.photo_url", "shared_post.avatar_photo", "shared_reel.video_url", "shared_reel.avatar_photo")}),
+                "reel_mentions": (db.reel_mentions, {"image_fields": ("source_user_avatar",)}),
+            }
+            results = {}
+            for name, (collection, fields) in specs.items():
+                results[name] = await _migrate_collection_media(collection, max_documents=25, after_id=after_ids.get(name), **fields)
+
         return {
             "ok": True,
-            "posts_migrated": posts["documents_migrated"],
-            "posts_failed": posts["documents_failed"],
-            "reels_migrated": reels["documents_migrated"],
-            "reels_failed": reels["documents_failed"],
-            "users_migrated": users["documents_migrated"],
-            "users_failed": users["documents_failed"],
-            "media_migrated": posts["media_migrated"] + reels["media_migrated"] + users["media_migrated"],
-            "media_failed": posts["media_failed"] + reels["media_failed"] + users["media_failed"],
+            "batch_limit_per_collection": 25,
+            "input_after_ids": after_ids,
+            "collections": results,
+            "posts_migrated": results["posts"]["documents_migrated"],
+            "posts_failed": results["posts"]["documents_failed"],
+            "reels_migrated": results["reels"]["documents_migrated"],
+            "reels_failed": results["reels"]["documents_failed"],
+            "users_migrated": results["users"]["documents_migrated"],
+            "users_failed": results["users"]["documents_failed"],
+            "media_migrated": sum(item["media_migrated"] for item in results.values()),
+            "media_failed": sum(item["media_failed"] for item in results.values()),
+        }
+
+    async def _audit_media_field(collection, field, unwind_fields=()):
+        pipeline = [{"$unwind": "$" + path} for path in unwind_fields]
+        pipeline.append({"$facet": {
+            "inline": [
+                {"$match": {field: {"$regex": "^data:", "$options": "i"}}},
+                {"$project": {
+                    "kind": {"$cond": [
+                        {"$regexMatch": {"input": "$" + field, "regex": "^data:video/", "options": "i"}}, "video",
+                        {"$cond": [{"$regexMatch": {"input": "$" + field, "regex": "^data:audio/", "options": "i"}}, "audio", "image"]},
+                    ]},
+                    "bytes": {"$strLenBytes": "$" + field},
+                }},
+                {"$group": {"_id": "$kind", "references": {"$sum": 1}, "encoded_bytes": {"$sum": "$bytes"}}},
+            ],
+            "cloudinary": [
+                {"$match": {field: {"$regex": r"^https?://res\.cloudinary\.com/", "$options": "i"}}},
+                {"$group": {"_id": None, "references": {"$sum": 1}}},
+            ],
+        }})
+        rows = await collection.aggregate(pipeline).to_list(1)
+        facets = rows[0] if rows else {"inline": [], "cloudinary": []}
+        inline = facets.get("inline", [])
+        return {
+            "inline_references": sum(row.get("references", 0) for row in inline),
+            "inline_encoded_bytes": sum(row.get("encoded_bytes", 0) for row in inline),
+            "inline_by_kind": {str(row.get("_id")): {"references": row.get("references", 0), "encoded_bytes": row.get("encoded_bytes", 0)} for row in inline},
+            "cloudinary_url_references": facets.get("cloudinary", [{}])[0].get("references", 0) if facets.get("cloudinary") else 0,
+        }
+
+    @api.get("/admin/audit-media-storage")
+    async def audit_media_storage(request: Request):
+        if not MIGRATION_SECRET or request.headers.get("x-migration-key") != MIGRATION_SECRET:
+            raise HTTPException(403, "Not authorized")
+        specs = {
+            "posts": (db.posts, {"video_url": (), "photo_url": (), "photo_urls": ("photo_urls",), "gif_url": (), "music_artwork": (), "music_preview_url": (), "thumbnail_url": (), "sticker_overlays.url": ("sticker_overlays",)}),
+            "reels": (db.reels, {"video_url": (), "photo_url": (), "music_artwork": (), "thumbnail_url": (), "sticker_overlays.url": ("sticker_overlays",)}),
+            "users": (db.users, {"avatar_photo": (), "cover_photo": (), "profile_video": (), "cover_video": ()}),
+            "groups": (db.groups, {"avatar_photo": ()}),
+            "messages": (db.messages, {"photo_url": (), "gif_url": (), "audio_url": (), "shared_post.photo_url": (), "shared_post.avatar_photo": (), "shared_reel.video_url": (), "shared_reel.avatar_photo": ()}),
+            "group_messages": (db.group_messages, {"photo_url": (), "gif_url": (), "audio_url": (), "shared_post.photo_url": (), "shared_post.avatar_photo": (), "shared_reel.video_url": (), "shared_reel.avatar_photo": ()}),
+            "reel_mentions": (db.reel_mentions, {"source_user_avatar": ()}),
+        }
+        report = {}
+        for name, (collection, fields) in specs.items():
+            report[name] = {}
+            for field, unwind_fields in fields.items():
+                report[name][field] = await _audit_media_field(collection, field, unwind_fields)
+        return {
+            "ok": True,
+            "scope": "MongoDB media fields; Cloudinary counts are stored URL references, not provider-side asset verification",
+            "collections": report,
+            "inline_references": sum(item["inline_references"] for fields in report.values() for item in fields.values()),
+            "inline_encoded_bytes": sum(item["inline_encoded_bytes"] for fields in report.values() for item in fields.values()),
+            "cloudinary_url_references": sum(item["cloudinary_url_references"] for fields in report.values() for item in fields.values()),
         }
 
     @api.post("/posts")
@@ -2359,17 +2565,18 @@ postbluom.online"""
                 exclusion_filter = {"user_id": {"$nin": list(excluded_user_ids)}}
                 query = {"$and": [query, exclusion_filter]} if query else exclusion_filter
 
-        # Older Compose versions stored photo/video data URLs directly in posts.
-        # They are valid historical media and must remain visible in home/profile;
-        # the frontend now uploads new photos to hosted URLs before creating posts.
-        # Keep the filter for the separate reels query below, but never apply it
-        # to regular posts or old posts disappear from both screens.
+        # Mongo strips legacy data URLs before documents reach Python or JSON.
+        # Reels remain excluded from the normal mixed feed until their migration.
         legacy_media_filter = {"$nor": [
             {"video_url": {"$regex": "^data:"}},
             {"photo_url": {"$regex": "^data:"}},
             {"photo_urls": {"$elemMatch": {"$regex": "^data:"}}},
         ]}
         feed_user_filter = query.get("user_id")
+        post_media_stage = _safe_media_sanitize_stage(
+            scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"),
+            array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+        )
 
         # Reels get merged into the home feed and profile grid (but not search).
         include_reels = (feed or bool(user_id)) and not q
@@ -2387,17 +2594,23 @@ postbluom.online"""
                 {"$match": {"$or": visible_author_filters}},
                 {"$sort": {"created_at": -1}},
                 {"$limit": fetch_n},
+                post_media_stage,
                 {"$project": {"_id": 0, "_author": 0}},
             ]).to_list(fetch_n)
         else:
-            posts_task = db.posts.find(query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            posts_task = db.posts.aggregate([
+                {"$match": query}, {"$sort": {"created_at": -1}}, {"$limit": fetch_n},
+                post_media_stage, {"$project": {"_id": 0}},
+            ]).to_list(fetch_n)
         if include_reels:
             # Mention visibility is private to the signed-in viewer, never the profile target.
             mention_target_id = u["id"]
-            viewer_mentions = await db.reel_mentions.find(
-                {"target_user_id": mention_target_id},
-                {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
-            ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            viewer_mentions = await _safe_media_find(
+                db.reel_mentions, {"target_user_id": mention_target_id},
+                scalar_fields=("source_user_avatar",),
+                projection={"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
+                sort={"created_at": -1}, limit=fetch_n,
+            )
             mentioned_ids = list(dict.fromkeys(doc["reel_id"] for doc in viewer_mentions if doc.get("reel_id")))
 
             async def _load_feed_reels():
@@ -2429,6 +2642,10 @@ postbluom.online"""
                             {"$match": reel_visibility},
                             {"$sort": {"created_at": -1}},
                             {"$limit": result_limit},
+                            _safe_media_sanitize_stage(
+                                scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+                                overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+                            ),
                             {"$project": {"_id": 0, "_author": 0}},
                         ]
 
@@ -2448,9 +2665,19 @@ postbluom.online"""
                 else:
                     normal_query = {"$and": [{"user_id": feed_user_filter}, legacy_media_filter]}
                     mentioned_query = {"$and": [{"id": {"$in": mentioned_ids}}, legacy_media_filter]}
-                    normal_task = db.reels.find(normal_query, {"_id": 0}).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+                    reel_media_stage = _safe_media_sanitize_stage(
+                        scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+                        overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+                    )
+                    normal_task = db.reels.aggregate([
+                        {"$match": normal_query}, {"$sort": {"created_at": -1}}, {"$limit": fetch_n},
+                        reel_media_stage, {"$project": {"_id": 0}},
+                    ]).to_list(fetch_n)
                     mentioned_task = (
-                        db.reels.find(mentioned_query, {"_id": 0}).sort("created_at", -1).limit(len(mentioned_ids)).to_list(len(mentioned_ids))
+                        db.reels.aggregate([
+                            {"$match": mentioned_query}, {"$sort": {"created_at": -1}}, {"$limit": len(mentioned_ids)},
+                            reel_media_stage, {"$project": {"_id": 0}},
+                        ]).to_list(len(mentioned_ids))
                         if mentioned_ids else _empty_list()
                     )
                 normal_reels, mentioned_reels = await asyncio.gather(normal_task, mentioned_task)
@@ -2508,7 +2735,7 @@ postbluom.online"""
 
     @api.get("/posts/{pid}")
     async def get_post(pid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid}, {"_id": 0})
+        post = await _safe_media_find_one(db.posts, {"id": pid}, scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"), array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",), projection={"_id": 0})
         if not post: raise HTTPException(404, "Post not found")
         if u["id"] not in post.get("views", []):
             await db.posts.update_one({"id": pid}, {"$addToSet": {"views": u["id"]}})
@@ -2517,7 +2744,7 @@ postbluom.online"""
 
     @api.delete("/posts/{pid}")
     async def delete_post(pid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1})
         if not post: raise HTTPException(404, "Not found")
         if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
         await db.posts.delete_one({"id": pid})
@@ -2525,7 +2752,7 @@ postbluom.online"""
 
     @api.patch("/posts/{pid}")
     async def edit_post(pid: str, p: PostIn, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1})
         if not post: raise HTTPException(404, "Post not found")
         if post["user_id"] != u["id"]: raise HTTPException(403, "Not your post")
         _validate_post_video(p.video_url, p.video_duration)
@@ -2546,11 +2773,16 @@ postbluom.online"""
                 upd["photo_urls"] = p.photo_urls
                 upd["photo_url"] = p.photo_urls[0] if p.photo_urls else None
         await db.posts.update_one({"id": pid}, {"$set": upd})
-        return await db.posts.find_one({"id": pid}, {"_id": 0})
+        return await _safe_media_find_one(
+            db.posts, {"id": pid},
+            scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"),
+            array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+            projection={"_id": 0},
+        )
 
     @api.post("/posts/{pid}/like")
     async def like_post(pid: str, p: LikeIn, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1})
         if not post: raise HTTPException(404, "Not found")
         # Atomic: first remove any existing like from this user, then add new one if color given.
         # Avoids race condition where two simultaneous requests overwrite each other's likes.
@@ -2571,7 +2803,7 @@ postbluom.online"""
 
     @api.post("/posts/{pid}/comments")
     async def add_comment(pid: str, p: CommentIn, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1, "comments_enabled": 1})
         if not post: raise HTTPException(404, "Post not found")
         if not post.get("comments_enabled", True):
             raise HTTPException(403, "Comments are turned off for this post")
@@ -2593,7 +2825,7 @@ postbluom.online"""
 
     @api.delete("/posts/{pid}/comments/{cid}")
     async def delete_comment(pid: str, cid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1, "comments.id": 1, "comments.user_id": 1})
         if not post: raise HTTPException(404, "Post not found")
         comment = next((c for c in post.get("comments", []) if c["id"] == cid), None)
         if not comment: raise HTTPException(404, "Comment not found")
@@ -2609,7 +2841,7 @@ postbluom.online"""
 
     @api.post("/posts/{pid}/save")
     async def save_post(pid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "saves": 1})
         if not post: raise HTTPException(404, "Post not found")
         if u["id"] in (post.get("saves") or []):
             await db.posts.update_one({"id": pid}, {"$pull": {"saves": u["id"]}})
@@ -2619,9 +2851,14 @@ postbluom.online"""
 
     @api.post("/posts/{pid}/repost")
     async def repost_post(pid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid})
+        post = await _safe_media_find_one(
+            db.posts, {"id": pid},
+            scalar_fields=("photo_url", "video_url", "avatar_photo"), array_fields=("photo_urls",),
+            projection={"_id": 0, "id": 1, "user_id": 1, "content": 1, "accent": 1, "photo_url": 1,
+                        "photo_urls": 1, "video_url": 1, "video_duration": 1, "user_name": 1, "user_handle": 1},
+        )
         if not post: raise HTTPException(404, "Post not found")
-        already = await db.posts.find_one({"repost_of": pid, "user_id": u["id"]})
+        already = await db.posts.find_one({"repost_of": pid, "user_id": u["id"]}, {"_id": 0, "id": 1})
         if already:
             await db.posts.delete_one({"id": already["id"]})
             await db.posts.update_one({"id": pid}, {"$pull": {"reposts": u["id"]}})
@@ -2658,11 +2895,11 @@ postbluom.online"""
         if friend_id == u["id"]:
             raise HTTPException(400, "You cannot share a post with yourself")
 
-        post = await db.posts.find_one(
-            {"id": pid},
-            {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1,
-             "user_name": 1, "user_handle": 1, "avatar_bg": 1,
-             "avatar_letter": 1, "avatar_photo": 1},
+        post = await _safe_media_find_one(
+            db.posts, {"id": pid}, scalar_fields=("photo_url", "avatar_photo"), array_fields=("photo_urls",),
+            projection={"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1,
+                        "user_name": 1, "user_handle": 1, "avatar_bg": 1,
+                        "avatar_letter": 1, "avatar_photo": 1},
         )
         if not post:
             raise HTTPException(404, "Post not found")
@@ -2759,7 +2996,7 @@ postbluom.online"""
     async def mention_in_post(pid: str, body: dict, u=Depends(current_user)):
         mentioned_username = (body.get("username") or "").lstrip("@")
         if not mentioned_username: raise HTTPException(400, "username required")
-        target = await db.users.find_one({"username": mentioned_username})
+        target = await _safe_user_find_one({"username": mentioned_username})
         if not target: raise HTTPException(404, "User not found")
         if target["id"] == u["id"]: return {"ok": True}
         await db.notifications.insert_one({
@@ -2780,7 +3017,7 @@ postbluom.online"""
         source reel so the original photo/video URL and natural aspect ratio
         remain unchanged.
         """
-        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0})
+        reel = await _safe_media_find_one(db.reels, {"id": reel_id}, scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"), overlay_fields=("sticker_overlays",), comment_fields=("comments",), projection={"_id": 0})
         if not reel:
             raise HTTPException(404, "Reel not found")
         raw_target_user_id = body.get("target_user_id")
@@ -2789,7 +3026,7 @@ postbluom.online"""
         target_user_id = raw_target_user_id.strip()
         if not target_user_id:
             raise HTTPException(400, "target_user_id required")
-        target = await db.users.find_one({"id": target_user_id}, {"_id": 0})
+        target = await _safe_user_find_one({"id": target_user_id})
         if not target:
             raise HTTPException(404, "User not found")
         blocked_by_target = target_user_id in (u.get("blocked_users") or []) or u["id"] in (target.get("blocked_users") or [])
@@ -2894,7 +3131,7 @@ postbluom.online"""
     async def report_post(pid: str, body: dict, u=Depends(current_user)):
         reason = (body.get("reason") or "").strip()
         if not reason: raise HTTPException(400, "Reason required")
-        post = await db.posts.find_one({"id": pid})
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1})
         if not post: raise HTTPException(404, "Post not found")
         already = await db.reports.find_one({"post_id": pid, "reported_by": u["id"]})
         if already: return {"ok": True, "already": True}
@@ -2948,14 +3185,17 @@ postbluom.online"""
                 r["type"] = "post" if r.get("post_id") else "reel"
             target_id = r.get("reported_user_id")
             if target_id:
-                target = await db.users.find_one({"id": target_id}, {"_id": 0, "name": 1, "handle": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1})
+                target = await _safe_user_find_one(
+            {"id": target_id},
+            {"_id": 0, "name": 1, "handle": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1},
+        )
                 if target:
                     r["reported_user"] = target
             source = None
             if r.get("post_id"):
-                source = await db.posts.find_one({"id": r["post_id"]}, {"_id": 0, "photo_urls": 1, "photo_url": 1, "video_url": 1})
+                source = await _safe_media_find_one(db.posts, {"id": r["post_id"]}, scalar_fields=("photo_url", "video_url"), array_fields=("photo_urls",), projection={"_id": 0, "photo_urls": 1, "photo_url": 1, "video_url": 1})
             elif r.get("reel_id"):
-                source = await db.reels.find_one({"id": r["reel_id"]}, {"_id": 0, "photo_urls": 1, "photo_url": 1, "video_url": 1})
+                source = await _safe_media_find_one(db.reels, {"id": r["reel_id"]}, scalar_fields=("photo_url", "video_url"), array_fields=("photo_urls",), projection={"_id": 0, "photo_urls": 1, "photo_url": 1, "video_url": 1})
             if source:
                 photos = source.get("photo_urls") or ([source.get("photo_url")] if source.get("photo_url") else [])
                 if photos:
@@ -2980,11 +3220,7 @@ postbluom.online"""
     @api.get("/users/me/saved-posts")
     async def get_saved_posts(u=Depends(current_user)):
         user_id = u["id"]
-        posts_cursor = db.posts.find({"saves": user_id}).sort("created_at", -1).limit(50)
-        result = []
-        async for p in posts_cursor:
-            p.pop("_id", None)
-            result.append(p)
+        result = await _safe_media_find(db.posts, {"saves": user_id}, scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"), array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",), sort={"created_at": -1}, projection={"_id": 0}, limit=50)
         return {"posts": result}
 
     @api.get("/users/{target_user_id}/saved-posts")
@@ -2994,18 +3230,14 @@ postbluom.online"""
             raise HTTPException(404, "User not found")
         if target.get("is_private") and target_user_id != u["id"] and u["id"] not in (target.get("followers") or []):
             return {"posts": [], "private_locked": True}
-        posts_cursor = db.posts.find({"saves": target_user_id}).sort("created_at", -1).limit(50)
-        result = []
-        async for p in posts_cursor:
-            p.pop("_id", None)
-            result.append(p)
+        result = await _safe_media_find(db.posts, {"saves": target_user_id}, scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"), array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",), sort={"created_at": -1}, projection={"_id": 0}, limit=50)
         return {"posts": result}
 
     # ── Friends ───────────────────────────────────────────────────
     @api.post("/friends/request")
     async def friend_request(p: FriendIn, u=Depends(current_user)):
         if p.target_user_id == u["id"]: raise HTTPException(400, "Can't friend yourself")
-        target = await db.users.find_one({"id": p.target_user_id})
+        target = await _safe_user_find_one({"id": p.target_user_id})
         if not target: raise HTTPException(404, "User not found")
         if target.get("account_type") == "organisation":
             raise HTTPException(400, "You can only follow organisation accounts, not connect")
@@ -3071,11 +3303,11 @@ postbluom.online"""
                          "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1,
                          "category": 1, "location": 1, "about": 1, "cover_photo": 1,
                          "stats": 1, "following": 1}
-        friends = await db.users.find({"id": {"$in": friend_ids}}, PUBLIC_FIELDS).to_list(500)
+        friends = await _safe_user_find({"id": {"$in": friend_ids}}, PUBLIC_FIELDS, limit=500)
         in_from_ids  = [r["from_id"] for r in pending_in]
         out_to_ids   = [r["to_id"]   for r in pending_out]
-        in_users_list  = await db.users.find({"id": {"$in": in_from_ids}},  PUBLIC_FIELDS).to_list(500) if in_from_ids  else []
-        out_users_list = await db.users.find({"id": {"$in": out_to_ids}},   PUBLIC_FIELDS).to_list(500) if out_to_ids   else []
+        in_users_list  = await _safe_user_find({"id": {"$in": in_from_ids}}, PUBLIC_FIELDS, limit=500) if in_from_ids else []
+        out_users_list = await _safe_user_find({"id": {"$in": out_to_ids}}, PUBLIC_FIELDS, limit=500) if out_to_ids else []
         in_users  = {usr["id"]: usr for usr in in_users_list}
         out_users = {usr["id"]: usr for usr in out_users_list}
         for r in pending_in:  r["from_user"] = in_users.get(r["from_id"], {})
@@ -3244,26 +3476,28 @@ postbluom.online"""
         # ── Build reply-to preview ────────────────────────────────
         reply_to_preview = None
         if p.reply_to_id:
-            ref = await db.messages.find_one(
-                {"id": p.reply_to_id},
-                {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "photo_url": 1}
-            )
+            ref_rows = await db.messages.aggregate([
+                {"$match": {"id": p.reply_to_id}},
+                {"$project": {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "has_photo": {"$and": [{"$ne": [{"$ifNull": ["$photo_url", None]}, None]}, {"$ne": ["$photo_url", ""]}]}}},
+            ]).to_list(1)
+            ref = ref_rows[0] if ref_rows else None
             if ref:
                 reply_to_preview = {
                     "id":       p.reply_to_id,
                     "from_name": ref.get("from_name", ""),
                     "from_id":  ref.get("from_id", ""),
                     "text":     (ref.get("text") or "")[:120],
-                    "has_photo": bool(ref.get("photo_url")),
+                    "has_photo": bool(ref.get("has_photo")),
                 }
 
         # ── Build shared-post preview ─────────────────────────────
         shared_post = None
         if p.shared_post_id:
-            sp = await db.posts.find_one(
-                {"id": p.shared_post_id},
-                {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1,
-                 "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1}
+            sp = await _safe_media_find_one(
+                db.posts, {"id": p.shared_post_id},
+                scalar_fields=("photo_url", "avatar_photo"), array_fields=("photo_urls",),
+                projection={"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1,
+                            "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1},
             )
             if sp:
                 shared_post = {
@@ -3281,10 +3515,10 @@ postbluom.online"""
         # ── Build shared-reel preview ─────────────────────────────
         shared_reel = None
         if p.shared_reel_id:
-            sr = await db.reels.find_one(
-                {"id": p.shared_reel_id},
-                {"_id": 0, "id": 1, "caption": 1, "video_url": 1,
-                 "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1}
+            sr = await _safe_media_find_one(
+                db.reels, {"id": p.shared_reel_id}, scalar_fields=("video_url", "avatar_photo"),
+                projection={"_id": 0, "id": 1, "caption": 1, "video_url": 1,
+                            "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1},
             )
             if sr:
                 shared_reel = {
@@ -3370,13 +3604,14 @@ postbluom.online"""
                 "last_mood":   {"$first": "$mood_color"},
             }},
         ]
+        pipeline.append(_safe_media_sanitize_stage(scalar_fields=("last_photo", "last_gif", "last_audio")))
         convs      = await db.messages.aggregate(pipeline).to_list(200)
         user_ids   = [c["_id"] for c in convs]
         pub = {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
                "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1,
                "followers": 1, "following": 1,
                "is_badge_verified": 1, "is_online": 1, "last_seen": 1}
-        users_list = await db.users.find({"id": {"$in": user_ids}}, pub).to_list(200)
+        users_list = await _safe_user_find({"id": {"$in": user_ids}}, pub, limit=200)
         for uu in users_list:
             uu["followers_count"] = len(uu.get("followers") or [])
             uu["following_count"] = len(uu.get("following") or [])
@@ -3425,13 +3660,17 @@ postbluom.online"""
         # This is the critical fix: previously, skip/limit ran first then Python filtered,
         # meaning cleared messages could re-appear when the conversation was re-opened.
         fq = {**q, "deleted_for": {"$ne": u["id"]}, "deleted_for_everyone": {"$ne": True}}
-        msgs  = await db.messages.find(fq, {"_id": 0}).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
+        msgs = await _safe_media_find(
+            db.messages, fq,
+            scalar_fields=("photo_url", "gif_url", "audio_url", "from_avatar_photo", "shared_post.photo_url", "shared_post.avatar_photo"),
+            projection={"_id": 0}, sort={"created_at": 1}, skip=skip, limit=limit,
+        )
         total = await db.messages.count_documents(fq)
         return {"messages": msgs, "total": total, "skip": skip, "limit": limit}
 
     @api.delete("/messages/{msg_id}")
     async def delete_message(msg_id: str, delete_for: str = "self", u=Depends(current_user)):
-        msg = await db.messages.find_one({"id": msg_id})
+        msg = await db.messages.find_one({"id": msg_id}, {"_id": 0, "from_id": 1, "to_id": 1})
         if not msg:
             raise HTTPException(404, "Message not found")
         if delete_for == "everyone":
@@ -3884,7 +4123,7 @@ postbluom.online"""
                 {"username": {"$regex": q, "$options": "i"}},
                 {"email": {"$regex": q, "$options": "i"}},
             ]
-        users_list = await db.users.find(query, {"_id": 0, "password_hash": 0, "otp_hash": 0}).skip(skip).limit(limit).to_list(limit)
+        users_list = await _safe_user_find(query, {"_id": 0, "password_hash": 0, "otp_hash": 0}, skip=skip, limit=limit)
         total = await db.users.count_documents(query)
         return {"users": users_list, "total": total}
 
@@ -4572,7 +4811,11 @@ postbluom.online"""
     @api.get("/reels/{reel_id}/remixes")
     async def list_reel_remixes(reel_id: str, u=Depends(current_user)):
         """Return the source reel and public reels using the same audio."""
-        source = await db.reels.find_one({"id": reel_id}, {"_id": 0})
+        source = await _safe_media_find_one(
+            db.reels, {"id": reel_id},
+            scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+            overlay_fields=("sticker_overlays",), comment_fields=("comments",), projection={"_id": 0},
+        )
         if not source:
             raise HTTPException(404, "Reel not found")
         excluded = set((u.get("blocked_users", []) or []) + (u.get("muted_users", []) or []))
@@ -4602,7 +4845,12 @@ postbluom.online"""
         }
         if excluded:
             query["user_id"] = {"$nin": list(excluded)}
-        rows = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
+        rows = await _safe_media_find(
+            db.reels, query,
+            scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+            overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+            projection={"_id": 0}, sort={"created_at": -1}, limit=50,
+        )
         if not any(str(row.get("id")) == str(reel_id) for row in rows):
             rows.insert(0, source)
         for row in rows:
@@ -4647,7 +4895,12 @@ postbluom.online"""
         if category and category.lower() != "all":
             query["category"] = {"$regex": category, "$options": "i"}
         pool_limit = min(limit * 6, 300)
-        reels_raw = await db.reels.find(query, {"_id": 0}).sort("created_at", -1).skip(0).limit(pool_limit).to_list(pool_limit)
+        reels_raw = await _safe_media_find(
+            db.reels, query,
+            scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+            overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+            projection={"_id": 0}, sort={"created_at": -1}, limit=pool_limit,
+        )
         mention_rows = await db.reel_mentions.aggregate([
             {"$match": {"reel_id": {"$in": [r.get("id") for r in reels_raw if r.get("id")]}}},
             {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
@@ -4790,7 +5043,12 @@ postbluom.online"""
             ]}
             if excluded:
                 reel_q["user_id"] = {"$nin": excluded}
-            reels_found = await db.reels.find(reel_q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+            reels_found = await _safe_media_find(
+                db.reels, reel_q,
+                scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+                overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+                projection={"_id": 0}, sort={"created_at": -1}, skip=skip, limit=limit,
+            )
             following_ids = set(u.get("following", []))
             for r in reels_found:
                 likes = r.get("likes") or []
@@ -4904,7 +5162,7 @@ postbluom.online"""
 
     @api.get("/reels/{reel_id}/comments")
     async def get_reel_comments(reel_id: str, u=Depends(current_user)):
-        reel = await db.reels.find_one({"id": reel_id}, {"comments": 1, "_id": 0})
+        reel = await _safe_media_find_one(db.reels, {"id": reel_id}, comment_fields=("comments",), projection={"_id": 0, "comments": 1})
         if not reel:
             raise HTTPException(404, "Reel not found")
         comments = reel.get("comments", []) or []
@@ -5088,7 +5346,7 @@ postbluom.online"""
     async def report_reel(reel_id: str, body: dict, u=Depends(current_user)):
         reason = (body.get("reason") or "").strip()
         if not reason: raise HTTPException(400, "Reason required")
-        reel = await db.reels.find_one({"id": reel_id})
+        reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "user_id": 1})
         if not reel: raise HTTPException(404, "Reel not found")
         already = await db.reports.find_one({"reel_id": reel_id, "reported_by": u["id"]})
         if already: return {"ok": True, "already": True}
@@ -5143,7 +5401,10 @@ postbluom.online"""
 
     @api.get("/groups")
     async def list_groups(u=Depends(current_user)):
-        grps = await db.groups.find({"members": u["id"]}, {"_id": 0}).sort("last_message_at", -1).to_list(100)
+        grps = await _safe_media_find(
+            db.groups, {"members": u["id"]}, scalar_fields=("avatar_photo",),
+            projection={"_id": 0}, sort={"last_message_at": -1}, limit=100,
+        )
         result = []
         for g in grps:
             unread = await db.group_messages.count_documents({
@@ -5155,13 +5416,14 @@ postbluom.online"""
 
     @api.get("/groups/{group_id}")
     async def get_group(group_id: str, u=Depends(current_user)):
-        g = await db.groups.find_one({"id": group_id}, {"_id": 0})
+        g = await _safe_media_find_one(db.groups, {"id": group_id}, scalar_fields=("avatar_photo",), projection={"_id": 0})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
-        member_docs = await db.users.find(
+        member_docs = await _safe_user_find(
             {"id": {"$in": g["members"]}},
-            {"_id": 0, "id": 1, "name": 1, "handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1, "bio": 1, "is_online": 1, "is_badge_verified": 1}
-        ).to_list(200)
+            {"_id": 0, "id": 1, "name": 1, "handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1, "bio": 1, "is_online": 1, "is_badge_verified": 1},
+            limit=200,
+        )
         g["member_details"] = member_docs
         return g
 
@@ -5263,9 +5525,11 @@ postbluom.online"""
         g = await db.groups.find_one({"id": group_id}, {"_id": 0, "members": 1})
         if not g: raise HTTPException(404, "Group not found")
         if u["id"] not in g.get("members", []): raise HTTPException(403, "Not a member")
-        msgs = await db.group_messages.find(
-            {"group_id": group_id, "deleted_for": {"$ne": u["id"]}}, {"_id": 0}
-        ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        msgs = await _safe_media_find(
+            db.group_messages, {"group_id": group_id, "deleted_for": {"$ne": u["id"]}},
+            scalar_fields=("photo_url", "gif_url", "audio_url", "from_avatar_photo", "shared_post.photo_url", "shared_post.avatar_photo"),
+            projection={"_id": 0}, sort={"created_at": -1}, skip=skip, limit=limit,
+        )
         msgs.reverse()
         await db.group_messages.update_many(
             {"group_id": group_id, "from_id": {"$ne": u["id"]}, "seen_by": {"$ne": u["id"]}},
@@ -5284,12 +5548,16 @@ postbluom.online"""
             raise HTTPException(400, "Message cannot be empty")
         reply_to_preview = None
         if p.reply_to_id:
-            ref = await db.group_messages.find_one({"id": p.reply_to_id}, {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "photo_url": 1})
+            ref_rows = await db.group_messages.aggregate([
+                {"$match": {"id": p.reply_to_id}},
+                {"$project": {"_id": 0, "text": 1, "from_name": 1, "from_id": 1, "has_photo": {"$and": [{"$ne": [{"$ifNull": ["$photo_url", None]}, None]}, {"$ne": ["$photo_url", ""]}]}}},
+            ]).to_list(1)
+            ref = ref_rows[0] if ref_rows else None
             if ref:
-                reply_to_preview = {"id": p.reply_to_id, "from_name": ref.get("from_name",""), "from_id": ref.get("from_id",""), "text": (ref.get("text") or "")[:120], "has_photo": bool(ref.get("photo_url"))}
+                reply_to_preview = {"id": p.reply_to_id, "from_name": ref.get("from_name",""), "from_id": ref.get("from_id",""), "text": (ref.get("text") or "")[:120], "has_photo": bool(ref.get("has_photo"))}
         shared_post = None
         if p.shared_post_id:
-            sp = await db.posts.find_one({"id": p.shared_post_id}, {"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1, "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1})
+            sp = await _safe_media_find_one(db.posts, {"id": p.shared_post_id}, scalar_fields=("photo_url", "avatar_photo"), array_fields=("photo_urls",), projection={"_id": 0, "id": 1, "content": 1, "photo_url": 1, "photo_urls": 1, "user_name": 1, "user_handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1})
             if sp:
                 shared_post = {"id": sp["id"], "content": (sp.get("content") or "")[:200], "photo_url": sp.get("photo_url") or ((sp.get("photo_urls") or [None])[0]), "user_name": sp.get("user_name",""), "user_handle": sp.get("user_handle",""), "avatar_bg": sp.get("avatar_bg",""), "avatar_letter": sp.get("avatar_letter",""), "avatar_photo": sp.get("avatar_photo"), "type": "post"}
         doc = {
@@ -5359,7 +5627,7 @@ postbluom.online"""
     async def join_group_via_invite(body: dict, u=Depends(current_user)):
         invite_code = (body.get("invite_code") or "").strip().upper()
         if not invite_code: raise HTTPException(400, "invite_code required")
-        g = await db.groups.find_one({"invite_code": invite_code}, {"_id": 0})
+        g = await _safe_media_find_one(db.groups, {"invite_code": invite_code}, scalar_fields=("avatar_photo",), projection={"_id": 0})
         if not g: raise HTTPException(404, "Invalid invite link")
         if u["id"] in g.get("members", []):
             return {"group": g, "already_member": True}
@@ -5377,7 +5645,7 @@ postbluom.online"""
     @api.delete("/groups/{group_id}/messages/{msg_id}")
     async def delete_group_message(group_id: str, msg_id: str, body: dict = None, u=Depends(current_user)):
         body = body or {}
-        msg = await db.group_messages.find_one({"id": msg_id, "group_id": group_id})
+        msg = await db.group_messages.find_one({"id": msg_id, "group_id": group_id}, {"_id": 0, "from_id": 1})
         if not msg: raise HTTPException(404, "Message not found")
         if body.get("delete_for") == "everyone" and msg["from_id"] == u["id"]:
             await db.group_messages.update_one({"id": msg_id}, {"$set": {"deleted_for_everyone": True, "text": "", "photo_url": None, "audio_url": None}})
