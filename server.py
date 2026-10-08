@@ -522,13 +522,64 @@ try:
         return rows[0] if rows else None
 
     async def _safe_user_find_one(query, projection=None):
-        rows = await _safe_media_find(
-            db.users, query,
-            scalar_fields=("avatar_photo", "cover_photo", "profile_video", "cover_video"),
-            projection=projection or {"_id": 0, "password_hash": 0, "otp_hash": 0},
-            limit=1,
-        )
-        return rows[0] if rows else None
+        projection = projection or {"_id": 0, "password_hash": 0, "otp_hash": 0}
+        user = await db.users.find_one(query, projection)
+        if not user:
+            return None
+
+        # Older accounts may still have inline profile images. The media-safe
+        # aggregation intentionally hides data URIs, so migrate these two
+        # fields before returning a user profile instead of showing a blank avatar.
+        user_id = user.get("id")
+        if user_id:
+            safe_id = "".join(
+                ch if ch.isalnum() or ch in "_-" else "_" for ch in str(user_id)
+            )[:80] or uuid.uuid4().hex
+            for field in ("avatar_photo", "cover_photo"):
+                value = user.get(field)
+                if not isinstance(value, str) or not value.lstrip().lower().startswith("data:image/"):
+                    continue
+                try:
+                    hosted_url = await _cloudinaryize_inline_image(
+                        value,
+                        "post-app/profile-photos",
+                        f"legacy_profile_{safe_id}_{field}",
+                        overwrite=True,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Legacy profile image migration failed for user %s field %s",
+                        user_id, field,
+                    )
+                    hosted_url = None
+                if not hosted_url:
+                    continue
+                try:
+                    saved = await db.users.update_one(
+                        {"id": user_id, field: value},
+                        {"$set": {field: hosted_url}},
+                    )
+                except Exception:
+                    logging.exception(
+                        "Could not save migrated profile image for user %s field %s",
+                        user_id, field,
+                    )
+                    user[field] = hosted_url
+                    continue
+                if saved.matched_count:
+                    user[field] = hosted_url
+                else:
+                    latest = await db.users.find_one(
+                        {"id": user_id}, {"_id": 0, field: 1}
+                    )
+                    user[field] = latest.get(field) if latest else None
+
+        # Never return remaining inline media or profile videos in API responses.
+        for field in ("avatar_photo", "cover_photo", "profile_video", "cover_video"):
+            value = user.get(field)
+            if isinstance(value, str) and value.lstrip().lower().startswith("data:"):
+                user[field] = None
+        return user
 
     async def _safe_user_find(query, projection=None, sort=None, skip=0, limit=100):
         return await _safe_media_find(
