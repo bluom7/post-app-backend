@@ -4742,70 +4742,16 @@ postbluom.online"""
 
     @api.get("/reels")
     async def list_reels(skip: int = Query(0, ge=0, le=10000), limit: int = Query(10, ge=1, le=50), u=Depends(current_user)):
-        blocked  = u.get("blocked_users", [])
-        muted    = u.get("muted_users", [])
-        excluded = list(set(blocked + muted))
-        following_ids = list(set(u.get("following", []) or []))
-        query: dict = {
-            "moderation_status": {"$nin": ["flagged", "under_review", "removed"]},
-            "$or": [
-                {"audience": {"$exists": False}},
-                {"audience": "public"},
-                {"user_id": u["id"]},
-                {"audience": "friends", "user_id": {"$in": following_ids}},
-                {"audience": "only_show", "audience_users": u["id"]},
-            ],
-        }
-        if excluded:
-            query["user_id"] = {"$nin": excluded}
-        def _safe_reel_array(field):
-            value = "$" + field
-            return {"$cond": [{"$isArray": value}, value, []]}
-
-        def _safe_reel_count(field):
-            return {"$convert": {"input": "$" + field, "to": "long", "onError": 0, "onNull": 0}}
-
-        reels_list = await db.reels.aggregate([
-            {"$match": query},
-            {"$sort": {"created_at": -1}},
-            {"$skip": skip},
-            {"$limit": limit},
-            {"$addFields": {
-                "is_liked": {"$in": [u["id"], _safe_reel_array("likes")]},
-                "like_count": {"$max": [{"$size": _safe_reel_array("likes")}, _safe_reel_count("like_count")]},
-                "is_saved": {"$in": [u["id"], _safe_reel_array("saves")]},
-                "save_count": {"$max": [{"$size": _safe_reel_array("saves")}, _safe_reel_count("save_count")]},
-                "comment_count": {"$max": [{"$size": _safe_reel_array("comments")}, _safe_reel_count("comment_count")]},
-                "share_count": {"$max": [{"$size": _safe_reel_array("shares")}, _safe_reel_count("share_count")]},
-                "view_count": {"$size": {"$setUnion": [_safe_reel_array("views"), []]}},
-            }},
-            {"$project": {"_id": 0, "likes": 0, "saves": 0, "comments": 0, "shares": 0, "views": 0}},
-        ]).to_list(limit)
-        mention_rows = await db.reel_mentions.aggregate([
-            {"$match": {"reel_id": {"$in": [r["id"] for r in reels_list]}}},
-            {"$group": {"_id": "$reel_id", "count": {"$sum": 1}}},
-        ]).to_list(limit) if reels_list else []
-        mention_counts = {row["_id"]: row["count"] for row in mention_rows}
-        mention_docs = {
-            doc["reel_id"]: doc
-            async for doc in db.reel_mentions.find(
-                {"target_user_id": u["id"], "reel_id": {"$in": [r["id"] for r in reels_list]}},
-                
-                {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1}
-            )
-        } if reels_list else {}
-        following_ids = set(u.get("following") or [])
-        for r in reels_list:
-            mention = mention_docs.get(r["id"])
-            r["is_mentioned"] = bool(mention)
-            r["mentioned_by"] = (
-                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
-                if mention else None
-            )
-            r["mention_count"] = mention_counts.get(r["id"], 0)
-            r["is_following"] = r["user_id"] in following_ids or r["user_id"] == u["id"]
-        return {"reels": reels_list, "has_more": len(reels_list) == limit, "skip": skip, "limit": limit}
-
+        """Legacy Reels endpoint; use the same personalized ranking as /reels/feed."""
+        # The current frontend paginates by skip. The ranking feed reserves an
+        # exploration slot per page, so translate the visible offset to its
+        # ranked main-slot page index.
+        exploration_count = max(1, int(limit * 0.15))
+        main_slot_count = max(1, limit - exploration_count)
+        page = skip // main_slot_count
+        result = await get_algorithmic_reels_feed(page=page, limit=limit, q="", u=u)
+        result["skip"] = skip
+        return result
 
 
     @api.get("/reels/{reel_id}/remixes")
