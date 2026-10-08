@@ -515,21 +515,18 @@ try:
         pipeline.append(_safe_media_sanitize_stage(scalar_fields, array_fields, overlay_fields, comment_fields))
         if projection:
             pipeline.append({"$project": projection})
-        return await collection.aggregate(pipeline).to_list(limit)
+        rows = await collection.aggregate(pipeline).to_list(limit)
+        if getattr(collection, "name", None) in {"posts", "reels"} and "avatar_photo" in scalar_fields:
+            await _hydrate_author_avatars(rows)
+        return rows
 
     async def _safe_media_find_one(collection, query, **options):
         rows = await _safe_media_find(collection, query, limit=1, **options)
         return rows[0] if rows else None
 
-    async def _safe_user_find_one(query, projection=None):
-        projection = projection or {"_id": 0, "password_hash": 0, "otp_hash": 0}
-        user = await db.users.find_one(query, projection)
+    async def _migrate_legacy_user_profile_media(user):
         if not user:
             return None
-
-        # Older accounts may still have inline profile images. The media-safe
-        # aggregation intentionally hides data URIs, so migrate these two
-        # fields before returning a user profile instead of showing a blank avatar.
         user_id = user.get("id")
         if user_id:
             safe_id = "".join(
@@ -573,21 +570,76 @@ try:
                         {"id": user_id}, {"_id": 0, field: 1}
                     )
                     user[field] = latest.get(field) if latest else None
-
-        # Never return remaining inline media or profile videos in API responses.
         for field in ("avatar_photo", "cover_photo", "profile_video", "cover_video"):
             value = user.get(field)
             if isinstance(value, str) and value.lstrip().lower().startswith("data:"):
                 user[field] = None
         return user
 
+    async def _safe_user_find_one(query, projection=None):
+        user = await db.users.find_one(
+            query, projection or {"_id": 0, "password_hash": 0, "otp_hash": 0}
+        )
+        return await _migrate_legacy_user_profile_media(user)
+
     async def _safe_user_find(query, projection=None, sort=None, skip=0, limit=100):
-        return await _safe_media_find(
+        profiles = await _safe_media_find(
             db.users, query,
             scalar_fields=("avatar_photo", "cover_photo", "profile_video", "cover_video"),
             projection=projection or {"_id": 0, "password_hash": 0, "otp_hash": 0},
             sort=sort, skip=skip, limit=limit,
         )
+        profile_ids = [profile.get("id") for profile in profiles if profile.get("id")]
+        if not profile_ids:
+            return profiles
+        legacy_profiles = await db.users.find(
+            {
+                "id": {"$in": profile_ids},
+                "$or": [
+                    {"avatar_photo": {"$regex": "^data:", "$options": "i"}},
+                    {"cover_photo": {"$regex": "^data:", "$options": "i"}},
+                ],
+            },
+            {"_id": 0, "id": 1, "avatar_photo": 1, "cover_photo": 1},
+        ).to_list(len(profile_ids))
+        profiles_by_id = {str(profile["id"]): profile for profile in profiles}
+        for offset in range(0, len(legacy_profiles), 8):
+            migrated_batch = await asyncio.gather(*(
+                _migrate_legacy_user_profile_media(profile)
+                for profile in legacy_profiles[offset:offset + 8]
+            ))
+            for migrated in migrated_batch:
+                target = profiles_by_id.get(str(migrated.get("id")))
+                if not target:
+                    continue
+                for field in ("avatar_photo", "cover_photo"):
+                    if field in target:
+                        target[field] = migrated.get(field)
+        return profiles
+
+    async def _hydrate_author_avatars(rows):
+        if not rows:
+            return rows
+        user_ids = list(dict.fromkeys(
+            row.get("user_id") for row in rows
+            if isinstance(row, dict) and row.get("user_id")
+        ))
+        if not user_ids:
+            return rows
+        authors = await _safe_user_find(
+            {"id": {"$in": user_ids}},
+            {"_id": 0, "id": 1, "avatar_photo": 1},
+            limit=len(user_ids),
+        )
+        avatars = {
+            str(author.get("id")): author.get("avatar_photo")
+            for author in authors if author.get("avatar_photo")
+        }
+        for row in rows:
+            photo = avatars.get(str(row.get("user_id")))
+            if photo:
+                row["avatar_photo"] = photo
+        return rows
 
     # ── Auth helpers ─────────────────────────────────────────────
     async def raw_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
@@ -2746,6 +2798,7 @@ postbluom.online"""
             async def _no_reels(): return []
             reels_task = _no_reels()
         posts_raw, reels_raw = await asyncio.gather(posts_task, reels_task)
+        await _hydrate_author_avatars(posts_raw + reels_raw)
         # Mention visibility is private to the signed-in viewer, never the profile target.
         mention_docs = {}
         if include_reels:
@@ -6693,8 +6746,10 @@ postbluom.online"""
                 "share_count": {"$max": [_reel_array_size("$shares"), _reel_count_value("$share_count")]},
                 "view_count": _reel_unique_array_size("$views"),
             }},
+            _safe_media_sanitize_stage(scalar_fields=("avatar_photo",)),
             {"$project": {"_id": 0, "likes": 0, "saves": 0, "shares": 0, "views": 0}},
         ]).to_list(len(final_reel_ids)) if final_reel_ids else []
+        await _hydrate_author_avatars(full_reels)
         full_reels_by_id = {reel.get("id"): reel for reel in full_reels if reel.get("id")}
         ranking_fields = (
             "_rank_view_count", "_rank_like_count", "_rank_comment_count",
