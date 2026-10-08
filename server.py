@@ -516,6 +516,18 @@ try:
         if projection:
             pipeline.append({"$project": projection})
         rows = await collection.aggregate(pipeline).to_list(limit)
+        if comment_fields:
+            embedded_comments = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for field in comment_fields:
+                    values = row.get(field)
+                    if isinstance(values, list):
+                        embedded_comments.extend(
+                            comment for comment in values if isinstance(comment, dict)
+                        )
+            await _hydrate_comment_profiles(embedded_comments)
         if getattr(collection, "name", None) in {"posts", "reels"} and "avatar_photo" in scalar_fields:
             await _hydrate_author_avatars(rows)
         return rows
@@ -640,6 +652,59 @@ try:
             if photo:
                 row["avatar_photo"] = photo
         return rows
+
+    async def _hydrate_comment_profiles(comments):
+        """Fill embedded comment/reply identity from each author's current profile."""
+        if not isinstance(comments, list) or not comments:
+            return comments
+        entries = []
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            entries.append(comment)
+            replies = comment.get("replies")
+            if isinstance(replies, list):
+                entries.extend(reply for reply in replies if isinstance(reply, dict))
+        user_ids = list(dict.fromkeys(
+            str(entry.get("user_id")).strip()
+            for entry in entries
+            if entry.get("user_id") is not None and str(entry.get("user_id")).strip()
+        ))
+        if not user_ids:
+            return comments
+        profile_map = {}
+        profile_fields = {
+            "_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+            "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1,
+            "is_badge_verified": 1,
+        }
+        try:
+            for offset in range(0, len(user_ids), 100):
+                batch = user_ids[offset:offset + 100]
+                profiles = await _safe_user_find(
+                    {"id": {"$in": batch}}, profile_fields, limit=len(batch)
+                )
+                for profile in profiles:
+                    if profile.get("id") is not None:
+                        profile_map[str(profile["id"])] = profile
+        except Exception:
+            logging.exception("Comment profile hydration failed")
+            return comments
+        for entry in entries:
+            profile = profile_map.get(str(entry.get("user_id")))
+            if not profile:
+                continue
+            name = profile.get("name") or profile.get("username") or entry.get("user_name") or "User"
+            entry["user_name"] = name
+            if profile.get("handle"):
+                entry["user_handle"] = profile["handle"]
+            if profile.get("username"):
+                entry["username"] = profile["username"]
+            entry["avatar_photo"] = profile.get("avatar_photo")
+            entry["avatar_bg"] = profile.get("avatar_bg") or entry.get("avatar_bg") or "#FFD600"
+            entry["avatar_letter"] = profile.get("avatar_letter") or str(name)[0].upper()
+            entry["is_badge_verified"] = bool(profile.get("is_badge_verified"))
+        return comments
 
     # ── Auth helpers ─────────────────────────────────────────────
     async def raw_user(creds: HTTPAuthorizationCredentials = Depends(bearer)):
@@ -2824,6 +2889,12 @@ postbluom.online"""
         merged = posts_raw + merged_reels
         merged.sort(key=lambda d: d.get("created_at") or "", reverse=True)
         posts = merged[skip:skip + limit]
+        embedded_comments = []
+        for item in posts:
+            comments = item.get("comments") if isinstance(item, dict) else None
+            if isinstance(comments, list):
+                embedded_comments.extend(comment for comment in comments if isinstance(comment, dict))
+        await _hydrate_comment_profiles(embedded_comments)
         unviewed_ids = [p["id"] for p in posts if not p.get("is_reel") and u["id"] not in p.get("views", [])]
         if unviewed_ids:
             # Fire-and-forget: don't block the response for view tracking
@@ -2905,6 +2976,42 @@ postbluom.online"""
             asyncio.create_task(send_push(post["user_id"], "New like ♥️", u["name"] + " liked your post"))
         return {"likes": likes, "total": len(likes)}
 
+    @api.get("/posts/{pid}/comments")
+    async def get_post_comments(pid: str, u=Depends(current_user)):
+        post = await db.posts.find_one(
+            {"id": pid},
+            {"_id": 0, "user_id": 1, "audience": 1, "audience_users": 1},
+        )
+        if not post:
+            raise HTTPException(404, "Post not found")
+        owner_id = post.get("user_id")
+        if owner_id and owner_id != u["id"]:
+            excluded = set((u.get("blocked_users") or []) + (u.get("muted_users") or []))
+            if owner_id in excluded:
+                raise HTTPException(404, "Post not found")
+            author = await db.users.find_one(
+                {"id": owner_id},
+                {"_id": 0, "is_private": 1, "followers": 1, "blocked_users": 1},
+            )
+            if not author or u["id"] in (author.get("blocked_users") or []):
+                raise HTTPException(404, "Post not found")
+            is_follower = u["id"] in (author.get("followers") or []) or owner_id in (u.get("following") or [])
+            audience = post.get("audience") or "public"
+            allowed_users = post.get("audience_users") or []
+            if (author.get("is_private") and not is_follower) or audience == "only_me":
+                raise HTTPException(403, "You can't view comments on this post")
+            if audience == "only_show" and u["id"] not in allowed_users:
+                raise HTTPException(403, "You can't view comments on this post")
+            if audience == "followers" and not is_follower:
+                raise HTTPException(403, "You can't view comments on this post")
+        comment_post = await _safe_media_find_one(
+            db.posts, {"id": pid}, comment_fields=("comments",),
+            projection={"_id": 0, "comments": 1},
+        )
+        if not comment_post:
+            raise HTTPException(404, "Post not found")
+        return {"comments": comment_post.get("comments", []) or []}
+
     @api.post("/posts/{pid}/comments")
     async def add_comment(pid: str, p: CommentIn, u=Depends(current_user)):
         post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1, "comments_enabled": 1})
@@ -2914,9 +3021,11 @@ postbluom.online"""
         c = {
             "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
-            "avatar_letter": u["avatar_letter"], "text": p.text,
+            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")), "text": p.text,
             "created_at": now().isoformat(),
         }
+        await _hydrate_comment_profiles([c])
         await db.posts.update_one({"id": pid}, {"$push": {"comments": c}})
         if post["user_id"] != u["id"]:
             await db.notifications.insert_one({
@@ -5216,18 +5325,6 @@ postbluom.online"""
         if not reel:
             raise HTTPException(404, "Reel not found")
         comments = reel.get("comments", []) or []
-        user_ids = {c.get("user_id") for c in comments if c.get("user_id")}
-        for comment in comments:
-            user_ids.update(r.get("user_id") for r in (comment.get("replies") or []) if r.get("user_id"))
-        verified_users = await db.users.find(
-            {"id": {"$in": list(user_ids)}},
-            {"_id": 0, "id": 1, "is_badge_verified": 1},
-        ).to_list(len(user_ids)) if user_ids else []
-        verified_map = {str(profile.get("id")): bool(profile.get("is_badge_verified")) for profile in verified_users}
-        for comment in comments:
-            comment["is_badge_verified"] = verified_map.get(str(comment.get("user_id")), bool(comment.get("is_badge_verified")))
-            for reply in comment.get("replies") or []:
-                reply["is_badge_verified"] = verified_map.get(str(reply.get("user_id")), bool(reply.get("is_badge_verified")))
         return {"comments": comments}
 
     @api.post("/reels/{reel_id}/share")
@@ -5267,6 +5364,7 @@ postbluom.online"""
             "gif_url":       gif_url,
             "created_at":    now().isoformat(),
         }
+        await _hydrate_comment_profiles([comment])
         await db.reels.update_one(
             {"id": reel_id},
             {"$push": {"comments": comment}, "$inc": {"comment_count": 1}}
@@ -5351,6 +5449,7 @@ postbluom.online"""
             "gif_url":       gif_url,
             "created_at":    now().isoformat(),
         }
+        await _hydrate_comment_profiles([reply])
         await db.reels.update_one(
             {"id": reel_id, "comments.id": comment_id},
             {"$push": {"comments.$.replies": reply}}
