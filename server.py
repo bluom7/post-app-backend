@@ -1871,14 +1871,20 @@ postbluom.online"""
         is_private_locked = is_private and not is_follower and not is_self
         pending_req  = None
         posts_count_task = db.posts.count_documents({"user_id": user_id})
+        reels_count_task = db.reels.count_documents({"user_id": user_id})
         follow_req_task  = (
             db.follow_requests.find_one({"from_id": u["id"], "to_id": user_id, "status": "pending"})
             if is_private_locked else None
         )
         if follow_req_task is not None:
-            posts_count, pending_req = await asyncio.gather(posts_count_task, follow_req_task)
+            posts_count, reels_count, pending_req = await asyncio.gather(
+                posts_count_task, reels_count_task, follow_req_task
+            )
         else:
-            posts_count = await posts_count_task
+            posts_count, reels_count = await asyncio.gather(
+                posts_count_task, reels_count_task
+            )
+        posts_count += reels_count
         is_mutual        = user_id in u.get("following", []) and u["id"] in (user.get("following") or [])
         is_following_you = u["id"] in user.get("following", [])
         followers_count  = len(user.get("followers", []))
