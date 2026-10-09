@@ -3509,6 +3509,113 @@ postbluom.online"""
             result.append(item)
         return {"reels": result, "has_more": skip + len(mention_rows) < total, "skip": skip, "limit": limit, "total": total}
 
+
+    @api.get("/users/{target_user_id}/tagged-posts")
+    async def get_user_tagged_posts(target_user_id: str, skip: int = 0, limit: int = 50, u=Depends(current_user)):
+        """Return visible posts and reels whose existing tagged_users include this profile."""
+        skip = max(0, min(skip, 10000))
+        limit = max(1, min(limit, 50))
+        target = await db.users.find_one(
+            {"id": target_user_id},
+            {"_id": 0, "id": 1, "name": 1, "handle": 1, "username": 1,
+             "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1,
+             "is_badge_verified": 1, "is_private": 1, "followers": 1,
+             "blocked_users": 1},
+        )
+        if not target:
+            raise HTTPException(404, "User not found")
+        if target_user_id in (u.get("blocked_users") or []) or u["id"] in (target.get("blocked_users") or []):
+            return {"posts": [], "private_locked": True, "has_more": False, "skip": skip, "limit": limit}
+        if target.get("is_private") and target_user_id != u["id"] and u["id"] not in (target.get("followers") or []):
+            return {"posts": [], "private_locked": True, "has_more": False, "skip": skip, "limit": limit}
+
+        tag_handles = list(dict.fromkeys(
+            str(value).strip().lstrip("@")
+            for value in (target.get("handle"), target.get("username"))
+            if isinstance(value, str) and value.strip()
+        ))
+        if not tag_handles:
+            return {"posts": [], "has_more": False, "skip": skip, "limit": limit}
+        tag_pattern = r"^@?(?:" + "|".join(re.escape(handle) for handle in tag_handles) + r")$"
+        tag_filter = {"tagged_users": {"$elemMatch": {"$regex": tag_pattern, "$options": "i"}}}
+        following_ids = list(dict.fromkeys(u.get("following") or []))
+        excluded_user_ids = list(set((u.get("blocked_users") or []) + (u.get("muted_users") or [])))
+        fetch_n = min(10001, skip + limit + 1)
+        public_audience = {"$or": [{"audience": {"$exists": False}}, {"audience": "public"}]}
+        visible_authors = {"$or": [
+            {"user_id": u["id"]},
+            {"$and": [{"_author.is_private": {"$ne": True}}, public_audience]},
+            {"$and": [
+                {"user_id": {"$in": following_ids}},
+                {"audience": {"$nin": ["only_me", "only_show"]}},
+            ]},
+            {"$and": [
+                {"_author.is_private": {"$ne": True}},
+                {"audience": "only_show"},
+                {"audience_users": u["id"]},
+            ]},
+        ]}
+        author_safety = {"$and": [
+            {"user_id": {"$nin": excluded_user_ids}},
+            visible_authors,
+            {"$nor": [{"_author.blocked_users": u["id"]}]},
+        ]}
+        legacy_media_filter = {"$nor": [
+            {"video_url": {"$regex": "^data:"}},
+            {"photo_url": {"$regex": "^data:"}},
+            {"photo_urls": {"$elemMatch": {"$regex": "^data:"}}},
+        ]}
+        post_rows = await db.posts.aggregate([
+            {"$match": {"$and": [tag_filter, legacy_media_filter]}},
+            {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
+            {"$match": author_safety},
+            {"$sort": {"created_at": -1}},
+            {"$limit": fetch_n},
+            _safe_media_sanitize_stage(
+                scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"),
+                array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+            ),
+            {"$project": {"_id": 0, "_author": 0}},
+        ]).to_list(fetch_n)
+        reel_rows = await db.reels.aggregate([
+            {"$match": {"$and": [
+                tag_filter,
+                legacy_media_filter,
+                {"moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
+            ]}},
+            {"$lookup": {"from": "users", "localField": "user_id", "foreignField": "id", "as": "_author"}},
+            {"$match": author_safety},
+            {"$sort": {"created_at": -1}},
+            {"$limit": fetch_n},
+            _safe_media_sanitize_stage(
+                scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+                overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+            ),
+            {"$project": {"_id": 0, "_author": 0}},
+        ]).to_list(fetch_n)
+
+        tagged_user = {field: target.get(field) for field in (
+            "id", "name", "handle", "username", "avatar_photo", "avatar_bg", "avatar_letter", "is_badge_verified"
+        )}
+        combined = []
+        for post in post_rows:
+            post["tagged_user"] = tagged_user
+            combined.append(post)
+        for reel in reel_rows:
+            item = _reel_to_feed_item(reel)
+            item["is_reel"] = True
+            item["tagged_users"] = reel.get("tagged_users") or []
+            item["tagged_user"] = tagged_user
+            combined.append(item)
+        combined.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+        page = combined[skip:skip + limit]
+        return {
+            "posts": page,
+            "has_more": len(combined) > skip + limit,
+            "skip": skip,
+            "limit": limit,
+        }
+
     @api.get("/users/{target_user_id}/saved-posts")
     async def get_user_saved_posts(target_user_id: str, u=Depends(current_user)):
         target = await db.users.find_one({"id": target_user_id}, {"_id": 0, "id": 1, "is_private": 1, "followers": 1})
