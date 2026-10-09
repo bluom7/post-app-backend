@@ -3442,6 +3442,73 @@ postbluom.online"""
         result = await _safe_media_find(db.posts, {"saves": user_id}, scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"), array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",), sort={"created_at": -1}, projection={"_id": 0}, limit=50)
         return {"posts": result}
 
+    @api.get("/users/{target_user_id}/mentioned-reels")
+    async def get_user_mentioned_reels(target_user_id: str, skip: int = 0, limit: int = 50, u=Depends(current_user)):
+        skip = max(0, min(skip, 10000))
+        limit = max(1, min(limit, 50))
+        target = await db.users.find_one(
+            {"id": target_user_id},
+            {"_id": 0, "id": 1, "is_private": 1, "followers": 1, "blocked_users": 1},
+        )
+        if not target:
+            raise HTTPException(404, "User not found")
+        if target_user_id in (u.get("blocked_users") or []) or u["id"] in (target.get("blocked_users") or []):
+            return {"reels": [], "private_locked": True, "has_more": False, "skip": skip, "limit": limit, "total": 0}
+        if target.get("is_private") and target_user_id != u["id"] and u["id"] not in (target.get("followers") or []):
+            return {"reels": [], "private_locked": True, "has_more": False, "skip": skip, "limit": limit, "total": 0}
+
+        mention_query = {"target_user_id": target_user_id}
+        mention_rows = await db.reel_mentions.find(
+            mention_query,
+            {"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
+        ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        total = await db.reel_mentions.count_documents(mention_query)
+        if not mention_rows:
+            return {"reels": [], "has_more": False, "skip": skip, "limit": limit, "total": total}
+
+        reel_ids = list(dict.fromkeys(row.get("reel_id") for row in mention_rows if row.get("reel_id")))
+        raw_reels = await _safe_media_find(
+            db.reels,
+            {"id": {"$in": reel_ids}, "moderation_status": {"$nin": ["flagged", "under_review", "removed"]}},
+            scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+            overlay_fields=("sticker_overlays",),
+            comment_fields=("comments",),
+            projection={"_id": 0},
+            limit=len(reel_ids),
+        )
+        reels_by_id = {str(reel.get("id")): reel for reel in raw_reels}
+        owner_ids = list({str(reel.get("user_id") or "") for reel in raw_reels if reel.get("user_id")})
+        author_rows = await db.users.find(
+            {"id": {"$in": owner_ids}},
+            {"_id": 0, "id": 1, "is_private": 1, "followers": 1},
+        ).to_list(length=len(owner_ids)) if owner_ids else []
+        authors_by_id = {str(author.get("id")): author for author in author_rows}
+        excluded_ids = set((u.get("blocked_users") or []) + (u.get("muted_users") or []))
+        following_ids = set(u.get("following") or [])
+        result = []
+        for mention in mention_rows:
+            reel = reels_by_id.get(str(mention.get("reel_id") or ""))
+            if not reel:
+                continue
+            owner_id = str(reel.get("user_id") or "")
+            if owner_id in excluded_ids or not _reels_user_can_see(reel, u["id"], following_ids):
+                continue
+            author = authors_by_id.get(owner_id)
+            if owner_id != u["id"] and (not author or (author.get("is_private") and u["id"] not in (author.get("followers") or []))):
+                continue
+            mentioned_by = {
+                "id": mention.get("source_user_id"),
+                "name": mention.get("source_user_name"),
+                "handle": mention.get("source_user_handle"),
+                "avatar_photo": mention.get("source_user_avatar"),
+                "avatar_bg": mention.get("source_user_bg"),
+                "avatar_letter": mention.get("source_user_letter"),
+            }
+            item = _reel_to_feed_item(reel, True, mentioned_by)
+            item["mention_created_at"] = mention.get("created_at")
+            result.append(item)
+        return {"reels": result, "has_more": skip + len(mention_rows) < total, "skip": skip, "limit": limit, "total": total}
+
     @api.get("/users/{target_user_id}/saved-posts")
     async def get_user_saved_posts(target_user_id: str, u=Depends(current_user)):
         target = await db.users.find_one({"id": target_user_id}, {"_id": 0, "id": 1, "is_private": 1, "followers": 1})
