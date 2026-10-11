@@ -1086,7 +1086,8 @@ postbluom.online"""
         video_effect: Optional[str] = None                # VIDEO_EFFECTS id: none|vivid|warm|cool|bw|fade|vintage
 
     class CommentIn(BaseModel):
-        text: str
+        text: str = ""
+        gif_url: Optional[str] = None
 
     class LikeIn(BaseModel):
         color: Optional[str] = None
@@ -3023,13 +3024,20 @@ postbluom.online"""
     async def add_comment(pid: str, p: CommentIn, u=Depends(current_user)):
         post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1, "comments_enabled": 1})
         if not post: raise HTTPException(404, "Post not found")
+        await get_post_comments(pid, u)
         if not post.get("comments_enabled", True):
             raise HTTPException(403, "Comments are turned off for this post")
+        comment_text = (p.text or "").strip()
+        gif_url = (p.gif_url or "").strip() or None
+        _reject_inline_data_uri(gif_url, "gif_url")
+        if not comment_text and not gif_url:
+            raise HTTPException(400, "Empty comment")
         c = {
             "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
             "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
             "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
-            "is_badge_verified": bool(u.get("is_badge_verified")), "text": p.text,
+            "is_badge_verified": bool(u.get("is_badge_verified")), "text": comment_text,
+            "gif_url": gif_url, "likes": [], "replies": [],
             "created_at": now().isoformat(),
         }
         await _hydrate_comment_profiles([c])
@@ -3053,6 +3061,74 @@ postbluom.online"""
             raise HTTPException(403, "Cannot delete")
         await db.posts.update_one({"id": pid}, {"$pull": {"comments": {"id": cid}}})
         return {"ok": True}
+
+    @api.post("/posts/{pid}/comments/{cid}/like")
+    async def like_post_comment(pid: str, cid: str, body: dict = None, u=Depends(current_user)):
+        comments_result = await get_post_comments(pid, u)
+        comment = next((c for c in comments_result.get("comments", []) if str(c.get("id")) == str(cid)), None)
+        if not comment:
+            raise HTTPException(404, "Comment not found")
+        user_id = str(u["id"])
+        existing_likes = [str(like_id) for like_id in (comment.get("likes") or [])]
+        requested_state = body.get("liked") if isinstance(body, dict) else None
+        if not isinstance(requested_state, bool):
+            requested_state = user_id not in existing_likes
+        update = {"$addToSet": {"comments.$.likes": user_id}} if requested_state else {"$pull": {"comments.$.likes": user_id}}
+        await db.posts.update_one({"id": pid, "comments.id": cid}, update)
+        updated_result = await get_post_comments(pid, u)
+        updated_comment = next((c for c in updated_result.get("comments", []) if str(c.get("id")) == str(cid)), None)
+        if not updated_comment:
+            raise HTTPException(404, "Comment not found")
+        authoritative_likes = [str(like_id) for like_id in (updated_comment.get("likes") or [])]
+        return {
+            "liked": user_id in authoritative_likes,
+            "like_count": len(authoritative_likes),
+            "likes": authoritative_likes,
+        }
+
+    @api.post("/posts/{pid}/comments/{cid}/replies")
+    async def add_post_comment_reply(pid: str, cid: str, body: dict, u=Depends(current_user)):
+        comments_result = await get_post_comments(pid, u)
+        parent_comment = next((c for c in comments_result.get("comments", []) if str(c.get("id")) == str(cid)), None)
+        if not parent_comment:
+            raise HTTPException(404, "Comment not found")
+        post = await db.posts.find_one({"id": pid}, {"_id": 0, "user_id": 1, "comments_enabled": 1})
+        if not post:
+            raise HTTPException(404, "Post not found")
+        if not post.get("comments_enabled", True):
+            raise HTTPException(403, "Comments are turned off for this post")
+        text = (body.get("text") or "").strip()
+        gif_url = (body.get("gif_url") or "").strip() or None
+        _reject_inline_data_uri(gif_url, "gif_url")
+        if not text and not gif_url:
+            raise HTTPException(400, "Empty reply")
+        reply = {
+            "id": str(uuid.uuid4()),
+            "user_id": u["id"],
+            "user_name": u["name"],
+            "user_handle": u["handle"],
+            "avatar_bg": u["avatar_bg"],
+            "avatar_letter": u["avatar_letter"],
+            "avatar_photo": u.get("avatar_photo"),
+            "is_badge_verified": bool(u.get("is_badge_verified")),
+            "text": text,
+            "gif_url": gif_url,
+            "created_at": now().isoformat(),
+        }
+        await _hydrate_comment_profiles([reply])
+        await db.posts.update_one(
+            {"id": pid, "comments.id": cid},
+            {"$push": {"comments.$.replies": reply}}
+        )
+        if parent_comment.get("user_id") != u["id"]:
+            await db.notifications.insert_one({
+                "id": str(uuid.uuid4()), "user_id": parent_comment["user_id"],
+                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
+                "type": "comment", "post_id": pid, "comment_id": cid,
+                "created_at": now().isoformat(), "read": False,
+            })
+            asyncio.create_task(send_push(parent_comment["user_id"], "New reply 💬", u["name"] + " replied to your comment"))
+        return reply
 
     @api.post("/posts/{pid}/view")
     async def view_post(pid: str, u=Depends(current_user)):
