@@ -2632,6 +2632,7 @@ postbluom.online"""
             "photo_urls": ([r["photo_url"]] if r.get("photo_url") and not r.get("video_url") else None),
             "video_url": r.get("video_url"),
             "video_duration": r.get("duration"),
+            "remix_of": r.get("remix_of"),
             "photo_width": None, "photo_height": None,
             # aspect_ratio: only meaningful for video reels (default 9/16).
             # For photo reels leave None — frontend uses natural img dimensions.
@@ -5079,6 +5080,7 @@ postbluom.online"""
         music_artwork    = (body.get("music_artwork") or "").strip() or None
         if audience not in ("public", "friends", "only_show", "only_me"):
             audience = "public"
+        remix_of       = str(body.get("remix_of") or "").strip() or None
         is_photo_reel  = bool(photo_url) and not video_url
         if not video_url and not photo_url:
             raise HTTPException(400, "video_url or photo_url is required")
@@ -5095,6 +5097,7 @@ postbluom.online"""
             "is_badge_verified": bool(u.get("is_badge_verified")),
             "video_url":         video_url if not is_photo_reel else None,
             "photo_url":         photo_url if is_photo_reel else None,
+            "remix_of":          remix_of,
             "caption":           caption,
             "category":          category,
             "tags":              tags,
