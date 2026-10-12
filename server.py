@@ -3293,7 +3293,7 @@ postbluom.online"""
         return {"saved": True}
 
     @api.post("/posts/{pid}/repost")
-    async def repost_post(pid: str, u=Depends(current_user)):
+    async def repost_post(pid: str, desired: Optional[bool] = Query(default=None), u=Depends(current_user)):
         post = await _safe_media_find_one(
             db.posts, {"id": pid},
             scalar_fields=("photo_url", "video_url", "avatar_photo"), array_fields=("photo_urls",),
@@ -3308,29 +3308,59 @@ postbluom.online"""
             raise HTTPException(403, "Action not allowed")
         if owner.get("is_private") and owner.get("id") != u["id"] and u["id"] not in (owner.get("followers") or []):
             raise HTTPException(403, "This post is not available to you")
-        relation = await db.post_reposts.find_one(
-            {"post_id": pid, "user_id": u["id"]}, {"_id": 0, "id": 1}
+
+        relation_filter = {"post_id": pid, "user_id": u["id"]}
+        relation, legacy = await asyncio.gather(
+            db.post_reposts.find_one(relation_filter, {"_id": 0}),
+            db.posts.find_one({"repost_of": pid, "user_id": u["id"]}, {"_id": 0, "id": 1}),
         )
-        legacy = await db.posts.find_one(
-            {"repost_of": pid, "user_id": u["id"]}, {"_id": 0, "id": 1}
-        )
-        if relation or legacy or u["id"] in (post.get("reposts") or []):
-            await db.post_reposts.delete_many({"post_id": pid, "user_id": u["id"]})
-            if legacy:
-                await db.posts.delete_one({"id": legacy["id"]})
-            await db.posts.update_one({"id": pid}, {"$pull": {"reposts": u["id"]}})
-            return {"reposted": False}
+        repost_ids = {str(value) for value in (post.get("reposts") or []) if value is not None}
+        already_reposted = bool(relation or legacy or str(u["id"]) in repost_ids)
+        should_repost = (not already_reposted) if desired is None else desired
+
+        if not should_repost:
+            if already_reposted:
+                removal_tasks = [
+                    db.post_reposts.delete_many(relation_filter),
+                    db.posts.update_one({"id": pid}, {"$pull": {"reposts": u["id"]}}),
+                ]
+                if legacy and legacy.get("id"):
+                    removal_tasks.append(db.posts.delete_one({"id": legacy["id"]}))
+                await asyncio.gather(*removal_tasks)
+                updated_post = await db.posts.find_one({"id": pid}, {"_id": 0, "reposts": 1})
+                repost_ids = {str(value) for value in ((updated_post or {}).get("reposts") or []) if value is not None}
+            return {"reposted": False, "repost_count": len(repost_ids)}
 
         created_at = now().isoformat()
-        relation_doc = {
+        candidate = {
             "id": str(uuid.uuid4()), "post_id": pid, "user_id": u["id"],
             "user_name": u.get("name"), "user_handle": u.get("handle"),
             "avatar_photo": u.get("avatar_photo"), "avatar_bg": u.get("avatar_bg"),
             "avatar_letter": u.get("avatar_letter"), "created_at": created_at,
         }
-        await db.post_reposts.insert_one(relation_doc)
-        await db.posts.update_one({"id": pid}, {"$addToSet": {"reposts": u["id"]}})
-        if post.get("user_id") != u["id"]:
+        relation_added = False
+        if relation:
+            relation_doc = relation
+        else:
+            try:
+                insert_result = await db.post_reposts.update_one(
+                    relation_filter, {"$setOnInsert": candidate}, upsert=True
+                )
+                relation_added = insert_result.upserted_id is not None
+                relation_doc = candidate if relation_added else await db.post_reposts.find_one(relation_filter, {"_id": 0})
+            except Exception as upsert_error:
+                relation_doc = await db.post_reposts.find_one(relation_filter, {"_id": 0})
+                if not relation_doc:
+                    raise upsert_error
+
+        update_tasks = [db.posts.update_one({"id": pid}, {"$addToSet": {"reposts": u["id"]}})]
+        if legacy and legacy.get("id"):
+            update_tasks.append(db.posts.delete_one({"id": legacy["id"]}))
+        await asyncio.gather(*update_tasks)
+        updated_post = await db.posts.find_one({"id": pid}, {"_id": 0, "reposts": 1})
+        repost_ids = {str(value) for value in ((updated_post or {}).get("reposts") or []) if value is not None}
+
+        if relation_added and not already_reposted and post.get("user_id") != u["id"]:
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": post["user_id"],
                 "from_user_id": u["id"], "from_user_name": u.get("name"),
@@ -3338,7 +3368,7 @@ postbluom.online"""
                 "post_id": pid, "created_at": created_at, "read": False,
             })
             asyncio.create_task(send_push(post["user_id"], "Repost", u.get("name", "Someone") + " reposted your post"))
-        return {"reposted": True, "repost": relation_doc, "repost_count": len(post.get("reposts") or []) + 1}
+        return {"reposted": True, "repost": relation_doc, "repost_count": len(repost_ids)}
 
     @api.post("/posts/{pid}/repost-to-friend")
     async def repost_to_friend(pid: str, p: ShareToFriendIn, u=Depends(current_user)):
