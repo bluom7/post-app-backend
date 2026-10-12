@@ -2656,7 +2656,8 @@ postbluom.online"""
             "saves": r.get("saves", []),
             "save_count": max(len(r.get("saves") or []), int(r.get("save_count") or 0)),
             "share_count": max(len(r.get("shares") or []), int(r.get("share_count") or 0)),
-            "reposts": [],
+            "reposts": list(r.get("reposts") or []),
+            "repost_count": len(r.get("reposts") or []),
             "created_at": r.get("created_at"),
             "edited_at": None,
             "is_pinned": False,
@@ -2757,6 +2758,36 @@ postbluom.online"""
         # Reels get merged into the home feed and profile grid (but not search).
         include_reels = (feed or bool(user_id)) and not q
         fetch_n = skip + limit
+        repost_actor_ids = []
+        if not q and feed:
+            repost_actor_ids = [item_id for item_id in set(following_ids + [u["id"]]) if item_id not in excluded_user_ids]
+        elif not q and following_only:
+            repost_actor_ids = [item_id for item_id in set(following_ids + [u["id"]]) if item_id not in excluded_user_ids]
+        elif not q and user_id and user_id not in excluded_user_ids:
+            repost_actor_ids = [user_id]
+        post_repost_rows = []
+        reel_repost_rows = []
+        if repost_actor_ids:
+            post_repost_rows = await db.post_reposts.find(
+                {"user_id": {"$in": repost_actor_ids}}, {"_id": 0}
+            ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            reel_repost_rows = await db.reel_reposts.find(
+                {"user_id": {"$in": repost_actor_ids}}, {"_id": 0}
+            ).sort("created_at", -1).limit(fetch_n).to_list(fetch_n)
+            legacy_reposts = await _safe_media_find(
+                db.reel_mentions,
+                {"source_user_id": {"$in": repost_actor_ids}, "$expr": {"$eq": ["$source_user_id", "$target_user_id"]}},
+                scalar_fields=("source_user_avatar",),
+                projection={"_id": 0, "id": 1, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
+                sort={"created_at": -1}, limit=fetch_n,
+            )
+            reel_repost_rows.extend({
+                "id": row.get("id"), "reel_id": row.get("reel_id"),
+                "user_id": row.get("source_user_id"), "user_name": row.get("source_user_name"),
+                "user_handle": row.get("source_user_handle"), "avatar_photo": row.get("source_user_avatar"),
+                "avatar_bg": row.get("source_user_bg"), "avatar_letter": row.get("source_user_letter"),
+                "created_at": row.get("created_at"),
+            } for row in legacy_reposts)
         if filter_public_authors:
             visible_author_filters = [
                 {"user_id": u["id"]},
@@ -2784,10 +2815,12 @@ postbluom.online"""
             viewer_mentions = await _safe_media_find(
                 db.reel_mentions, {"target_user_id": mention_target_id},
                 scalar_fields=("source_user_avatar",),
-                projection={"_id": 0, "reel_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
+                projection={"_id": 0, "reel_id": 1, "target_user_id": 1, "source_user_id": 1, "source_user_name": 1, "source_user_handle": 1, "source_user_avatar": 1, "source_user_bg": 1, "source_user_letter": 1, "created_at": 1},
                 sort={"created_at": -1}, limit=fetch_n,
             )
-            mentioned_ids = list(dict.fromkeys(doc["reel_id"] for doc in viewer_mentions if doc.get("reel_id")))
+            mentioned_ids = list(dict.fromkeys(
+                doc["reel_id"] for doc in viewer_mentions + reel_repost_rows if doc.get("reel_id")
+            ))
 
             async def _load_feed_reels():
                 # Fetch normal feed reels and mentioned/reposted reels separately.
@@ -2871,11 +2904,106 @@ postbluom.online"""
             async def _no_reels(): return []
             reels_task = _no_reels()
         posts_raw, reels_raw = await asyncio.gather(posts_task, reels_task)
+        if not q and (feed or following_only or user_id):
+            legacy_clones = [item for item in posts_raw if item.get("repost_of")]
+            source_ids = list(dict.fromkeys(
+                [row.get("post_id") for row in post_repost_rows if row.get("post_id")]
+                + [row.get("repost_of") for row in legacy_clones if row.get("repost_of")]
+            ))
+            source_posts = await _safe_media_find(
+                db.posts, {"id": {"$in": source_ids}},
+                scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"),
+                array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",),
+                projection={"_id": 0}, limit=len(source_ids),
+            ) if source_ids else []
+            source_by_id = {item.get("id"): item for item in source_posts if item.get("id")}
+            source_author_ids = list(dict.fromkeys(item.get("user_id") for item in source_posts if item.get("user_id")))
+            source_authors = await _safe_user_find(
+                {"id": {"$in": source_author_ids}},
+                {"_id": 0, "id": 1, "is_private": 1, "followers": 1}, limit=len(source_author_ids),
+            ) if source_author_ids else []
+            source_author_by_id = {item.get("id"): item for item in source_authors if item.get("id")}
+
+            def _repost_source_is_visible(source):
+                owner_id = source.get("user_id")
+                if not owner_id or owner_id in excluded_user_ids:
+                    return False
+                if owner_id == u["id"] or owner_id in following_ids:
+                    return True
+                author = source_author_by_id.get(owner_id) or {}
+                return not author.get("is_private")
+
+            def _post_repost_projection(source, event):
+                actor = {
+                    "id": event.get("user_id"), "name": event.get("user_name"),
+                    "handle": event.get("user_handle"), "avatar_photo": event.get("avatar_photo"),
+                    "avatar_bg": event.get("avatar_bg"), "avatar_letter": event.get("avatar_letter"),
+                }
+                item = dict(source)
+                item.update({
+                    "repost_of": source.get("id"),
+                    "repost_user_name": source.get("user_name"),
+                    "repost_user_handle": source.get("user_handle"),
+                    "reposted_by": actor,
+                    "is_repost_event": True,
+                    "is_reposted_by_viewer": u["id"] in (source.get("reposts") or []),
+                    "feed_event_id": "post-repost:" + str(event.get("id") or actor.get("id") or source.get("id")),
+                    "original_created_at": source.get("created_at"),
+                    "created_at": event.get("created_at") or source.get("created_at"),
+                })
+                return item
+
+            reposted_post_items = []
+            for legacy in legacy_clones:
+                source = source_by_id.get(legacy.get("repost_of"))
+                if source and _repost_source_is_visible(source):
+                    reposted_post_items.append(_post_repost_projection(source, legacy))
+            for event in post_repost_rows:
+                source = source_by_id.get(event.get("post_id"))
+                if source and _repost_source_is_visible(source):
+                    reposted_post_items.append(_post_repost_projection(source, event))
+
+            posts_raw = [item for item in posts_raw if not item.get("repost_of")]
+            if feed or following_only:
+                by_source_id = {}
+                for item in posts_raw + reposted_post_items:
+                    source_id = item.get("repost_of") or item.get("id")
+                    previous = by_source_id.get(source_id)
+                    if previous is None or (
+                        item.get("is_repost_event") and not previous.get("is_repost_event")
+                    ) or (
+                        item.get("is_repost_event") and previous.get("is_repost_event")
+                        and (item.get("created_at") or "") > (previous.get("created_at") or "")
+                    ):
+                        by_source_id[source_id] = item
+                posts_raw = list(by_source_id.values())
+            else:
+                posts_raw.extend(reposted_post_items)
+
         await _hydrate_author_avatars(posts_raw + reels_raw)
         # Mention visibility is private to the signed-in viewer, never the profile target.
         mention_docs = {}
+        repost_docs = {}
         if include_reels:
-            mention_docs = {doc["reel_id"]: doc for doc in viewer_mentions if doc.get("reel_id")}
+            for doc in viewer_mentions:
+                reel_key = doc.get("reel_id")
+                previous = mention_docs.get(reel_key)
+                if reel_key and (not previous or (doc.get("created_at") or "") > (previous.get("created_at") or "")):
+                    mention_docs[reel_key] = doc
+            for doc in reel_repost_rows:
+                reel_key = doc.get("reel_id")
+                previous = repost_docs.get(reel_key)
+                if reel_key and (not previous or (doc.get("created_at") or "") > (previous.get("created_at") or "")):
+                    repost_docs[reel_key] = doc
+        repost_reel_author_ids = list(dict.fromkeys(
+            reel.get("user_id") for reel in reels_raw
+            if reel.get("id") in repost_docs and reel.get("user_id")
+        ))
+        repost_reel_authors = await _safe_user_find(
+            {"id": {"$in": repost_reel_author_ids}},
+            {"_id": 0, "id": 1, "is_private": 1, "followers": 1}, limit=len(repost_reel_author_ids),
+        ) if repost_reel_author_ids and not feed else []
+        repost_reel_author_by_id = {item.get("id"): item for item in repost_reel_authors if item.get("id")}
         merged_reels = []
         seen_reel_ids = set()
         for reel in reels_raw:
@@ -2883,16 +3011,35 @@ postbluom.online"""
                 continue
             seen_reel_ids.add(reel["id"])
             mention = mention_docs.get(reel["id"])
+            repost = repost_docs.get(reel["id"])
+            mention_is_newer = bool(mention and (mention.get("created_at") or "") > ((repost or {}).get("created_at") or ""))
+            if repost and not feed and reel.get("user_id") != u["id"] and reel.get("user_id") not in following_ids:
+                source_author = repost_reel_author_by_id.get(reel.get("user_id")) or {}
+                if source_author.get("is_private"):
+                    continue
+            use_repost = bool(repost and not mention_is_newer)
+            actor = repost if use_repost else mention
             mentioned_by = (
-                {"id": mention.get("source_user_id"), "name": mention.get("source_user_name"), "handle": mention.get("source_user_handle"), "avatar_photo": mention.get("source_user_avatar"), "avatar_bg": mention.get("source_user_bg"), "avatar_letter": mention.get("source_user_letter")}
-                if mention else None
+                {"id": actor.get("user_id") if use_repost else actor.get("source_user_id"),
+                 "name": actor.get("user_name") if use_repost else actor.get("source_user_name"),
+                 "handle": actor.get("user_handle") if use_repost else actor.get("source_user_handle"),
+                 "avatar_photo": actor.get("avatar_photo") if use_repost else actor.get("source_user_avatar"),
+                 "avatar_bg": actor.get("avatar_bg") if use_repost else actor.get("source_user_bg"),
+                 "avatar_letter": actor.get("avatar_letter") if use_repost else actor.get("source_user_letter")}
+                if actor else None
             )
-            feed_item = _reel_to_feed_item(reel, bool(mention), mentioned_by)
-            if mention and mention.get("created_at"):
-                # A repost is a new feed event. Sort it by repost time rather
-                # than the original reel upload time.
+            feed_item = _reel_to_feed_item(reel, bool(mention or repost), mentioned_by)
+            if use_repost:
+                feed_item["is_repost_event"] = True
+                feed_item["repost_of"] = reel["id"]
+                feed_item["repost_user_name"] = reel.get("user_name")
+                feed_item["repost_user_handle"] = reel.get("user_handle")
+                feed_item["reposted_by"] = mentioned_by
+                feed_item["is_reposted_by_viewer"] = repost.get("user_id") == u["id"]
+                feed_item["feed_event_id"] = "reel-repost:" + str(repost.get("id") or reel["id"])
+            if actor and actor.get("created_at"):
                 feed_item["original_created_at"] = feed_item.get("created_at")
-                feed_item["created_at"] = mention["created_at"]
+                feed_item["created_at"] = actor["created_at"]
             merged_reels.append(feed_item)
         merged = posts_raw + merged_reels
         merged.sort(key=lambda d: d.get("created_at") or "", reverse=True)
@@ -3150,38 +3297,48 @@ postbluom.online"""
         post = await _safe_media_find_one(
             db.posts, {"id": pid},
             scalar_fields=("photo_url", "video_url", "avatar_photo"), array_fields=("photo_urls",),
-            projection={"_id": 0, "id": 1, "user_id": 1, "content": 1, "accent": 1, "photo_url": 1,
-                        "photo_urls": 1, "video_url": 1, "video_duration": 1, "user_name": 1, "user_handle": 1},
+            projection={"_id": 0, "id": 1, "user_id": 1, "user_name": 1, "user_handle": 1, "reposts": 1},
         )
-        if not post: raise HTTPException(404, "Post not found")
-        already = await db.posts.find_one({"repost_of": pid, "user_id": u["id"]}, {"_id": 0, "id": 1})
-        if already:
-            await db.posts.delete_one({"id": already["id"]})
+        if not post:
+            raise HTTPException(404, "Post not found")
+        owner = await _safe_user_find_one({"id": post.get("user_id")})
+        if not owner:
+            raise HTTPException(404, "User not found")
+        if post.get("user_id") in (u.get("blocked_users") or []) or u["id"] in (owner.get("blocked_users") or []):
+            raise HTTPException(403, "Action not allowed")
+        if owner.get("is_private") and owner.get("id") != u["id"] and u["id"] not in (owner.get("followers") or []):
+            raise HTTPException(403, "This post is not available to you")
+        relation = await db.post_reposts.find_one(
+            {"post_id": pid, "user_id": u["id"]}, {"_id": 0, "id": 1}
+        )
+        legacy = await db.posts.find_one(
+            {"repost_of": pid, "user_id": u["id"]}, {"_id": 0, "id": 1}
+        )
+        if relation or legacy or u["id"] in (post.get("reposts") or []):
+            await db.post_reposts.delete_many({"post_id": pid, "user_id": u["id"]})
+            if legacy:
+                await db.posts.delete_one({"id": legacy["id"]})
             await db.posts.update_one({"id": pid}, {"$pull": {"reposts": u["id"]}})
             return {"reposted": False}
-        doc = {
-            "id": str(uuid.uuid4()), "user_id": u["id"], "user_name": u["name"],
-            "user_handle": u["handle"], "avatar_bg": u["avatar_bg"],
-            "avatar_letter": u["avatar_letter"], "avatar_photo": u.get("avatar_photo"),
-            "content": post.get("content", ""), "accent": post.get("accent", "#FFD600"),
-            "location": "", "photo_url": post.get("photo_url"), "photo_urls": post.get("photo_urls", []),
-            "video_url": post.get("video_url"), "video_duration": post.get("video_duration"),
-            "likes": [], "comments": [], "views": [], "saves": [], "reposts": [],
-            "repost_of": pid, "repost_user_name": post.get("user_name"),
-            "repost_user_handle": post.get("user_handle"),
-            "created_at": now().isoformat(), "is_pinned": False,
+
+        created_at = now().isoformat()
+        relation_doc = {
+            "id": str(uuid.uuid4()), "post_id": pid, "user_id": u["id"],
+            "user_name": u.get("name"), "user_handle": u.get("handle"),
+            "avatar_photo": u.get("avatar_photo"), "avatar_bg": u.get("avatar_bg"),
+            "avatar_letter": u.get("avatar_letter"), "created_at": created_at,
         }
-        await db.posts.insert_one(doc.copy())
+        await db.post_reposts.insert_one(relation_doc)
         await db.posts.update_one({"id": pid}, {"$addToSet": {"reposts": u["id"]}})
-        if post["user_id"] != u["id"]:
+        if post.get("user_id") != u["id"]:
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": post["user_id"],
-                "from_user_id": u["id"], "from_user_name": u["name"], "from_user_avatar": u.get("avatar_photo"),
-                "type": "repost", "post_id": pid, "created_at": now().isoformat(), "read": False,
+                "from_user_id": u["id"], "from_user_name": u.get("name"),
+                "from_user_avatar": u.get("avatar_photo"), "type": "repost",
+                "post_id": pid, "created_at": created_at, "read": False,
             })
-            asyncio.create_task(send_push(post["user_id"], "Repost", u["name"] + " reposted your post"))
-        doc.pop("_id", None)
-        return {"reposted": True, "post": doc}
+            asyncio.create_task(send_push(post["user_id"], "Repost", u.get("name", "Someone") + " reposted your post"))
+        return {"reposted": True, "repost": relation_doc, "repost_count": len(post.get("reposts") or []) + 1}
 
     @api.post("/posts/{pid}/repost-to-friend")
     async def repost_to_friend(pid: str, p: ShareToFriendIn, u=Depends(current_user)):
@@ -3304,6 +3461,65 @@ postbluom.online"""
         if target_prefs.get("mentions", True):
             asyncio.create_task(send_push(target["id"], "Mention 📢", u["name"] + " mentioned you in a post"))
         return {"ok": True}
+
+    @api.post("/reels/{reel_id}/repost")
+    async def repost_reel(reel_id: str, u=Depends(current_user)):
+        reel = await _safe_media_find_one(
+            db.reels, {"id": reel_id},
+            scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
+            projection={"_id": 0, "id": 1, "user_id": 1, "user_name": 1, "user_handle": 1, "reposts": 1, "audience": 1, "audience_users": 1},
+        )
+        if not reel:
+            raise HTTPException(404, "Reel not found")
+        owner = await _safe_user_find_one({"id": reel.get("user_id")})
+        if not owner:
+            raise HTTPException(404, "User not found")
+        if reel.get("user_id") in (u.get("blocked_users") or []) or u["id"] in (owner.get("blocked_users") or []):
+            raise HTTPException(403, "Action not allowed")
+        if owner.get("is_private") and owner.get("id") != u["id"] and u["id"] not in (owner.get("followers") or []):
+            raise HTTPException(403, "This reel is not available to you")
+        if owner.get("id") != u["id"]:
+            audience = reel.get("audience") or "public"
+            if audience == "friends" and u["id"] not in (owner.get("followers") or []):
+                raise HTTPException(403, "This reel is not available to you")
+            if audience == "only_show" and u["id"] not in (reel.get("audience_users") or []):
+                raise HTTPException(403, "This reel is not available to you")
+            if audience not in ("public", "friends", "only_show"):
+                raise HTTPException(403, "This reel is not available to you")
+
+        legacy = await db.reel_mentions.find_one(
+            {"reel_id": reel_id, "target_user_id": u["id"], "source_user_id": u["id"]},
+            {"_id": 0, "id": 1},
+        )
+        existing = await db.reel_reposts.find_one(
+            {"reel_id": reel_id, "user_id": u["id"]}, {"_id": 0, "id": 1}
+        )
+        if existing or legacy or u["id"] in (reel.get("reposts") or []):
+            await db.reel_reposts.delete_many({"reel_id": reel_id, "user_id": u["id"]})
+            if legacy:
+                await db.reel_mentions.delete_one({"id": legacy["id"]})
+                await db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id, "user_id": u["id"], "from_user_id": u["id"]})
+            await db.reels.update_one({"id": reel_id}, {"$pull": {"reposts": u["id"]}})
+            return {"reposted": False}
+
+        created_at = now().isoformat()
+        relation_doc = {
+            "id": str(uuid.uuid4()), "reel_id": reel_id, "user_id": u["id"],
+            "user_name": u.get("name"), "user_handle": u.get("handle"),
+            "avatar_photo": u.get("avatar_photo"), "avatar_bg": u.get("avatar_bg"),
+            "avatar_letter": u.get("avatar_letter"), "created_at": created_at,
+        }
+        await db.reel_reposts.insert_one(relation_doc)
+        await db.reels.update_one({"id": reel_id}, {"$addToSet": {"reposts": u["id"]}})
+        if reel.get("user_id") != u["id"]:
+            await db.notifications.insert_one({
+                "id": str(uuid.uuid4()), "user_id": reel["user_id"],
+                "from_user_id": u["id"], "from_user_name": u.get("name"),
+                "from_user_avatar": u.get("avatar_photo"), "type": "reel_repost",
+                "reel_id": reel_id, "created_at": created_at, "read": False,
+            })
+            asyncio.create_task(send_push(reel["user_id"], "Repost", u.get("name", "Someone") + " reposted your reel"))
+        return {"reposted": True, "repost": relation_doc, "repost_count": len(reel.get("reposts") or []) + 1}
 
     @api.post("/reels/{reel_id}/mention")
     async def mention_in_reel(reel_id: str, body: dict, u=Depends(current_user)):
@@ -4654,6 +4870,10 @@ postbluom.online"""
             (db.world_active, "last_ping", {"background": True}),
             (db.reel_mentions, [("reel_id", 1), ("target_user_id", 1)], {"unique": True, "background": True}),
             (db.reel_mentions, [("target_user_id", 1), ("created_at", -1)], {"background": True}),
+            (db.post_reposts, [("post_id", 1), ("user_id", 1)], {"unique": True, "background": True}),
+            (db.post_reposts, [("user_id", 1), ("created_at", -1)], {"background": True}),
+            (db.reel_reposts, [("reel_id", 1), ("user_id", 1)], {"unique": True, "background": True}),
+            (db.reel_reposts, [("user_id", 1), ("created_at", -1)], {"background": True}),
         ]
         ok_count = 0
         for collection, keys, options in index_specs:
