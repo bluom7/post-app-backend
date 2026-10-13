@@ -3493,7 +3493,7 @@ postbluom.online"""
         return {"ok": True}
 
     @api.post("/reels/{reel_id}/repost")
-    async def repost_reel(reel_id: str, u=Depends(current_user)):
+    async def repost_reel(reel_id: str, desired: Optional[bool] = Query(default=None), u=Depends(current_user)):
         reel = await _safe_media_find_one(
             db.reels, {"id": reel_id},
             scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"),
@@ -3517,31 +3517,65 @@ postbluom.online"""
             if audience not in ("public", "friends", "only_show"):
                 raise HTTPException(403, "This reel is not available to you")
 
-        legacy = await db.reel_mentions.find_one(
-            {"reel_id": reel_id, "target_user_id": u["id"], "source_user_id": u["id"]},
-            {"_id": 0, "id": 1},
+        relation_filter = {"reel_id": reel_id, "user_id": u["id"]}
+        legacy_filter = {"reel_id": reel_id, "target_user_id": u["id"], "source_user_id": u["id"]}
+        legacy, existing = await asyncio.gather(
+            db.reel_mentions.find_one(legacy_filter, {"_id": 0, "id": 1}),
+            db.reel_reposts.find_one(relation_filter, {"_id": 0}),
         )
-        existing = await db.reel_reposts.find_one(
-            {"reel_id": reel_id, "user_id": u["id"]}, {"_id": 0, "id": 1}
-        )
-        if existing or legacy or u["id"] in (reel.get("reposts") or []):
-            await db.reel_reposts.delete_many({"reel_id": reel_id, "user_id": u["id"]})
-            if legacy:
-                await db.reel_mentions.delete_one({"id": legacy["id"]})
-                await db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id, "user_id": u["id"], "from_user_id": u["id"]})
-            await db.reels.update_one({"id": reel_id}, {"$pull": {"reposts": u["id"]}})
-            return {"reposted": False}
+        repost_ids = {str(value) for value in (reel.get("reposts") or []) if value is not None}
+        already_reposted = bool(existing or legacy or str(u["id"]) in repost_ids)
+        should_repost = (not already_reposted) if desired is None else desired
+
+        if not should_repost:
+            if already_reposted:
+                removal_tasks = [
+                    db.reel_reposts.delete_many(relation_filter),
+                    db.reels.update_one({"id": reel_id}, {"$pull": {"reposts": u["id"]}}),
+                ]
+                if legacy and legacy.get("id"):
+                    removal_tasks.extend([
+                        db.reel_mentions.delete_one({"id": legacy["id"]}),
+                        db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id, "user_id": u["id"], "from_user_id": u["id"]}),
+                    ])
+                await asyncio.gather(*removal_tasks)
+                updated_reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "reposts": 1})
+                repost_ids = {str(value) for value in ((updated_reel or {}).get("reposts") or []) if value is not None}
+            return {"reposted": False, "repost_count": len(repost_ids)}
 
         created_at = now().isoformat()
-        relation_doc = {
+        candidate = {
             "id": str(uuid.uuid4()), "reel_id": reel_id, "user_id": u["id"],
             "user_name": u.get("name"), "user_handle": u.get("handle"),
             "avatar_photo": u.get("avatar_photo"), "avatar_bg": u.get("avatar_bg"),
             "avatar_letter": u.get("avatar_letter"), "created_at": created_at,
         }
-        await db.reel_reposts.insert_one(relation_doc)
-        await db.reels.update_one({"id": reel_id}, {"$addToSet": {"reposts": u["id"]}})
-        if reel.get("user_id") != u["id"]:
+        relation_added = False
+        if existing:
+            relation_doc = existing
+        else:
+            try:
+                insert_result = await db.reel_reposts.update_one(
+                    relation_filter, {"$setOnInsert": candidate}, upsert=True
+                )
+                relation_added = insert_result.upserted_id is not None
+                relation_doc = candidate if relation_added else await db.reel_reposts.find_one(relation_filter, {"_id": 0})
+            except Exception as upsert_error:
+                relation_doc = await db.reel_reposts.find_one(relation_filter, {"_id": 0})
+                if not relation_doc:
+                    raise upsert_error
+
+        update_tasks = [db.reels.update_one({"id": reel_id}, {"$addToSet": {"reposts": u["id"]}})]
+        if legacy and legacy.get("id"):
+            update_tasks.extend([
+                db.reel_mentions.delete_one({"id": legacy["id"]}),
+                db.notifications.delete_many({"type": "reel_mention", "reel_id": reel_id, "user_id": u["id"], "from_user_id": u["id"]}),
+            ])
+        await asyncio.gather(*update_tasks)
+        updated_reel = await db.reels.find_one({"id": reel_id}, {"_id": 0, "reposts": 1})
+        repost_ids = {str(value) for value in ((updated_reel or {}).get("reposts") or []) if value is not None}
+
+        if relation_added and not already_reposted and reel.get("user_id") != u["id"]:
             await db.notifications.insert_one({
                 "id": str(uuid.uuid4()), "user_id": reel["user_id"],
                 "from_user_id": u["id"], "from_user_name": u.get("name"),
@@ -3549,7 +3583,7 @@ postbluom.online"""
                 "reel_id": reel_id, "created_at": created_at, "read": False,
             })
             asyncio.create_task(send_push(reel["user_id"], "Repost", u.get("name", "Someone") + " reposted your reel"))
-        return {"reposted": True, "repost": relation_doc, "repost_count": len(reel.get("reposts") or []) + 1}
+        return {"reposted": True, "repost": relation_doc, "repost_count": len(repost_ids)}
 
     @api.post("/reels/{reel_id}/mention")
     async def mention_in_reel(reel_id: str, body: dict, u=Depends(current_user)):
