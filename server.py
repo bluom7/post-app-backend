@@ -6633,6 +6633,43 @@ postbluom.online"""
             projection={"_id": 0}, sort={"created_at": -1}, skip=skip, limit=limit,
         )
         msgs.reverse()
+        # Do not render stale/empty shared-post markers as real post shares.
+        for msg in msgs:
+            shared_post = msg.get("shared_post")
+            if shared_post is not None and (
+                not isinstance(shared_post, dict)
+                or not str(shared_post.get("id") or "").strip()
+            ): 
+                msg["shared_post"] = None
+
+        # Older group messages may predate sender-avatar snapshots. Fill missing
+        # photos from current profiles so history keeps showing member avatars.
+        sender_ids = list(dict.fromkeys(
+            str(msg.get("from_id"))
+            for msg in msgs
+            if msg.get("from_id") and not msg.get("from_avatar_photo")
+        ))
+        if sender_ids:
+            sender_profiles = await _safe_user_find(
+                {"id": {"$in": sender_ids}},
+                {"_id": 0, "id": 1, "name": 1, "avatar_photo": 1, "avatar_bg": 1, "avatar_letter": 1},
+                limit=len(sender_ids),
+            )
+            profiles_by_id = {
+                str(profile.get("id")): profile
+                for profile in sender_profiles if profile.get("id") is not None
+            }
+            for msg in msgs:
+                profile = profiles_by_id.get(str(msg.get("from_id")))
+                if not profile:
+                    continue
+                if profile.get("avatar_photo"): 
+                    msg["from_avatar_photo"] = profile["avatar_photo"]
+                if not msg.get("from_avatar_bg"):
+                    msg["from_avatar_bg"] = profile.get("avatar_bg")
+                if not msg.get("from_avatar_letter"):
+                    name = msg.get("from_name") or profile.get("name") or "User"
+                    msg["from_avatar_letter"] = profile.get("avatar_letter") or str(name)[0].upper()
         await db.group_messages.update_many(
             {"group_id": group_id, "from_id": {"$ne": u["id"]}, "seen_by": {"$ne": u["id"]}},
             {"$addToSet": {"seen_by": u["id"]}}
