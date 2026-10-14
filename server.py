@@ -2042,30 +2042,6 @@ postbluom.online"""
         await db.users.update_one({"id": u["id"]}, {"$pull": {"muted_users": user_id}})
         return {"ok": True}
 
-    @api.post("/posts/{pid}/view")
-    async def view_post(pid: str, u=Depends(current_user)):
-        post = await db.posts.find_one({"id": pid}, {"_id": 0, "id": 1})
-        if not post:
-            raise HTTPException(404, "Post not found")
-        viewer_id = u.get("id")
-        if not viewer_id:
-            raise HTTPException(400, "User id is required")
-        existing_views = {"$cond": [{"$isArray": "$views"}, "$views", []]}
-        unique_views = {"$setUnion": [existing_views, [{"$literal": viewer_id}]]}
-        recorded = await db.posts.update_one(
-            {"id": pid, "views": {"$ne": viewer_id}},
-            [{"$set": {"views": unique_views, "view_count": {"$size": unique_views}}}],
-        )
-        if not recorded.matched_count:
-            deduplicated_views = {"$setUnion": [existing_views, []]}
-            await db.posts.update_one(
-                {"id": pid}, [{"$set": {"view_count": {"$size": deduplicated_views}}}]
-            )
-        latest = await db.posts.find_one({"id": pid}, {"_id": 0, "views": 1, "view_count": 1})
-        views = latest.get("views", []) if latest else []
-        count = len(views) if isinstance(views, list) else 0
-        return {"view_count": count, "views_count": count, "is_new_view": bool(recorded.modified_count)}
-
     @api.post("/posts/{pid}/not-interested")
     async def not_interested(pid: str, u=Depends(current_user)):
         await db.users.update_one({"id": u["id"]}, {"$addToSet": {"not_interested": pid}})
