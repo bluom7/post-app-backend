@@ -3405,6 +3405,7 @@ postbluom.online"""
         if not post: raise HTTPException(404, "Post not found")
         if u["id"] in (post.get("saves") or []):
             await db.posts.update_one({"id": pid}, {"$pull": {"saves": u["id"]}})
+            await db.saved_collections.update_many({"user_id": u["id"]}, {"$pull": {"items": {"item_id": pid, "item_type": "post"}}})
             return {"saved": False, "save_count": max(0, len(post.get("saves") or []) - 1)}
         await db.posts.update_one({"id": pid}, {"$addToSet": {"saves": u["id"]}})
         return {"saved": True, "save_count": len(post.get("saves") or []) + 1}
@@ -3918,6 +3919,105 @@ postbluom.online"""
         user_id = u["id"]
         result = await _safe_media_find(db.posts, {"saves": user_id}, scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"), array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",), sort={"created_at": -1}, projection={"_id": 0}, limit=50)
         return {"posts": [_attach_counts(_p) for _p in result]}
+
+    def _saved_collection_public(doc):
+        if not isinstance(doc, dict):
+            return None
+        items = doc.get("items") if isinstance(doc.get("items"), list) else []
+        return {
+            "id": str(doc.get("id") or ""),
+            "name": str(doc.get("name") or "Saved collection"),
+            "items": [{"item_id": str(item.get("item_id")), "item_type": item.get("item_type")} for item in items if isinstance(item, dict) and item.get("item_id") and item.get("item_type") in {"post", "reel"}],
+            "created_at": doc.get("created_at"),
+            "updated_at": doc.get("updated_at"),
+            "privacy": "only_me",
+        }
+
+    @api.get("/users/me/saved-items")
+    async def get_saved_library_items(skip: int = Query(default=0), limit: int = Query(default=100), u=Depends(current_user)):
+        skip = max(0, min(int(skip), 5000))
+        limit = max(1, min(int(limit), 100))
+        fetch_limit = min(skip + limit + 1, 5001)
+        user_id = u["id"]
+        posts, reels = await asyncio.gather(
+            _safe_media_find(db.posts, {"saves": user_id}, scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"), array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",), sort={"created_at": -1}, projection={"_id": 0}, limit=fetch_limit),
+            _safe_media_find(db.reels, {"saves": user_id, "moderation_status": {"$nin": ["flagged", "under_review", "removed"]}}, scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"), overlay_fields=("sticker_overlays",), comment_fields=("comments",), sort={"created_at": -1}, projection={"_id": 0}, limit=fetch_limit),
+        )
+        items = []
+        for post in posts:
+            post["is_reel"] = False
+            items.append(_attach_counts(post))
+        items.extend(_reel_to_feed_item(reel) for reel in reels)
+        items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        page = items[skip:skip + limit]
+        return {"items": page, "has_more": len(items) > skip + limit, "skip": skip, "limit": limit}
+
+    @api.get("/users/me/saved-collections")
+    async def get_saved_collections(u=Depends(current_user)):
+        docs = await db.saved_collections.find({"user_id": u["id"]}, {"_id": 0}).sort("updated_at", -1).limit(100).to_list(100)
+        return {"collections": [_saved_collection_public(doc) for doc in docs]}
+
+    @api.post("/users/me/saved-collections")
+    async def create_saved_collection(body: dict, u=Depends(current_user)):
+        name = str(body.get("name") or "").strip()
+        if not name: raise HTTPException(400, "Collection name is required")
+        if len(name) > 80: raise HTTPException(400, "Collection name must be 80 characters or fewer")
+        user_id = u["id"]
+        if await db.saved_collections.count_documents({"user_id": user_id}) >= 100: raise HTTPException(400, "You can create up to 100 collections")
+        name_key = name.casefold()
+        if await db.saved_collections.find_one({"user_id": user_id, "name_key": name_key}, {"_id": 1}): raise HTTPException(409, "A collection with that name already exists")
+        stamp = now().isoformat()
+        doc = {"id": str(uuid.uuid4()), "user_id": user_id, "name": name, "name_key": name_key, "items": [], "created_at": stamp, "updated_at": stamp}
+        await db.saved_collections.insert_one(doc)
+        return {"collection": _saved_collection_public(doc)}
+
+    @api.get("/users/me/saved-collections/{collection_id}")
+    async def get_saved_collection(collection_id: str, u=Depends(current_user)):
+        doc = await db.saved_collections.find_one({"id": collection_id, "user_id": u["id"]}, {"_id": 0})
+        if not doc: raise HTTPException(404, "Collection not found")
+        refs = _saved_collection_public(doc)["items"]
+        post_ids = [item["item_id"] for item in refs if item["item_type"] == "post"]
+        reel_ids = [item["item_id"] for item in refs if item["item_type"] == "reel"]
+        posts, reels = await asyncio.gather(
+            _safe_media_find(db.posts, {"id": {"$in": post_ids}, "saves": u["id"]}, scalar_fields=("photo_url", "video_url", "avatar_photo", "gif_url", "music_artwork", "music_preview_url", "thumbnail_url"), array_fields=("photo_urls",), overlay_fields=("sticker_overlays",), comment_fields=("comments",), projection={"_id": 0}, limit=max(1, len(post_ids))),
+            _safe_media_find(db.reels, {"id": {"$in": reel_ids}, "saves": u["id"], "moderation_status": {"$nin": ["flagged", "under_review", "removed"]}}, scalar_fields=("photo_url", "video_url", "avatar_photo", "music_artwork", "thumbnail_url"), overlay_fields=("sticker_overlays",), comment_fields=("comments",), projection={"_id": 0}, limit=max(1, len(reel_ids))),
+        )
+        by_key = {}
+        for post in posts:
+            post["is_reel"] = False
+            by_key["post:" + str(post.get("id"))] = _attach_counts(post)
+        for reel in reels:
+            shaped = _reel_to_feed_item(reel)
+            by_key["reel:" + str(shaped.get("id"))] = shaped
+        ordered = [by_key[key] for key in (item["item_type"] + ":" + item["item_id"] for item in refs) if key in by_key]
+        return {"collection": _saved_collection_public(doc), "items": ordered}
+
+    @api.post("/users/me/saved-collections/{collection_id}/items")
+    async def add_saved_collection_item(collection_id: str, body: dict, u=Depends(current_user)):
+        if not await db.saved_collections.find_one({"id": collection_id, "user_id": u["id"]}, {"_id": 1}): raise HTTPException(404, "Collection not found")
+        item_id = str(body.get("item_id") or "").strip()
+        item_type = str(body.get("item_type") or "post").strip().lower()
+        if not item_id or item_type not in {"post", "reel"}: raise HTTPException(400, "A saved post or reel is required")
+        media_collection = db.reels if item_type == "reel" else db.posts
+        if not await media_collection.find_one({"id": item_id, "saves": u["id"]}, {"_id": 1}): raise HTTPException(404, "Save this item before adding it to a collection")
+        ref = {"item_id": item_id, "item_type": item_type}
+        await db.saved_collections.update_one({"id": collection_id, "user_id": u["id"]}, {"$addToSet": {"items": ref}, "$set": {"updated_at": now().isoformat()}})
+        updated = await db.saved_collections.find_one({"id": collection_id, "user_id": u["id"]}, {"_id": 0})
+        return {"collection": _saved_collection_public(updated), "added": True}
+
+    @api.delete("/users/me/saved-collections/{collection_id}/items/{item_type}/{item_id}")
+    async def remove_saved_collection_item(collection_id: str, item_type: str, item_id: str, u=Depends(current_user)):
+        item_type = str(item_type or "").strip().lower()
+        if item_type not in {"post", "reel"}: raise HTTPException(400, "Invalid saved item type")
+        result = await db.saved_collections.update_one({"id": collection_id, "user_id": u["id"]}, {"$pull": {"items": {"item_id": item_id, "item_type": item_type}}, "$set": {"updated_at": now().isoformat()}})
+        if not result.matched_count: raise HTTPException(404, "Collection not found")
+        return {"ok": True}
+
+    @api.delete("/users/me/saved-collections/{collection_id}")
+    async def delete_saved_collection(collection_id: str, u=Depends(current_user)):
+        result = await db.saved_collections.delete_one({"id": collection_id, "user_id": u["id"]})
+        if not result.deleted_count: raise HTTPException(404, "Collection not found")
+        return {"ok": True}
 
     @api.get("/users/{target_user_id}/mentioned-reels")
     async def get_user_mentioned_reels(target_user_id: str, skip: int = 0, limit: int = 50, u=Depends(current_user)):
@@ -6166,6 +6266,7 @@ postbluom.online"""
         was_saved = u["id"] in saves
         if was_saved:
             await db.reels.update_one({"id": reel_id}, {"$pull": {"saves": u["id"]}})
+            await db.saved_collections.update_many({"user_id": u["id"]}, {"$pull": {"items": {"item_id": reel_id, "item_type": "reel"}}})
             return {"saved": False, "save_count": max(0, len(saves) - 1)}
         await db.reels.update_one({"id": reel_id}, {"$addToSet": {"saves": u["id"]}})
         return {"saved": True, "save_count": len(saves) + 1}
