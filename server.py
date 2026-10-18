@@ -1662,6 +1662,18 @@ postbluom.online"""
             safe["dob"] = raw_dob
         return safe
 
+    def _apply_presence_visibility(profile, viewer):
+        if not profile:
+            return profile
+        safe = dict(profile)
+        if safe.get("is_badge_verified") and not viewer.get("is_badge_verified"):
+            safe.pop("is_online", None)
+            safe.pop("last_seen", None)
+        return safe
+
+    def _apply_user_visibility(profile, viewer):
+        return _apply_presence_visibility(_apply_dob_visibility(profile, viewer["id"]), viewer)
+
     # ── Profile ───────────────────────────────────────────────────
     @api.patch("/profile")
     async def update_profile(p: ProfileUpdate, u=Depends(current_user)):
@@ -1835,7 +1847,7 @@ postbluom.online"""
         users = await _safe_user_find(
             {"id": {"$in": ids}}, {"_id": 0, "password_hash": 0, "otp_hash": 0}, limit=len(ids)
         )
-        return [_apply_dob_visibility(profile, u["id"]) for profile in users]
+        return [_apply_user_visibility(profile, u) for profile in users]
 
     @api.get("/users/me/follow-requests")
     async def my_follow_requests(u=Depends(current_user)):
@@ -1884,7 +1896,7 @@ postbluom.online"""
             query, {"_id": 0, "password_hash": 0, "otp_hash": 0}, skip=skip, limit=limit
         )
         total = await db.users.count_documents(query)
-        return {"users": [_apply_dob_visibility(profile, u["id"]) for profile in users], "total": total, "skip": skip, "limit": limit}
+        return {"users": [_apply_user_visibility(profile, u) for profile in users], "total": total, "skip": skip, "limit": limit}
 
     @api.get("/users/{user_id}")
     async def get_user(user_id: str, u=Depends(current_user)):
@@ -1928,7 +1940,7 @@ postbluom.online"""
         }
         if is_private_locked:
             return base
-        safe_user = _apply_dob_visibility(user, u["id"])
+        safe_user = _apply_user_visibility(user, u)
         return {
             **safe_user, "is_official": bool(OFFICIAL_ACCOUNT_ID and user_id == OFFICIAL_ACCOUNT_ID),
             "is_mutual": is_mutual, "is_following_you": is_following_you,
@@ -1988,7 +2000,7 @@ postbluom.online"""
             {"id": {"$in": user.get("followers", [])}},
             {"_id": 0, "password_hash": 0, "otp_hash": 0}, limit=500,
         )
-        return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
+        return [_apply_user_visibility(profile, u) for profile in profiles]
 
     @api.get("/users/{user_id}/following")
     async def get_following(user_id: str, u=Depends(current_user)):
@@ -1998,7 +2010,7 @@ postbluom.online"""
             {"id": {"$in": user.get("following", [])}},
             {"_id": 0, "password_hash": 0, "otp_hash": 0}, limit=500,
         )
-        return [_apply_dob_visibility(profile, u["id"]) for profile in profiles]
+        return [_apply_user_visibility(profile, u) for profile in profiles]
 
     # ── Follow Requests (private accounts) ───────────────────────
     @api.post("/users/{user_id}/follow-request/cancel")
@@ -4712,24 +4724,14 @@ postbluom.online"""
             raise HTTPException(404, "Recipient not found")
         if u["id"] in recipient.get("blocked_users", []) or p.to_user_id in u.get("blocked_users", []):
             raise HTTPException(403, "Cannot message this user")
-        if recipient.get("is_badge_verified") and not u.get("is_badge_verified"):
-            # Verified recipient: only accepted friends (connect request accepted) may message
-            _vfr = await db.friend_requests.find_one({
-                "status": "accepted",
-                "$or": [
-                    {"from_id": u["id"], "to_id": p.to_user_id},
-                    {"from_id": p.to_user_id, "to_id": u["id"]},
-                ],
-            })
-            if not _vfr:
-                raise HTTPException(403, "Connect with this verified user and wait for them to accept before messaging")
+        direct_to_verified = bool(recipient.get("is_badge_verified") and not u.get("is_badge_verified"))
 
         # Cross-continent rule: must follow each other or be connected friends
         same_continent = (
             (u.get("continent") or "").strip() == (recipient.get("continent") or "").strip()
             and bool(u.get("continent"))
         )
-        if not same_continent:
+        if not same_continent and not direct_to_verified:
             sender_follows    = p.to_user_id in (u.get("following") or [])
             recipient_follows = u["id"] in (recipient.get("followers") or [])
             if not (sender_follows or recipient_follows):
@@ -4903,7 +4905,7 @@ postbluom.online"""
             uu["following_count"] = len(uu.get("following") or [])
             uu.pop("followers", None)
             uu.pop("following", None)
-        users_map  = {uu["id"]: uu for uu in users_list}
+        users_map  = {uu["id"]: _apply_presence_visibility(uu, u) for uu in users_list}
 
         async def _unread(cid: str) -> int:
             return await db.messages.count_documents({
@@ -4915,9 +4917,13 @@ postbluom.online"""
 
         unread_counts = await asyncio.gather(*[_unread(c["_id"]) for c in convs])
         for c, uc in zip(convs, unread_counts):
-            c["user"]              = users_map.get(c["_id"], {})
-            c["unread"]            = uc
-            c["is_partner_online"] = c["_id"] in _ws_connections
+            partner_user = users_map.get(c["_id"], {})
+            c["user"] = partner_user
+            c["unread"] = uc
+            if not (partner_user.get("is_badge_verified") and not u.get("is_badge_verified")):
+                c["is_partner_online"] = c["_id"] in _ws_connections
+            else:
+                c.pop("is_partner_online", None)
         convs.sort(key=lambda x: x.get("last_time", ""), reverse=True)
         return {"conversations": convs}
 
@@ -6991,7 +6997,7 @@ postbluom.online"""
             following_ids = set(u.get("following", []))
             for usr in users_found:
                 usr["is_following"] = usr["id"] in following_ids
-            results["users"] = [_apply_dob_visibility(profile, u["id"]) for profile in users_found]
+            results["users"] = [_apply_user_visibility(profile, u) for profile in users_found]
 
         if search_type in ("all", "hashtags"):
             pipeline = [
@@ -7285,6 +7291,13 @@ postbluom.online"""
         name = p.name.strip()
         if not name:
             raise HTTPException(400, "Group name required")
+        if not u.get("is_badge_verified") and p.member_ids:
+            verified_member = await db.users.find_one(
+                {"id": {"$in": p.member_ids}, "is_badge_verified": True},
+                {"_id": 0, "id": 1},
+            )
+            if verified_member:
+                raise HTTPException(403, "Non-verified accounts cannot add verified users to groups")
         members = list(set([u["id"]] + p.member_ids))
         group_id = str(uuid.uuid4())
         avatar_photo = await _cloudinaryize_inline_image(
@@ -7333,6 +7346,7 @@ postbluom.online"""
             {"_id": 0, "id": 1, "name": 1, "handle": 1, "avatar_bg": 1, "avatar_letter": 1, "avatar_photo": 1, "bio": 1, "is_online": 1, "is_badge_verified": 1},
             limit=200,
         )
+        member_docs = [_apply_presence_visibility(member, u) for member in member_docs]
         g["member_details"] = member_docs
         return g
 
@@ -7401,12 +7415,12 @@ postbluom.online"""
         if not new_uid: raise HTTPException(400, "user_id required")
         if new_uid == u["id"]: raise HTTPException(400, "You are already in the group")
         if new_uid in g.get("members", []): return {"ok": True, "already_member": True}
+        target = await db.users.find_one({"id": new_uid}, {"_id": 0, "id": 1, "is_badge_verified": 1})
+        if not target: raise HTTPException(404, "User not found")
+        if target.get("is_badge_verified") and not u.get("is_badge_verified"): 
+            raise HTTPException(403, "Non-verified accounts cannot add verified users to groups")
         connected_ids = set((u.get("followers") or []) + (u.get("following") or []))
         if new_uid not in connected_ids: raise HTTPException(403, "You can only add your followers, following, or mutual connections")
-        target = await db.users.find_one({"id": new_uid}, {"_id": 0, "id": 1, "is_badge_verified": 1, "followers": 1})
-        if not target: raise HTTPException(404, "User not found")
-        if target.get("is_badge_verified") and not u.get("is_badge_verified") and u["id"] not in (target.get("followers") or []):
-            raise HTTPException(403, "Verified users can only be added when they follow you")
         await db.groups.update_one({"id": group_id}, {"$addToSet": {"members": new_uid}})
         return {"ok": True}
 
