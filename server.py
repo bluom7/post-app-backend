@@ -1072,6 +1072,7 @@ postbluom.online"""
         username: Optional[str] = None
         handle: Optional[str] = None
         location: Optional[str] = None
+        country: Optional[str] = None
         about: Optional[str] = None
         website: Optional[str] = None
         avatar_bg: Optional[str] = None
@@ -1100,6 +1101,16 @@ postbluom.online"""
         post_visibility: Optional[str] = None
         comment_control: Optional[str] = None
         sensitive_content_filter: Optional[bool] = None
+
+        @field_validator("country")
+        @classmethod
+        def validate_country(cls, v):
+            if v is None:
+                return v
+            v = v.strip()
+            if len(v) > 80 or any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+                raise ValueError("Enter a valid country name")
+            return v
 
         @field_validator("username")
         @classmethod
@@ -1750,7 +1761,10 @@ postbluom.online"""
         return safe
 
     def _apply_user_visibility(profile, viewer):
-        return _apply_presence_visibility(_apply_dob_visibility(profile, viewer["id"]), viewer)
+        safe = _apply_presence_visibility(_apply_dob_visibility(profile, viewer["id"]), viewer)
+        if safe and str(safe.get("id") or "") != str(viewer.get("id") or ""):
+            safe.pop("country", None)
+        return safe
 
     # ── Profile ───────────────────────────────────────────────────
     @api.patch("/profile")
